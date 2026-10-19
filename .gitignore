@@ -1,0 +1,88 @@
+# ==============================================================================
+# Git Ignore - Exocortex & Télémétrie Cognitive
+# ==============================================================================
+
+# --- Données Brutes Takeout & Staging (Spécifié par l'utilisateur) ---
+takeout_raw/
+takeoutraw/
+takeout_staging/
+**/takeout_staging/
+Vault_Data/_System_Buffer/takeout_staging/
+
+# --- Tampons Systèmes, Télémétrie & Bases de Données Locales ---
+Vault_Data/_System_Buffer/screen_staging/
+Vault_Data/_System_Buffer/lancedb_store/
+Vault_Data/_System_Buffer/telemetry.db*
+*.db
+*.db-wal
+*.db-shm
+*.webp
+
+# --- Fichiers d'Environnement & Clés Secrètes ---
+.env
+.env.local
+*.key
+credentials.json
+
+# --- Exports & Dumps Temporaires ---
+repomix-output.xml
+repomix-output.txt
+*.log
+
+# --- Fichiers Python & Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Environnements Virtuels ---
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Caches Outils & Tests ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDEs & Éditeurs ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.cursor/
+
+# --- Fichiers Système d'Exploitation ---
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
