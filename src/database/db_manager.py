@@ -237,6 +237,41 @@ class DBManager:
             conn.executemany(sql, payload)
         return len(sessions)
 
+    def update_session_distillation_metadata(
+        self,
+        session_id: str,
+        topics_list: List[str],
+        notes_list: List[str],
+        summary: Optional[str] = None,
+    ) -> bool:
+        """
+        Met à jour les métadonnées de distillation post-LLM d'une session Gemini :
+        topics extraits, fiches conceptuelles générées et résumé mis à jour.
+        """
+        topics_json = json.dumps(topics_list, ensure_ascii=False)
+        notes_json = json.dumps(notes_list, ensure_ascii=False)
+
+        with self.get_connection() as conn:
+            if summary:
+                conn.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET extracted_topics_json = ?, generated_notes_json = ?, summary = ?
+                    WHERE session_id = ?;
+                    """,
+                    (topics_json, notes_json, summary, session_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET extracted_topics_json = ?, generated_notes_json = ?
+                    WHERE session_id = ?;
+                    """,
+                    (topics_json, notes_json, session_id),
+                )
+        return True
+
     def insert_historical_footprints_batch(self, footprints: List[HistoricalFootprintRecord]) -> int:
         """Insère un lot d'empreintes Search/YouTube dans historical_footprints."""
         if not footprints:

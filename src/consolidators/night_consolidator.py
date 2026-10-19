@@ -34,8 +34,14 @@ from src.database.db_manager import (
 )
 from src.database.vector_store import vector_store
 from src.consolidators.drive_compiler import DriveCompiler
+from src.ingestors.takeout_ingestor import register_new_taxonomy_tag
 from src.llm.ollama_client import HardwareProbe, VRAMInsufficientError, llm_client
-from src.llm.prompts import SYSTEM_PROMPT_ANTI_WIKIPEDIA
+from src.llm.prompts import (
+    SYSTEM_PROMPT_ANTI_WIKIPEDIA,
+    PROMPT_DYNAMIC_TAXONOMY_RULE,
+    PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
+    PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
+)
 
 logger = logging.getLogger("Exocortex.NightConsolidator")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -46,8 +52,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 # ==============================================================================
 
 class WindowClassification(BaseModel):
-    """Classification d'une fenêtre d'activité selon la taxonomie fermée."""
-    semantic_topic: str = Field(description="Nom exact du semantic_topic issu de Taxonomie_Tags.md")
+    """Classification d'une fenêtre d'activité selon la taxonomie fermée ou émergente."""
+    semantic_topic: str = Field(description="Topic existant dans Taxonomie_Tags.md OU nouveau tag Domaine_SousDomaine si aucun ne correspond.")
+    is_new_topic: bool = Field(default=False, description="True si un nouveau topic a dû être créé.")
+    new_topic_description: Optional[str] = Field(default=None, description="Description courte si nouveau topic.")
     cognitive_mode: str = Field(description="Mode cognitif : production, exploration, chat_ia, gaming, media")
     confidence: float = Field(default=0.9, description="Score de confiance entre 0.0 et 1.0")
 
@@ -135,8 +143,8 @@ def heuristic_fallback_classification(
     if any(k in text for k in ["droit", "jurisprudence", "loi", "philo", "spinoza", "camus"]):
         return "Philo_Droit_et_Morale", "exploration"
 
-    # Repli par défaut
-    fallback_tag = "IA_Agentique_et_RAG" if allowed_tags and "IA_Agentique_et_RAG" in allowed_tags else (allowed_tags[0] if allowed_tags else "General")
+    # Repli par défaut sur A_Trier pour éviter de polluer les tags nobles
+    fallback_tag = "A_Trier" if allowed_tags and "A_Trier" in allowed_tags else "A_Trier"
     mode = "production" if any(k in executable.lower() for k in ["code", "devenv", "notepad"]) else "exploration"
     return fallback_tag, mode
 
@@ -231,13 +239,14 @@ class NightConsolidator:
             chosen_mode = None
 
             if is_ollama_ready:
-                taxonomy_list = "\n".join([f"- {t} : {self.tag_descriptions.get(t, '')}" for t in self.allowed_tags])
+                taxonomy_list = "\n".join([f"- `{t}` : {self.tag_descriptions.get(t, '')}" for t in self.allowed_tags])
                 prompt = (
                     f"Voici une activité capturée sur le bureau Windows :\n"
                     f"- Exécutable : {exe}\n"
                     f"- Titre de la fenêtre : {title}\n"
                     f"- Extrait visuel/OCR : {ocr or 'Aucun'}\n\n"
-                    f"Taxonomie fermée autorisée pour semantic_topic :\n{taxonomy_list}\n\n"
+                    f"Taxonomie actuelle autorisée pour semantic_topic :\n{taxonomy_list}\n\n"
+                    f"{PROMPT_DYNAMIC_TAXONOMY_RULE}\n"
                     "Modes cognitifs autorisés : 'production', 'exploration', 'chat_ia', 'gaming', 'media'.\n"
                     "Assigne le semantic_topic exact et le cognitive_mode le plus pertinent."
                 )
@@ -245,15 +254,28 @@ class NightConsolidator:
                     res = llm_client.generate_structured(
                         prompt=prompt,
                         response_model=WindowClassification,
-                        system="Tu es un classificateur de télémétrie strict. Réponds uniquement en JSON valide.",
+                        system="Tu es un classificateur de télémétrie strict. Réponds uniquement en JSON valide conforme au schéma.",
                         model=settings.MODEL_FAST_VISION,
                         keep_alive=0,
                     )
-                    # Vérification stricte que le topic fait partie de la liste autorisée
-                    if res.semantic_topic in self.allowed_tags:
-                        chosen_topic = res.semantic_topic
-                    else:
-                        chosen_topic, _ = heuristic_fallback_classification(exe, title, ocr, self.allowed_tags)
+                    # Enregistrement dynamique des nouveaux topics émergents
+                    if res.is_new_topic and res.confidence >= 0.75:
+                        clean_tag = res.semantic_topic.strip()
+                        if re.match(r"^[A-Za-z0-9]+_[A-Za-z0-9_]+$", clean_tag):
+                            if clean_tag not in self.allowed_tags:
+                                desc = res.new_topic_description or "Topic émergent issu de l'activité écran"
+                                if register_new_taxonomy_tag(clean_tag, desc):
+                                    self.allowed_tags.append(clean_tag)
+                                    self.tag_descriptions[clean_tag] = desc
+                                    chosen_topic = clean_tag
+                            else:
+                                chosen_topic = clean_tag
+
+                    if not chosen_topic:
+                        if res.semantic_topic in self.allowed_tags:
+                            chosen_topic = res.semantic_topic
+                        else:
+                            chosen_topic, _ = heuristic_fallback_classification(exe, title, ocr, self.allowed_tags)
                     chosen_mode = res.cognitive_mode
                 except Exception as exc:
                     logger.debug("Repli heuristique pour [%s] '%s' (%s)", exe, title, exc)
@@ -403,10 +425,14 @@ class NightConsolidator:
     def run_pass_2_synthesis(self, target_date: date, metric: DailyMetricRecord) -> None:
         """
         Passe 2 :
-        1. Rédige le journal épisodique 01_Episodique/YYYY-MM-DD.md.
+        1. Rédige le journal épisodique 01_Episodique/YYYY-MM-DD.md avec synthèse LLM des tunnels réels.
         2. Pour tout sujet ayant cumulé >= 45 minutes dans la journée, crée ou enrichit la fiche dans 02_Concepts/.
         3. Purge la VRAM en fin de passe.
         """
+        if metric.total_screen_sec == 0:
+            logger.info("Temps d'écran total nul pour le %s. Aucune note épisodique ou conceptuelle générée.", target_date.isoformat())
+            return
+
         logger.info("--- DÉBUT PASSE 2 : SYNTHÈSE ÉPISODIQUE & CONCEPTS ---")
         free_gb, _ = HardwareProbe.get_vram_info()
 
@@ -415,10 +441,23 @@ class NightConsolidator:
         effective_model = llm_client.check_and_select_model(target_model)
         logger.info("Modèle sélectionné pour la synthèse : %s (VRAM libre: %.2f Go)", effective_model, free_gb)
 
-        # 1. Génération de la note 01_Episodique/YYYY-MM-DD.md
+        # 1. Extraction et structuration des activités réelles du jour
         date_str = target_date.strftime("%Y-%m-%d")
-        episodic_file = settings.EPISODIC_DIR / f"{date_str}.md"
+        activities = self.db.get_activities_for_date(target_date)
 
+        topic_activities: Dict[str, List[str]] = {}
+        for act in activities:
+            top = act.get("semantic_topic") or "Non_Classe"
+            exe = act.get("executable") or ""
+            title = act.get("window_title") or ""
+            ocr = act.get("ocr_snippet") or ""
+            line = f"- [{exe}] {title}"
+            if ocr:
+                line += f" (Aperçu visuel : {ocr[:120]})"
+            if line not in topic_activities.setdefault(top, []):
+                topic_activities[top].append(line)
+
+        # Préparation du tableau des topics pour le journal
         top_topics_dict = json.loads(metric.top_topics_json)
         topics_table_lines = [
             "| Sujet Sémantique | Durée Cumulée | Part du Temps |",
@@ -433,6 +472,46 @@ class NightConsolidator:
         topics_table = "\n".join(topics_table_lines)
         hyperfocus_fmt = f"{metric.max_hyperfocus_sec // 60} min" if metric.max_hyperfocus_sec < 3600 else f"{metric.max_hyperfocus_sec // 3600}h{(metric.max_hyperfocus_sec % 3600) // 60:02d}"
 
+        # 2. Synthèse LLM de la Section 3 du Journal Épisodique
+        activities_summary_lines: List[str] = []
+        for top_name, items in topic_activities.items():
+            activities_summary_lines.append(f"### Sujet : {top_name}")
+            for item in items[:6]:
+                activities_summary_lines.append(item)
+        activities_text = "\n".join(activities_summary_lines)
+
+        synthesis_prompt = (
+            f"Voici les données d'activité réelles de la journée du {date_str} :\n"
+            f"- Temps d'écran total : {metric.total_screen_sec / 3600.0:.2f} h\n"
+            f"- Production active : {metric.active_production_sec / 3600.0:.2f} h\n"
+            f"- Exploration / passif : {metric.passive_exploration_sec / 3600.0:.2f} h\n"
+            f"- Tunnel d'hyperfocus max : {hyperfocus_fmt} sur `{metric.max_hyperfocus_topic or 'Non défini'}`\n"
+            f"- Changements de contexte par heure : {metric.context_switches_per_hour}\n\n"
+            f"Activités et fenêtres réelles consultées par sujet :\n{activities_text}\n\n"
+            "Rédige une analyse synthétique dense, factuelle et sans complaisance (2 à 3 paragraphes) des tunnels de concentration "
+            "de la journée, des transitions de focus, des outils et des réalisations concrètes observées. "
+            "Zéro verbiage encyclopédique. Ne décris que la dynamique de travail réelle de l'utilisateur."
+        )
+
+        section_3_content = ""
+        if llm_client.is_alive():
+            try:
+                section_3_content = llm_client.generate_text(
+                    prompt=synthesis_prompt,
+                    system=PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
+                    model=effective_model,
+                    keep_alive=0,
+                )
+            except Exception as exc:
+                logger.warning("Erreur lors de la synthèse LLM du journal épisodique : %s", exc)
+
+        if not section_3_content.strip():
+            section_3_content = (
+                f"Journée marquée par une concentration principale sur `{metric.max_hyperfocus_topic or 'les projets en cours'}` "
+                f"avec un hyperfocus continu de {hyperfocus_fmt} et {metric.context_switches_per_hour} changements de contexte par heure."
+            )
+
+        episodic_file = settings.EPISODIC_DIR / f"{date_str}.md"
         episodic_content = f"""---
 date: "{date_str}"
 total_screen_hours: {metric.total_screen_sec / 3600.0:.2f}
@@ -457,13 +536,13 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
 {topics_table}
 
 ## 3. Synthèse des Tunnels de Concentration
-Journée marquée par une concentration principale sur `{metric.max_hyperfocus_topic or 'les projets en cours'}`.
+{section_3_content.strip()}
 """
         with open(episodic_file, "w", encoding="utf-8") as f:
             f.write(episodic_content)
         logger.info("Journal épisodique généré : %s", episodic_file.name)
 
-        # 2. Distillation ou enrichissement des fiches conceptuelles (seuil >= 45 min = 2700s)
+        # 3. Distillation ou enrichissement des fiches conceptuelles (seuil >= 45 min = 2700s)
         for topic_name, duration_secs in top_topics_dict.items():
             if duration_secs < 2700:  # Seuil strict de 45 minutes
                 continue
@@ -472,26 +551,83 @@ Journée marquée par une concentration principale sur `{metric.max_hyperfocus_t
             concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
             duration_fmt = f"{duration_secs // 3600}h{(duration_secs % 3600) // 60:02d}"
 
-            # Si la note existe déjà, l'enrichir
+            topic_items = topic_activities.get(topic_name, [])
+            topic_context_str = "\n".join(topic_items[:12])
+
             if concept_file.exists():
                 with open(concept_file, "r", encoding="utf-8") as cf:
                     existing_text = cf.read()
 
-                # Mise à jour du frontmatter et de la section épisodique
                 m_updated = re.sub(r'updated_at:\s*"[^"]*"', f'updated_at: "{date_str}"', existing_text)
-                new_source_line = f">   - Activité écran du `{date_str}` ({duration_fmt})\n"
+                m_time = re.search(r'total_time_invested_min:\s*(\d+)', m_updated)
+                if m_time:
+                    prev_time = int(m_time.group(1))
+                    new_time = prev_time + (duration_secs // 60)
+                    m_updated = re.sub(r'total_time_invested_min:\s*\d+', f'total_time_invested_min: {new_time}', m_updated)
 
-                if ">   - Activité écran du" not in m_updated:
+                new_source_line = f">   - Activité écran du `{date_str}` ({duration_fmt})\n"
+                if "> - **Sources épisodiques :**\n" in m_updated:
                     m_updated = m_updated.replace("> - **Sources épisodiques :**\n", f"> - **Sources épisodiques :**\n{new_source_line}")
-                else:
-                    m_updated = m_updated.replace("> - **Sources épisodiques :**\n", f"> - **Sources épisodiques :**\n{new_source_line}")
+
+                if llm_client.is_alive() and topic_context_str:
+                    enrich_prompt = (
+                        f"L'utilisateur a passé {duration_fmt} de travail supplémentaire sur le sujet '{topic_name}' le {date_str}.\n"
+                        f"Fenêtres et activités récentes :\n{topic_context_str}\n\n"
+                        f"Rédige un court paragraphe d'enrichissement factuel (avec un sous-titre `### Session du {date_str}`) "
+                        "détaillant les nouveaux arbitrages, implémentations ou tests observés. Zéro intro générale encyclopédique."
+                    )
+                    try:
+                        enrich_text = llm_client.generate_text(
+                            prompt=enrich_prompt,
+                            system=PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
+                            model=effective_model,
+                            keep_alive=0,
+                        )
+                        if enrich_text.strip():
+                            if "> [!abstract]- Généalogie & Télémétrie" in m_updated:
+                                parts = m_updated.split("> [!abstract]- Généalogie & Télémétrie")
+                                m_updated = f"{parts[0].rstrip()}\n\n{enrich_text.strip()}\n\n> [!abstract]- Généalogie & Télémétrie{parts[1]}"
+                            else:
+                                m_updated = f"{m_updated.rstrip()}\n\n{enrich_text.strip()}\n"
+                    except Exception as exc:
+                        logger.warning("Erreur enrichissement concept %s : %s", slug, exc)
 
                 with open(concept_file, "w", encoding="utf-8") as cf:
                     cf.write(m_updated)
                 logger.info("Fiche conceptuelle enrichie : %s (+%s)", concept_file.name, duration_fmt)
             else:
-                # Création d'une nouvelle note atomique selon le contrat Section 6
                 concept_id = datetime.now().strftime("%Y%m%d%H%M")
+                synthesized_body = ""
+                if llm_client.is_alive() and topic_context_str:
+                    concept_prompt = (
+                        f"L'utilisateur a passé {duration_fmt} de concentration continue sur le sujet '{topic_name}' le {date_str}.\n"
+                        f"Fenêtres, outils et activités associées :\n{topic_context_str}\n\n"
+                        "Rédige le corps analytique d'une note conceptuelle (2 à 3 sections Markdown avec sous-titres : "
+                        "### Contexte & Problématique, ### Choix Techniques & Implémentation, ### Arbitrages & Prochaines Étapes). "
+                        "Zéro paraphrase Wikipédia, uniquement du contenu ancré dans l'activité réelle."
+                    )
+                    try:
+                        synthesized_body = llm_client.generate_text(
+                            prompt=concept_prompt,
+                            system=PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
+                            model=effective_model,
+                            keep_alive=0,
+                        )
+                    except Exception as exc:
+                        logger.warning("Erreur génération corps concept %s : %s", slug, exc)
+
+                if not synthesized_body.strip():
+                    synthesized_body = (
+                        f"### Contexte & Investigations\n"
+                        f"Session d'hyperfocus de {duration_fmt} consacrée à {topic_name.replace('_', ' ')}.\n\n"
+                        f"### Activités & Traces Notables\n"
+                        + "\n".join([f"- {it}" for it in topic_items[:6]])
+                    )
+
+                # Connexions sémantiques dynamiques
+                related_tags = [t for t in self.allowed_tags if t != topic_name][:2]
+                related_links_str = ", ".join([f"[[{t}]]" for t in related_tags]) if related_tags else f"[[{topic_name}]]"
+
                 new_concept = f"""---
 id: "{concept_id}"
 title: "{topic_name.replace('_', ' ')}"
@@ -507,17 +643,17 @@ summary_1_line: "Synthèse et développement des réflexions sur {topic_name.rep
 
 # {topic_name.replace('_', ' ')}
 
-Synthèse structurée des arbitrages techniques, investigations et conclusions validées sur ce sujet.
+{synthesized_body.strip()}
 
 > [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
 > - **Temps cumulé sur ce sujet :** {duration_fmt}
 > - **Sources épisodiques :**
 >   - Activité écran du `{date_str}` ({duration_fmt})
-> - **Connexions sémantiques :** [[IA_Agentique_et_RAG]], [[Data_Engineering]]
+> - **Connexions sémantiques :** {related_links_str}
 """
                 with open(concept_file, "w", encoding="utf-8") as cf:
                     cf.write(new_concept)
-                logger.info("Nouvelle fiche conceptuelle créée : %s", concept_file.name)
+                logger.info("Nouvelle fiche conceptuelle créée via synthèse LLM : %s", concept_file.name)
 
         # Purge de la VRAM après la synthèse
         llm_client.unload_model(effective_model)
@@ -557,7 +693,14 @@ Synthèse structurée des arbitrages techniques, investigations et conclusions v
         if target_date and target_date not in dates_to_process:
             dates_to_process.append(target_date)
         if not dates_to_process:
-            dates_to_process = [datetime.now().date()]
+            logger.info("Aucune date avec activité à consolider. Arrêt du Sommeil Paradoxal.")
+            return {
+                "classified_activities": classified_count,
+                "processed_dates": [],
+                "indexed_concepts_count": 0,
+                "drive_files": {},
+                "db_stats": self.db.get_database_stats(),
+            }
 
         logger.info("Journées à agréger et synthétiser : %s", [d.isoformat() for d in dates_to_process])
 

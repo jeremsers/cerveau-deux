@@ -87,33 +87,21 @@ class VectorStore:
 
     def get_embedding(self, text: str) -> List[float]:
         """
-        Génère un vecteur d'embedding 1024-dim via Ollama bge-m3.
-        Si Ollama est inaccessible ou le modèle absent, repli sur un vecteur normalisé déterministe.
+        Génère un vecteur d'embedding 1024-dim réel via bge-m3.
+        Lève une RuntimeError si le modèle d'embedding est injoignable (interdiction des vecteurs SHA-256 factices).
         """
         clean_text = re.sub(r"\s+", " ", text).strip()[:2048]
-        try:
-            vec = llm_client.generate_embeddings(
-                text=clean_text,
-                model=settings.MODEL_EMBEDDING,
-                keep_alive=0,  # Déchargement VRAM immédiat
+        vec = llm_client.generate_embeddings(
+            text=clean_text,
+            model=settings.MODEL_EMBEDDING,
+            keep_alive=0,
+        )
+        if not vec or len(vec) != EMBEDDING_DIM:
+            raise RuntimeError(
+                f"Échec critique d'embedding : dimension reçue {len(vec) if vec else 0} != {EMBEDDING_DIM}. "
+                f"Vérifiez qu'Ollama est actif et que '{settings.MODEL_EMBEDDING}' est installé."
             )
-            if vec and len(vec) == EMBEDDING_DIM:
-                return [float(x) for x in vec]
-        except Exception as exc:
-            logger.warning(
-                "Ollama non disponible ou modèle '%s' absent (%s). Utilisation d'un vecteur déterministe.",
-                settings.MODEL_EMBEDDING,
-                exc,
-            )
-
-        # Repli déterministe pour tests sans Ollama
-        import hashlib
-        h = hashlib.sha256(clean_text.encode("utf-8")).digest()
-        base_vals = [float(b) / 255.0 - 0.5 for b in h]
-        repeated = (base_vals * (EMBEDDING_DIM // len(base_vals) + 1))[:EMBEDDING_DIM]
-        # Normalisation L2
-        norm = sum(x * x for x in repeated) ** 0.5 or 1.0
-        return [x / norm for x in repeated]
+        return [float(x) for x in vec]
 
     def index_concept_file(self, file_path: Path) -> bool:
         """Lit, parse le frontmatter et vectorise une note Markdown de 02_Concepts/."""

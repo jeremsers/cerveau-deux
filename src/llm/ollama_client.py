@@ -127,12 +127,111 @@ class HybridLLMClient:
         return requested_model
 
     def is_alive(self, timeout: float = 0.5) -> bool:
-        """Vérifie rapidement si le serveur Ollama est démarré et joignable."""
+        """Vérifie rapidement si le backend LLM (Ollama ou llama_server) est démarré et joignable."""
+        if settings.LLM_BACKEND == "llama_server":
+            try:
+                resp = self._session.get(f"{settings.LLAMA_SERVER_BASE_URL}/models", timeout=timeout)
+                return resp.status_code == 200
+            except Exception:
+                return False
         try:
             resp = self._session.get(f"{self.base_url}/api/tags", timeout=timeout)
             return resp.status_code == 200
         except Exception:
             return False
+
+    def ensure_local_gguf_models(self) -> Dict[str, bool]:
+        """
+        Vérifie et provisionne automatiquement les modèles GGUF locaux dans Ollama.
+        Si gemma4:12b ou gemma4:26b-a4b sont absents d'Ollama mais que les fichiers .gguf
+        sont présents dans settings.MODELS_DIR, génère le Modelfile et crée le modèle.
+        """
+        status: Dict[str, bool] = {
+            settings.MODEL_FAST_VISION: False,
+            settings.MODEL_HEAVY_SYNTHESIS: False,
+        }
+        if settings.LLM_BACKEND == "llama_server":
+            logger.info("Backend llama_server configuré, les modèles GGUF sont gérés par le serveur dédié.")
+            return status
+
+        if not self.is_alive(timeout=1.0):
+            logger.warning("Serveur Ollama non joignable à %s, provisioning ignoré.", self.base_url)
+            return status
+
+        # Récupération des modèles déjà enregistrés dans Ollama
+        existing_models = set()
+        try:
+            resp = self._session.get(f"{self.base_url}/api/tags", timeout=3.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for m in data.get("models", []):
+                    name = m.get("name", "")
+                    existing_models.add(name)
+                    if ":" in name:
+                        existing_models.add(name.split(":")[0])
+        except Exception as exc:
+            logger.warning("Impossible de lister les modèles Ollama : %s", exc)
+
+        models_to_check = [
+            (settings.MODEL_FAST_VISION, settings.GGUF_FAST_PATH),
+            (settings.MODEL_HEAVY_SYNTHESIS, settings.GGUF_HEAVY_PATH),
+        ]
+
+        for model_name, gguf_path in models_to_check:
+            if any(model_name in em or em.startswith(model_name) for em in existing_models):
+                logger.info("Modèle Ollama '%s' déjà disponible.", model_name)
+                status[model_name] = True
+                continue
+
+            if not gguf_path.exists():
+                logger.warning("Binaire GGUF introuvable pour '%s' à l'emplacement : %s", model_name, gguf_path)
+                continue
+
+            logger.info("Modèle '%s' absent d'Ollama. Création automatique depuis %s...", model_name, gguf_path.name)
+            modelfile_content = (
+                f"FROM \"{gguf_path.resolve().as_posix()}\"\n"
+                'TEMPLATE """{{ if .System }}<start_of_turn>system\n'
+                '{{ .System }}<end_of_turn>\n'
+                '{{ end }}{{ if .Prompt }}<start_of_turn>user\n'
+                '{{ .Prompt }}<end_of_turn>\n'
+                '{{ end }}<start_of_turn>model\n'
+                '{{ .Response }}<end_of_turn>\n'
+                '"""\n'
+                'PARAMETER stop "<start_of_turn>"\n'
+                'PARAMETER stop "<end_of_turn>"\n'
+            )
+
+            modelfile_path = settings.MODELS_DIR / f"Modelfile.{model_name.replace(':', '_')}"
+            try:
+                modelfile_path.write_text(modelfile_content, encoding="utf-8")
+                # 1. Tentative via l'API REST Ollama /api/create
+                create_url = f"{self.base_url}/api/create"
+                create_payload = {
+                    "name": model_name,
+                    "modelfile": modelfile_content,
+                    "stream": False,
+                }
+                c_resp = self._session.post(create_url, json=create_payload, timeout=600.0)
+                if c_resp.status_code == 200:
+                    logger.info("Modèle Ollama '%s' créé avec succès via API REST !", model_name)
+                    status[model_name] = True
+                    continue
+            except Exception as exc:
+                logger.debug("Tentative API REST pour créer '%s' : %s", model_name, exc)
+
+            # 2. Repli via CLI subprocess ollama create
+            try:
+                cmd = ["ollama", "create", model_name, "-f", str(modelfile_path.resolve())]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=600.0)
+                if res.returncode == 0:
+                    logger.info("Modèle Ollama '%s' créé avec succès via CLI !", model_name)
+                    status[model_name] = True
+                else:
+                    logger.warning("Échec de 'ollama create' pour '%s' : %s", model_name, res.stderr)
+            except Exception as exc:
+                logger.error("Erreur d'exécution de 'ollama create' pour '%s' : %s", model_name, exc)
+
+        return status
 
     # ==========================================================================
     # EXCLUSION MUTUELLE ET PURGE MÉMOIRE (KEEP_ALIVE=0)
@@ -196,6 +295,27 @@ class HybridLLMClient:
         # Si un autre modèle était en mémoire, le purger
         if self.currently_loaded_model and self.currently_loaded_model != effective_model:
             self.unload_model(self.currently_loaded_model)
+
+        if settings.LLM_BACKEND == "llama_server":
+            url = f"{settings.LLAMA_SERVER_BASE_URL}/chat/completions"
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            payload = {
+                "model": effective_model,
+                "messages": messages,
+                "temperature": temperature,
+                "stream": False,
+            }
+            try:
+                resp = self._session.post(url, json=payload, timeout=self.timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+            except requests.RequestException as exc:
+                logger.error("Erreur requête HTTP llama_server (%s) : %s", url, exc)
+                raise
 
         url = f"{self.base_url}/api/chat"
         messages = []
@@ -305,12 +425,31 @@ class HybridLLMClient:
             + f"Tu dois impérativement répondre UNIQUEMENT avec un objet JSON valide conforme à ce schéma JSON :\n{json_schema}"
         )
 
-        url = f"{self.base_url}/api/chat"
         messages = [
             {"role": "system", "content": strict_system},
             {"role": "user", "content": prompt},
         ]
 
+        if settings.LLM_BACKEND == "llama_server":
+            url = f"{settings.LLAMA_SERVER_BASE_URL}/chat/completions"
+            payload = {
+                "model": effective_model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+                "stream": False,
+            }
+            try:
+                resp = self._session.post(url, json=payload, timeout=self.timeout)
+                resp.raise_for_status()
+                raw_text = resp.json()["choices"][0]["message"]["content"].strip()
+                parsed_dict = json.loads(raw_text)
+                return response_model.model_validate(parsed_dict)
+            except Exception as exc:
+                logger.error("Erreur parsing structuré llama_server : %s", exc)
+                raise
+
+        url = f"{self.base_url}/api/chat"
         payload = {
             "model": effective_model,
             "messages": messages,

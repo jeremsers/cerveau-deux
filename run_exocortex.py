@@ -37,7 +37,7 @@ def run_daemon() -> None:
     from src.daemons.telemetry_daemon import TelemetryDaemon
 
     daemon = TelemetryDaemon()
-    daemon.run()
+    daemon.run_loop()
 
 
 def run_consolidate(date_str: Optional[str] = None) -> None:

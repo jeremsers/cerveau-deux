@@ -47,6 +47,18 @@ class Settings(BaseModel):
     )
 
     # --- Modèles d'Inférence LLM Locale (Ollama / Llama-server) ---
+    MODELS_DIR: Path = Field(
+        default_factory=lambda: Path(os.getenv("MODELS_DIR", "./models")).resolve()
+    )
+    LLM_BACKEND: str = Field(
+        default_factory=lambda: os.getenv("LLM_BACKEND", "ollama").lower()  # "ollama" ou "llama_server"
+    )
+    GGUF_FAST_FILENAME: str = Field(
+        default_factory=lambda: os.getenv("GGUF_FAST_FILENAME", "gemma-4-12b-it-Q4_K_M.gguf")
+    )
+    GGUF_HEAVY_FILENAME: str = Field(
+        default_factory=lambda: os.getenv("GGUF_HEAVY_FILENAME", "gemma-4-26b-a4b-it-UD-IQ4_NL.gguf")
+    )
     OLLAMA_BASE_URL: str = Field(
         default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     )
@@ -208,6 +220,26 @@ class Settings(BaseModel):
     def GOOGLE_DRIVE_SYNC_DIR(self) -> Path:
         return self.VAULT_ROOT / "Google_Drive_Sync"
 
+    @property
+    def GGUF_FAST_PATH(self) -> Path:
+        """Chemin vers le binaire GGUF 12B (tolérance casse)."""
+        p = self.MODELS_DIR / self.GGUF_FAST_FILENAME
+        if not p.exists() and self.MODELS_DIR.exists():
+            for c in self.MODELS_DIR.glob("*.gguf"):
+                if c.name.lower() == self.GGUF_FAST_FILENAME.lower():
+                    return c
+        return p
+
+    @property
+    def GGUF_HEAVY_PATH(self) -> Path:
+        """Chemin vers le binaire GGUF 26B (tolérance casse)."""
+        p = self.MODELS_DIR / self.GGUF_HEAVY_FILENAME
+        if not p.exists() and self.MODELS_DIR.exists():
+            for c in self.MODELS_DIR.glob("*.gguf"):
+                if c.name.lower() == self.GGUF_HEAVY_FILENAME.lower():
+                    return c
+        return p
+
     def ensure_directories(self) -> None:
         """Crée l'intégralité des répertoires requis pour Vault_Data et ses sous-dossiers techniques."""
         directories = [
@@ -221,6 +253,7 @@ class Settings(BaseModel):
             self.LANCEDB_DIR,
             self.GOOGLE_DRIVE_SYNC_DIR,
             self.TAKEOUT_DIR,
+            self.MODELS_DIR,
         ]
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)

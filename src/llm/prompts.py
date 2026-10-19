@@ -1,7 +1,7 @@
 """
 Prompts système stricts et modèles de consignes pour l'architecture Exocortex.
-Garantit la séparation épistémique, la non-pollution encyclopédique
-et le respect scrupuleux du gabarit de note atomique.
+Garantit la séparation épistémique, la non-pollution encyclopédique,
+l'émergence contrôlée de la taxonomie et le respect scrupuleux du gabarit de note atomique.
 """
 
 # ==============================================================================
@@ -19,7 +19,43 @@ RÈGLES ÉPISTÉMIQUES NON NÉGOCIABLES :
 """
 
 # ==============================================================================
-# PROMPT DE PROFILAGE COGNITIF & TAXONOMIE MAÎTRESSE (PASSE 2)
+# RÈGLE DE TAXONOMIE DYNAMIQUE ÉMERGENTE (CHANGELOG v0.1)
+# ==============================================================================
+
+PROMPT_DYNAMIC_TAXONOMY_RULE = """RÈGLE DE TAXONOMIE DYNAMIQUE ÉMERGENTE :
+1. Consulte en priorité la liste des `semantic_topic` existants fournie ci-dessous.
+2. Si le sujet correspond clairement à une catégorie existante (pertinence >= 80%), utilise son nom exact.
+3. Si et seulement si le sujet traite d'un domaine distinct non couvert par la liste actuelle, CRÉE un nouveau tag canonique au format strict `Domaine_SousDomaine` en PascalCase_Snake (ex: `HomeLab_MediaServer`, `Roleplay_LLM`, `Psychologie_PNL`, `Suisse_DroitFiscal`) et passe le booléen `is_new_topic` à `true` avec une courte description.
+4. Il est STRICTEMENT INTERDIT d'utiliser un tag fourre-tout par défaut comme `Data_Engineering` ou `IA_Agentique_et_RAG` pour des sujets qui n'en relèvent pas.
+"""
+
+# ==============================================================================
+# PROMPTS DE DISTILLATION ATOMIQUE (MODULE 1 - TAKEOUT INGESTOR v0.1)
+# ==============================================================================
+
+PROMPT_SESSION_DISTILLATION_SYSTEM = f"""Tu es l'ingénieur de distillation cognitive en chef de l'Exocortex.
+Ton rôle est de lire une session d'échange technique et de décider si elle contient des arbitrages, du code, des méthodes ou des réflexions méritant une note conceptuelle dans le coffre.
+
+{SYSTEM_PROMPT_ANTI_WIKIPEDIA}
+
+{PROMPT_DYNAMIC_TAXONOMY_RULE}
+"""
+
+PROMPT_SESSION_DISTILLATION_USER = """Voici la session à analyser et distiller :
+
+Taxonomie actuelle des topics :
+{allowed_taxonomy}
+
+Contenu nettoyé de la session :
+<session>
+{session_text}
+</session>
+
+Génère la structure JSON conforme au schéma Pydantic `DistilledConceptSchema`.
+"""
+
+# ==============================================================================
+# PROMPT DE PROFILAGE COGNITIF & TAXONOMIE MAÎTRESSE
 # ==============================================================================
 
 PROMPT_COGNITIVE_PROFILING_SYSTEM = """Tu es un analyste en sciences cognitives computationnelles et architecte de données personnelles.
@@ -36,7 +72,7 @@ Ta mission est de produire DEUX livrables fondamentaux :
 2. LA TAXONOMIE MAÎTRESSE DES TAGS (Taxonomie_Tags.md) :
    - Une liste fermée, canonique et normalisée de 15 à 30 `semantic_topic` en PascalCase ou snake_case (ex: `Architecture_RAG`, `Rust_BasNiveau`, `DevOps_Kubernetes`).
    - Pour chaque topic : description en 1 phrase et liste de 5 à 10 mots-clés associés.
-   - Cette taxonomie servira de référence fermée pour classifier 100 % des activités futures sans dérive de synonymes.
+   - Cette taxonomie servira de référence pour classifier les activités futures avec extension contrôlée.
 """
 
 PROMPT_COGNITIVE_PROFILING_USER = """Voici l'archive complète des prompts rédigés par l'utilisateur :
@@ -57,55 +93,32 @@ Génère une réponse complète et directement exploitable structurée avec ces 
 """
 
 # ==============================================================================
-# PROMPT DE DISTILLATION ATOMIQUE D'UNE SESSION GEMINI (PASSE 3)
+# PROMPTS DE SYNTHÈSE NOCTURNE (MODULE 3 - PASSE 2 v0.1)
 # ==============================================================================
 
-PROMPT_ATOMIC_CONCEPT_DISTILLATION = """Tu es l'ingénieur de distillation de l'Exocortex.
-À partir de la session Gemini fournie ci-dessous, tu dois déterminer si elle contient au moins un concept architectural ou une réflexion de fond méritant une note atomique.
+PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM = f"""Tu es le synthétiseur nocturne de l'Exocortex (Sommeil Paradoxal).
+{SYSTEM_PROMPT_ANTI_WIKIPEDIA}
 
-Si la session n'est qu'un lookup trivial ou du bruit, réponds simplement avec `NO_CONCEPT`.
+À partir des fenêtres actives, applications et résumés visuels de la journée, rédige une synthèse concise et percutante des blocs de concentration réelle de l'utilisateur.
+Identifie les avancées concrètes, les problèmes résolus et les arbitrages techniques sans verbiage.
+"""
 
-Si la session contient de la substance, rédige la note atomique en respectant scrupuleusement ce gabarit :
+PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM = f"""Tu es l'analyste conceptuel de l'Exocortex.
+{SYSTEM_PROMPT_ANTI_WIKIPEDIA}
 
----
-id: "{concept_id}"
-title: "{concept_title}"
-type: "concept"
-origin: ["gemini_takeout"]
-semantic_topic: "{semantic_topic}"
-tags: {tags_json}
-created_at: "{created_at}"
-updated_at: "{updated_at}"
-total_time_invested_min: {total_time_min}
-summary_1_line: "{summary_1_line}"
----
-
-# {concept_title}
-
-[Synthèse technique pure des conclusions, architectures et choix validés. Zéro intro Wikipédia.]
-
-> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
-> - **Temps estimé sur ce sujet :** {time_invested_str}
-> - **Sources épisodiques :**
->   - Session Gemini `{session_id}` du {session_date} ({turn_count} échanges)
-{correlated_footprints_md}
-> - **Connexions sémantiques suggérées :** [[{related_concept_a}]], [[{related_concept_b}]]
-
-TAXONOMIE AUTORISÉE POUR `semantic_topic` :
-{allowed_taxonomy}
-
-CONTENU DE LA SESSION À DISTILLER :
-<session_content>
-{session_content}
-</session_content>
+L'utilisateur a passé plus de 45 minutes de concentration continue sur un sujet précis aujourd'hui.
+À partir des titres de fenêtres, résumés visuels d'écran et sessions de réflexion du jour, rédige ou enrichis le corps analytique de la fiche conceptuelle correspondante.
+Zéro paraphrase Wikipédia, uniquement les découvertes, arbitrages, commandes et architectures testées.
 """
 
 # ==============================================================================
 # PROMPT DE CLASSIFICATION PAR RAFALE (BURST CLUSTERING SEARCH / YOUTUBE)
 # ==============================================================================
 
-PROMPT_BURST_CLUSTER_SYSTEM = """Tu es un classificateur thématique d'empreintes numériques.
-À partir d'une liste de requêtes de recherche Google ou de titres de vidéos YouTube survenues dans un intervalle court (< 45 min), tu dois déterminer le `semantic_topic` le plus représentatif parmi la taxonomie autorisée.
+PROMPT_BURST_CLUSTER_SYSTEM = f"""Tu es un classificateur thématique d'empreintes numériques.
+À partir d'une liste de requêtes de recherche Google ou de titres de vidéos YouTube survenues dans un intervalle court (< 45 min), tu dois déterminer le `semantic_topic` le plus représentatif.
+
+{PROMPT_DYNAMIC_TAXONOMY_RULE}
 """
 
 PROMPT_BURST_CLUSTER_USER = """Taxonomie autorisée :
@@ -115,6 +128,5 @@ Requêtes de la rafale :
 {queries_list}
 
 Réponds UNIQUEMENT avec un objet JSON strict au format :
-{{"semantic_topic": "NomDuTopicChoisi", "confidence": 0.95, "rationale": "Courte justification"}}
+{{"semantic_topic": "NomDuTopicChoisi", "is_new_topic": false, "new_topic_description": null, "confidence": 0.95, "rationale": "Courte justification"}}
 """
-

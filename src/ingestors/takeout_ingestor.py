@@ -32,9 +32,10 @@ from src.database.db_manager import (
 )
 from src.llm.ollama_client import llm_client
 from src.llm.prompts import (
-    PROMPT_ATOMIC_CONCEPT_DISTILLATION,
     PROMPT_COGNITIVE_PROFILING_SYSTEM,
     PROMPT_COGNITIVE_PROFILING_USER,
+    PROMPT_SESSION_DISTILLATION_SYSTEM,
+    PROMPT_SESSION_DISTILLATION_USER,
     SYSTEM_PROMPT_ANTI_WIKIPEDIA,
 )
 
@@ -43,8 +44,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 
 # ==============================================================================
-# STRUCTURES INTERNES TYPÉES
+# STRUCTURES INTERNES TYPÉES & SCHÉMA PYDANTIC V2 DE DISTILLATION
 # ==============================================================================
+
+class DistilledConceptSchema(BaseModel):
+    """Schéma de sortie structuré Pydantic v2 pour la distillation LLM d'une session."""
+    is_worth_indexing: bool = Field(description="False si la session n'est que du bruit ou un test trivial sans conclusion.")
+    concept_title: str = Field(description="Titre conceptuel précis et canonique (ex: 'Configuration Serveur Plex & Riven sous Docker'). Jamais une phrase de prompt.")
+    slug: str = Field(description="Slug kebab-case propre (ex: 'configuration-plex-riven-docker')")
+    semantic_topic: str = Field(description="Tag de la taxonomie existante ou nouveau tag Domaine_SousDomaine")
+    is_new_topic: bool = Field(default=False, description="True si semantic_topic est une nouvelle catégorie absente de la liste")
+    new_topic_description: Optional[str] = Field(default=None, description="Description en 1 phrase si nouveau topic")
+    tags: List[str] = Field(description="3 à 5 sous-tags techniques en minuscule")
+    summary_1_line: str = Field(description="Résumé dense en une seule phrase de la conclusion ou de l'architecture.")
+    synthesized_markdown_body: str = Field(
+        description="Synthèse structurée en Markdown (sections ### Contexte, ### Arbitrages & Architecture, ### Conclusions & Commandes Clés). Zéro intro Wikipédia."
+    )
+    related_concepts: List[str] = Field(description="2 à 3 titres de concepts connexes pour le maillage Obsidian")
+
 
 class ParsedTurn(BaseModel):
     """Représente un tour d'échange individuel extrait d'un export."""
@@ -65,6 +82,81 @@ class ReconstructedSession(BaseModel):
     turn_count: int
     user_char_count: int
     summary: str
+
+
+def sanitize_turn_text(text: str, max_turn_chars: int = 3500) -> str:
+    """
+    Purge les dumps d'interfaces copiés-collés (menus HTML/DOM), les tracebacks répétitifs
+    et les espaces insécables multiples avant envoi au LLM.
+    """
+    if not text:
+        return ""
+    # 1. Suppression des séquences d'espaces/tabulations de scraping UI (ex: SillyTavern sliders)
+    cleaned = re.sub(r"(?:[\t \xa0]{4,}\n){3,}", "\n[Dump d'interface UI omis]\n", text)
+    # 2. Compression des logs d'erreurs ou stacktraces de plus de 15 lignes consécutives
+    lines = cleaned.splitlines()
+    if len(lines) > 35:
+        filtered_lines: List[str] = []
+        log_streak = 0
+        for line in lines:
+            is_log_line = any(
+                pat in line
+                for pat in ["Traceback", "File \"", "at FluentMigrator", "sqlalchemy.exc", "ggml_", "llama_model_loader", "   at "]
+            )
+            if is_log_line:
+                log_streak += 1
+                if log_streak <= 6:
+                    filtered_lines.append(line)
+                elif log_streak == 7:
+                    filtered_lines.append("... [Stacktrace / Log technique tronqué pour lisibilité] ...")
+            else:
+                log_streak = 0
+                filtered_lines.append(line)
+        cleaned = "\n".join(filtered_lines)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if len(cleaned) > max_turn_chars:
+        cleaned = cleaned[:max_turn_chars] + "\n...[Contenu long tronqué]..."
+    return cleaned
+
+
+def compute_realistic_session_duration_min(turns: List[ParsedTurn], max_gap_min: int = 15) -> int:
+    """
+    Calcule le temps réel investi dans une session en additionnant les intervalles
+    entre deux échanges consécutifs, plafonnés à `max_gap_min` (15 min) par tour,
+    plus 3 minutes de lecture/rédaction de base pour le premier tour.
+    """
+    if not turns:
+        return 0
+    total_sec = 180.0  # 3 min de base pour l'ouverture de session
+    max_gap_sec = max_gap_min * 60.0
+    for i in range(1, len(turns)):
+        delta_sec = max(0.0, (turns[i].timestamp - turns[i - 1].timestamp).total_seconds())
+        total_sec += min(delta_sec, max_gap_sec)
+    return max(5, int(round(total_sec / 60.0)))
+
+
+def register_new_taxonomy_tag(tag_name: str, description: Optional[str] = None) -> bool:
+    """
+    Ajoute proprement un nouveau topic validé au format strict Domaine_SousDomaine dans Taxonomie_Tags.md.
+    """
+    if not tag_name or not re.match(r"^[A-Za-z0-9]+_[A-Za-z0-9_]+$", tag_name):
+        return False
+    tax_path = settings.TAXONOMIE_TAGS_PATH
+    if not tax_path.exists():
+        return False
+
+    content = tax_path.read_text(encoding="utf-8")
+    if f"`{tag_name}`" in content or f"**{tag_name}**" in content:
+        return False
+
+    desc_text = description or "Sujet émergent qualifié par distillation"
+    new_entry = f"\n- `{tag_name}` : {desc_text}\n"
+
+    with open(tax_path, "a", encoding="utf-8") as f:
+        f.write(new_entry)
+    logger.info("Nouveau tag taxonomique enregistré dans %s : `%s`", tax_path.name, tag_name)
+    return True
 
 
 # ==============================================================================
@@ -126,6 +218,7 @@ def parse_gemini_html(file_path: Path) -> List[ParsedTurn]:
     logger.info("Nombre total de blocs détectés dans l'export : %d", len(blocks) - 1)
 
     turns: List[ParsedTurn] = []
+    last_valid_dt: Optional[datetime] = None
     for block in blocks[1:]:
         if "Prompt" not in block:
             continue
@@ -148,11 +241,17 @@ def parse_gemini_html(file_path: Path) -> List[ParsedTurn]:
         if not user_prompt:
             continue
 
-        # Extraction de la date
+        # Extraction de la date (jamais datetime.now() pour ne pas polluer l'historique)
         rest = body_html[m_prompt.end():]
         m_date = re.search(r"^(.*?)(?:<br\s*/?>)", rest.strip(), re.DOTALL)
         date_str = m_date.group(1).strip() if m_date else ""
-        parsed_dt = parse_date_flexible(date_str) or datetime.now()
+        parsed_dt = parse_date_flexible(date_str)
+        if not parsed_dt:
+            if last_valid_dt:
+                parsed_dt = last_valid_dt
+            else:
+                continue
+        last_valid_dt = parsed_dt
 
         # Extraction de la réponse IA
         response_html = rest[m_date.end():].strip() if m_date else ""
@@ -186,6 +285,7 @@ def parse_gemini_json(file_path: Path) -> List[ParsedTurn]:
         data = json.load(f)
 
     turns: List[ParsedTurn] = []
+    last_valid_dt: Optional[datetime] = None
     items = data if isinstance(data, list) else data.get("conversations", [])
 
     for item in items:
@@ -201,7 +301,13 @@ def parse_gemini_json(file_path: Path) -> List[ParsedTurn]:
             continue
 
         time_str = item.get("time", "")
-        parsed_dt = parse_date_flexible(time_str) or datetime.now()
+        parsed_dt = parse_date_flexible(time_str)
+        if not parsed_dt:
+            if last_valid_dt:
+                parsed_dt = last_valid_dt
+            else:
+                continue
+        last_valid_dt = parsed_dt
 
         url = item.get("titleUrl")
         session_id = None
@@ -404,8 +510,8 @@ def sessionize_gemini_turns(
             t_count = len(sub_turns)
             total_chars = sum(t.user_char_count for t in sub_turns)
 
-            # Règle anti-bruit : ignorer si < 3 tours ET < 250 caractères
-            if t_count < min_turns and total_chars < min_user_chars:
+            # Règle anti-bruit stricte : ignorer si moins de 3 tours OU moins de 250 caractères
+            if t_count < min_turns or total_chars < min_user_chars:
                 filtered_out_noise += 1
                 continue
 
@@ -699,15 +805,30 @@ def initialize_meta_and_concepts(
             for t_name, t_desc in default_topics:
                 f.write(f"- **`{t_name}`** : {t_desc}\n")
 
-    # Lecture des topics autorisés
-    allowed_topics_str = "\n".join([f"- {t[0]}" for t in default_topics])
+    # Lecture et extraction de la taxonomie maîtresse
+    allowed_topics_list: List[str] = []
+    if settings.TAXONOMIE_TAGS_PATH.exists():
+        with open(settings.TAXONOMIE_TAGS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                m_tag = re.search(r"-\s*`?([A-Za-z0-9]+_[A-Za-z0-9_]+)`?", line)
+                if m_tag:
+                    allowed_topics_list.append(m_tag.group(1))
 
-    # Sélection des sessions les plus denses pour créer les premières fiches atomiques
+    if not allowed_topics_list:
+        allowed_topics_list = [
+            "Dev_Web_et_Stack_Astro", "IA_Agentique_et_RAG", "LLM_Local_et_Hardware",
+            "Chefferie_Projet_et_UX", "Freelance_et_Acquisition", "Gaming_Solo_et_Modding",
+            "MMORPG_Theorycraft", "Webtoons_Manga_et_Anime", "Analyse_Musicale_et_MAO",
+            "Nutrition_Volume_Eating", "Sante_et_Admin_Perso", "Introspection_et_Neuroatypie",
+        ]
+    allowed_topics_str = "\n".join([f"- `{t}`" for t in allowed_topics_list])
+
+    # Sélection des sessions les plus qualifiées pour la distillation initiale
     top_sessions = sorted(
-        [s for s in sessions if s.turn_count >= 3 and s.user_char_count >= 400],
+        [s for s in sessions if s.turn_count >= 3 and s.user_char_count >= 300],
         key=lambda s: s.user_char_count,
         reverse=True,
-    )[:5]  # Top 5 des sessions les plus riches pour amorcer le coffre
+    )[:10]
 
     created_notes_count = 0
     for sess in top_sessions:
@@ -719,66 +840,139 @@ def initialize_meta_and_concepts(
             for fp in footprints[:8]:
                 footprints_md += f">   - [{fp['source']}] {fp['title_or_query']}\n"
 
-        # Titre et slug du concept
-        clean_title = re.sub(r"[^\w\s-]", "", sess.summary).strip()
-        slug = re.sub(r"[\s_]+", "-", clean_title.lower())[:50].strip("-") or f"session-{sess.session_id}"
-        concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
+        # Calcul mathématique réaliste du temps investi
+        duration_min = compute_realistic_session_duration_min(sess.turns)
+        duration_fmt = f"{duration_min // 60}h{duration_min % 60:02d}" if duration_min >= 60 else f"{duration_min} min"
 
-        if concept_file.exists():
+        # Nettoyage et assainissement des tours pour le LLM
+        clean_turns_text: List[str] = []
+        for t in sess.turns:
+            u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=1500)
+            a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=2000)
+            clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
+        session_text = "\n\n---\n\n".join(clean_turns_text)[:12000]
+
+        # Appel LLM structuré pour distillation réelle
+        distilled: Optional[DistilledConceptSchema] = None
+        user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
+            allowed_taxonomy=allowed_topics_str,
+            session_text=session_text,
+        )
+
+        # 1. Tentative Cloud SOTA si configuré
+        if settings.TAKEOUT_MODE == "cloud_api" and llm_client.is_cloud_available():
+            try:
+                cloud_raw = llm_client.generate_cloud_sota(
+                    prompt=user_prompt,
+                    system_prompt=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                )
+                m_json = re.search(r"\{.*\}", cloud_raw, re.DOTALL)
+                if m_json:
+                    distilled = DistilledConceptSchema.model_validate(json.loads(m_json.group(0)))
+            except Exception as exc:
+                logger.warning("Échec de distillation Cloud SOTA pour session %s : %s", sess.session_id, exc)
+
+        # 2. Tentative LLM Local (Ollama ou llama_server)
+        if not distilled and llm_client.is_alive():
+            try:
+                distilled = llm_client.generate_structured(
+                    prompt=user_prompt,
+                    response_model=DistilledConceptSchema,
+                    system=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                    model=settings.MODEL_FAST_VISION,
+                    keep_alive=0,
+                )
+            except Exception as exc:
+                logger.warning("Échec de distillation locale pour session %s : %s", sess.session_id, exc)
+
+        # 3. Repli heuristique si le LLM est inaccessible
+        if not distilled:
+            first_user = sanitize_turn_text(sess.turns[0].user_prompt)[:100]
+            clean_title = re.sub(r"[^\w\s-]", "", first_user).strip().title()
+            slug = re.sub(r"[\s_]+", "-", clean_title.lower())[:50].strip("-") or f"session-{sess.session_id}"
+            
+            # Détection de topic par mots-clés
+            matched_topic = "A_Trier"
+            text_low = (sess.summary + " " + first_user).lower()
+            for cand in allowed_topics_list:
+                cand_kws = cand.lower().split("_")
+                if any(kw in text_low for kw in cand_kws if len(kw) > 3):
+                    matched_topic = cand
+                    break
+
+            distilled = DistilledConceptSchema(
+                is_worth_indexing=True,
+                concept_title=clean_title,
+                slug=slug,
+                semantic_topic=matched_topic,
+                is_new_topic=False,
+                tags=[matched_topic.lower(), "takeout_coldstart"],
+                summary_1_line=sess.summary[:140],
+                synthesized_markdown_body=(
+                    f"### Problématique & Contexte\n{first_user}\n\n"
+                    f"### Arbitrages Techniques & Solutions\n"
+                    f"- Session composée de {sess.turn_count} échanges techniques.\n"
+                    f"- Conclusion principale : {sanitize_turn_text(sess.turns[-1].ai_response)[:400]}..."
+                ),
+                related_concepts=[matched_topic],
+            )
+
+        if not distilled.is_worth_indexing:
+            logger.info("Session %s considérée comme bruit par la distillation.", sess.session_id)
             continue
 
+        # Gestion de la taxonomie dynamique émergente
+        if distilled.is_new_topic and distilled.semantic_topic:
+            register_new_taxonomy_tag(distilled.semantic_topic, distilled.new_topic_description)
+            if distilled.semantic_topic not in allowed_topics_list:
+                allowed_topics_list.append(distilled.semantic_topic)
+
+        # Sauvegarde de la note dans 02_Concepts/
+        concept_file = settings.CONCEPTS_DIR / f"{distilled.slug}.md"
         created_date_str = sess.timestamp_start.strftime("%Y-%m-%d")
         updated_date_str = sess.timestamp_end.strftime("%Y-%m-%d")
         concept_id = sess.timestamp_start.strftime("%Y%m%d%H%M")
 
-        # Estimation du temps passé (durée effective entre début et fin, minimum 15 min)
-        duration_min = max(int((sess.timestamp_end - sess.timestamp_start).total_seconds() / 60), 15)
-        duration_fmt = f"{duration_min // 60}h{duration_min % 60:02d}" if duration_min >= 60 else f"{duration_min} min"
-
-        # Détermination du semantic_topic
-        topic = "Architecture_RAG" if "rag" in sess.summary.lower() or "vector" in sess.summary.lower() else "Data_Engineering"
-
-        # Construction du corps de la note (substance intellectuelle extraite)
-        body_points: List[str] = []
-        for t in sess.turns:
-            body_points.append(f"- **Problématique / Instruction :** {t.user_prompt.strip()}")
-            if t.ai_response:
-                # Synthèse de la conclusion
-                ai_snippet = t.ai_response.strip().split("\n\n")[0]
-                body_points.append(f"  - *Conclusion retenue :* {ai_snippet[:250]}...")
-
-        body_content = "\n\n".join(body_points)
+        related_md = ", ".join([f"[[{rc}]]" for rc in distilled.related_concepts]) if distilled.related_concepts else "[[Exocortex]]"
+        tags_json = json.dumps(distilled.tags, ensure_ascii=False)
 
         note_content = f"""---
 id: "{concept_id}"
-title: "{clean_title}"
+title: "{distilled.concept_title}"
 type: "concept"
 origin: ["gemini_takeout"]
-semantic_topic: "{topic}"
-tags: ["{topic.lower()}", "takeout_coldstart"]
+semantic_topic: "{distilled.semantic_topic}"
+tags: {tags_json}
 created_at: "{created_date_str}"
 updated_at: "{updated_date_str}"
 total_time_invested_min: {duration_min}
-summary_1_line: "{sess.summary[:140]}"
+summary_1_line: "{distilled.summary_1_line.replace('"', "'")}"
 ---
 
-# {clean_title}
+# {distilled.concept_title}
 
-{body_content}
+{distilled.synthesized_markdown_body}
 
 > [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
-> - **Temps cumulé sur ce sujet :** {duration_fmt}
+> - **Temps estimé sur ce sujet :** {duration_fmt}
 > - **Sources épisodiques :**
 >   - Session Gemini `{sess.session_id}` du {created_date_str} ({sess.turn_count} échanges, {sess.user_char_count} chars écrits)
-{footprints_md}> - **Connexions sémantiques :** [[Architecture_RAG]], [[Data_Engineering]]
+{footprints_md}> - **Connexions sémantiques suggérées :** {related_md}
 """
-
         with open(concept_file, "w", encoding="utf-8") as f:
             f.write(note_content)
         created_notes_count += 1
-        logger.info("Note atomique créée : %s", concept_file.name)
+        logger.info("Fiche conceptuelle distillée créée : %s (#%s)", concept_file.name, distilled.semantic_topic)
 
-    logger.info("Distillation initiale achevée : %d fiches conceptuelles créées dans 02_Concepts/.", created_notes_count)
+        # Mise à jour des métadonnées dans SQLite (chat_sessions)
+        db.update_session_distillation_metadata(
+            session_id=sess.session_id,
+            topics_list=[distilled.semantic_topic],
+            notes_list=[distilled.slug],
+            summary=distilled.summary_1_line,
+        )
+
+    logger.info("Distillation LLM achevée : %d fiches conceptuelles créées dans 02_Concepts/.", created_notes_count)
 
 
 # ==============================================================================
