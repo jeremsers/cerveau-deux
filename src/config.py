@@ -75,12 +75,15 @@ class Settings(BaseModel):
         default_factory=lambda: os.getenv("MODEL_EMBEDDING", "bge-m3")
     )
 
-    # --- Contraintes Matérielles VRAM (RTX 4070 Ti Super 16 Go) ---
+    # --- Contraintes Matérielles VRAM (RTX 4070 Ti Super 16 Go sous Windows 11) ---
     MIN_FREE_VRAM_GB: float = Field(
         default_factory=lambda: float(os.getenv("MIN_FREE_VRAM_GB", "8.0"))
     )
     FULL_DUAL_MODEL_VRAM_GB: float = Field(
-        default_factory=lambda: float(os.getenv("FULL_DUAL_MODEL_VRAM_GB", "14.5"))
+        default_factory=lambda: float(os.getenv("FULL_DUAL_MODEL_VRAM_GB", "12.8"))
+    )
+    TAKEOUT_MAX_DISTILL_SESSIONS: int = Field(
+        default_factory=lambda: int(os.getenv("TAKEOUT_MAX_DISTILL_SESSIONS", "0"))  # 0 = Toutes les sessions qualifiées
     )
 
     # --- Mode Cloud SOTA (Optionnel) ---

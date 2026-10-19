@@ -198,7 +198,7 @@ class NightConsolidator:
                         prompt=prompt,
                         image_path=img_path,
                         model=settings.MODEL_FAST_VISION,
-                        keep_alive=0,
+                        keep_alive="5m",
                     )
                 except Exception as exc:
                     logger.warning("Échec vision pour %s : %s", img_path.name, exc)
@@ -256,7 +256,7 @@ class NightConsolidator:
                         response_model=WindowClassification,
                         system="Tu es un classificateur de télémétrie strict. Réponds uniquement en JSON valide conforme au schéma.",
                         model=settings.MODEL_FAST_VISION,
-                        keep_alive=0,
+                        keep_alive="5m",
                     )
                     # Enregistrement dynamique des nouveaux topics émergents
                     if res.is_new_topic and res.confidence >= 0.75:
@@ -500,7 +500,7 @@ class NightConsolidator:
                     prompt=synthesis_prompt,
                     system=PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
                     model=effective_model,
-                    keep_alive=0,
+                    keep_alive="5m",
                 )
             except Exception as exc:
                 logger.warning("Erreur lors de la synthèse LLM du journal épisodique : %s", exc)
@@ -581,7 +581,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                             prompt=enrich_prompt,
                             system=PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
                             model=effective_model,
-                            keep_alive=0,
+                            keep_alive="5m",
                         )
                         if enrich_text.strip():
                             if "> [!abstract]- Généalogie & Télémétrie" in m_updated:
@@ -611,7 +611,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                             prompt=concept_prompt,
                             system=PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
                             model=effective_model,
-                            keep_alive=0,
+                            keep_alive="5m",
                         )
                     except Exception as exc:
                         logger.warning("Erreur génération corps concept %s : %s", slug, exc)
@@ -684,6 +684,10 @@ summary_1_line: "Synthèse et développement des réflexions sur {topic_name.rep
         logger.info("============================================================")
         logger.info("=== DÉCLENCHEMENT DU SOMMEIL PARADOXAL (CONSOLIDATION) ===")
         logger.info("============================================================")
+
+        # 0. Provisioning automatique des modèles GGUF locaux dans Ollama
+        if llm_client.is_alive():
+            llm_client.ensure_local_gguf_models()
 
         # Passe 1 : Vision & Tagging
         classified_count = self.run_pass_1_vision_and_tagging()

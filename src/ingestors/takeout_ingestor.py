@@ -30,6 +30,8 @@ from src.database.db_manager import (
     DBManager,
     HistoricalFootprintRecord,
 )
+from src.database.vector_store import vector_store
+from src.consolidators.drive_compiler import DriveCompiler
 from src.llm.ollama_client import llm_client
 from src.llm.prompts import (
     PROMPT_COGNITIVE_PROFILING_SYSTEM,
@@ -339,6 +341,7 @@ def parse_youtube_export(file_path: Path) -> List[HistoricalFootprintRecord]:
     """Parse l'historique YouTube (HTML ou JSON)."""
     logger.info("Parsing de l'historique YouTube : %s", file_path.name)
     footprints: List[HistoricalFootprintRecord] = []
+    last_valid_dt: Optional[datetime] = None
 
     if file_path.suffix.lower() == ".json":
         with open(file_path, "r", encoding="utf-8") as f:
@@ -349,7 +352,13 @@ def parse_youtube_export(file_path: Path) -> List[HistoricalFootprintRecord]:
             title_clean = re.sub(r"^A regardé\s+", "", title).strip()
             url = item.get("titleUrl")
             time_str = item.get("time", "")
-            dt = parse_date_flexible(time_str) or datetime.now()
+            dt = parse_date_flexible(time_str)
+            if not dt:
+                if last_valid_dt:
+                    dt = last_valid_dt
+                else:
+                    continue
+            last_valid_dt = dt
             channel = None
             subtitles = item.get("subtitles", [])
             if subtitles and isinstance(subtitles, list):
@@ -379,11 +388,17 @@ def parse_youtube_export(file_path: Path) -> List[HistoricalFootprintRecord]:
             channel = html.unescape(m_channel.group(1)).strip() if m_channel else None
             # Date
             m_date = re.search(r"<br/?>\s*(\d{1,2}\s+[\w\.]+\s+\d{4},\s+\d{2}:\d{2}:\d{2}\s+[A-Za-z0-9_]+)", b)
-            dt = parse_date_flexible(m_date.group(1)) if m_date else datetime.now()
+            dt = parse_date_flexible(m_date.group(1)) if m_date else None
+            if not dt:
+                if last_valid_dt:
+                    dt = last_valid_dt
+                else:
+                    continue
+            last_valid_dt = dt
             footprints.append(
                 HistoricalFootprintRecord(
                     source="youtube",
-                    timestamp=dt or datetime.now(),
+                    timestamp=dt,
                     title_or_query=title,
                     url=url,
                     channel_or_domain=channel,
@@ -398,6 +413,7 @@ def parse_google_search_export(file_path: Path) -> List[HistoricalFootprintRecor
     """Parse l'historique Google Search (HTML ou JSON)."""
     logger.info("Parsing de l'historique Google Search : %s", file_path.name)
     footprints: List[HistoricalFootprintRecord] = []
+    last_valid_dt: Optional[datetime] = None
 
     if file_path.suffix.lower() == ".json":
         with open(file_path, "r", encoding="utf-8") as f:
@@ -410,7 +426,13 @@ def parse_google_search_export(file_path: Path) -> List[HistoricalFootprintRecor
                 continue
             url = item.get("titleUrl")
             time_str = item.get("time", "")
-            dt = parse_date_flexible(time_str) or datetime.now()
+            dt = parse_date_flexible(time_str)
+            if not dt:
+                if last_valid_dt:
+                    dt = last_valid_dt
+                else:
+                    continue
+            last_valid_dt = dt
             footprints.append(
                 HistoricalFootprintRecord(
                     source="google_search",
@@ -432,11 +454,17 @@ def parse_google_search_export(file_path: Path) -> List[HistoricalFootprintRecor
             m_url = re.search(r'<a href="([^"]+)"', b)
             url = m_url.group(1) if m_url else None
             m_date = re.search(r"<br/?>\s*(\d{1,2}\s+[\w\.]+\s+\d{4},\s+\d{2}:\d{2}:\d{2}\s+[A-Za-z0-9_]+)", b)
-            dt = parse_date_flexible(m_date.group(1)) if m_date else datetime.now()
+            dt = parse_date_flexible(m_date.group(1)) if m_date else None
+            if not dt:
+                if last_valid_dt:
+                    dt = last_valid_dt
+                else:
+                    continue
+            last_valid_dt = dt
             footprints.append(
                 HistoricalFootprintRecord(
                     source="google_search",
-                    timestamp=dt or datetime.now(),
+                    timestamp=dt,
                     title_or_query=query,
                     url=url,
                 )
@@ -763,6 +791,7 @@ def perform_burst_clustering(
 def initialize_meta_and_concepts(
     sessions: List[ReconstructedSession],
     db: DBManager,
+    max_distill_sessions: Optional[int] = None,
 ) -> None:
     """
     Initialise 00_Meta/ et génère les premières fiches conceptuelles atomiques dans 02_Concepts/.
@@ -823,12 +852,17 @@ def initialize_meta_and_concepts(
         ]
     allowed_topics_str = "\n".join([f"- `{t}`" for t in allowed_topics_list])
 
-    # Sélection des sessions les plus qualifiées pour la distillation initiale
-    top_sessions = sorted(
-        [s for s in sessions if s.turn_count >= 3 and s.user_char_count >= 300],
+    # Sélection des sessions les plus qualifiées pour la distillation initiale (débridage v0.1.1)
+    qualified_sessions = sorted(
+        [s for s in sessions if s.turn_count >= settings.MIN_TURNS_THRESHOLD and s.user_char_count >= settings.MIN_USER_CHARS_THRESHOLD],
         key=lambda s: s.user_char_count,
         reverse=True,
-    )[:10]
+    )
+    limit = max_distill_sessions if max_distill_sessions is not None else settings.TAKEOUT_MAX_DISTILL_SESSIONS
+    top_sessions = qualified_sessions[:limit] if limit and limit > 0 else qualified_sessions
+
+    if llm_client.is_alive():
+        llm_client.ensure_local_gguf_models()
 
     created_notes_count = 0
     for sess in top_sessions:
@@ -862,13 +896,11 @@ def initialize_meta_and_concepts(
         # 1. Tentative Cloud SOTA si configuré
         if settings.TAKEOUT_MODE == "cloud_api" and llm_client.is_cloud_available():
             try:
-                cloud_raw = llm_client.generate_cloud_sota(
+                distilled = llm_client.generate_cloud_sota(
                     prompt=user_prompt,
-                    system_prompt=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                    system=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                    response_model=DistilledConceptSchema,
                 )
-                m_json = re.search(r"\{.*\}", cloud_raw, re.DOTALL)
-                if m_json:
-                    distilled = DistilledConceptSchema.model_validate(json.loads(m_json.group(0)))
             except Exception as exc:
                 logger.warning("Échec de distillation Cloud SOTA pour session %s : %s", sess.session_id, exc)
 
@@ -879,8 +911,8 @@ def initialize_meta_and_concepts(
                     prompt=user_prompt,
                     response_model=DistilledConceptSchema,
                     system=PROMPT_SESSION_DISTILLATION_SYSTEM,
-                    model=settings.MODEL_FAST_VISION,
-                    keep_alive=0,
+                    model=settings.MODEL_HEAVY_SYNTHESIS,
+                    keep_alive="5m",
                 )
             except Exception as exc:
                 logger.warning("Échec de distillation locale pour session %s : %s", sess.session_id, exc)
@@ -972,6 +1004,8 @@ summary_1_line: "{distilled.summary_1_line.replace('"', "'")}"
             summary=distilled.summary_1_line,
         )
 
+    # Déchargement complet de la VRAM après la distillation
+    llm_client.unload_all_models()
     logger.info("Distillation LLM achevée : %d fiches conceptuelles créées dans 02_Concepts/.", created_notes_count)
 
 
@@ -1017,7 +1051,7 @@ class TakeoutIngestor:
         )
         return discovered
 
-    def run(self) -> Dict[str, Any]:
+    def run(self, max_distill_sessions: Optional[int] = None) -> Dict[str, Any]:
         """Exécute l'intégralité du pipeline d'ingestion Takeout."""
         logger.info("=== LANCEMENT DU MODULE 1 (TAKEOUT INGESTOR) ===")
         files = self.discover_files()
@@ -1079,7 +1113,15 @@ class TakeoutIngestor:
         user_prompts_file, batch_files, web_prompt_file = generate_staging_files(sessions)
 
         # 8. Initialisation de 00_Meta et des premières fiches conceptuelles
-        initialize_meta_and_concepts(sessions, self.db)
+        initialize_meta_and_concepts(sessions, self.db, max_distill_sessions=max_distill_sessions)
+
+        # 9. Synchronisation Vectorielle LanceDB & Compilation Google Drive
+        logger.info("--- SYNCHRONISATION VECTORIELLE LANCEDB ---")
+        indexed_concepts = vector_store.sync_all_concepts()
+
+        logger.info("--- COMPILATION DES MÉGA-FICHIERS GOOGLE DRIVE ---")
+        drive_compiler = DriveCompiler(self.db)
+        drive_files = drive_compiler.compile_all()
 
         db_stats = self.db.get_database_stats()
         logger.info("=== FIN DU MODULE 1 AVEC SUCCÈS ===")
@@ -1092,6 +1134,8 @@ class TakeoutIngestor:
             "staging_prompts_file": str(user_prompts_file),
             "staging_batches_count": len(batch_files),
             "web_prompt_file": str(web_prompt_file),
+            "indexed_concepts_count": indexed_concepts,
+            "drive_files": {k: str(v) for k, v in drive_files.items()},
             "db_stats": db_stats,
         }
 

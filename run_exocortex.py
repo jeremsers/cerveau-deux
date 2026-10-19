@@ -31,6 +31,25 @@ logger = logging.getLogger("Exocortex.Launcher")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
+def run_init_models() -> None:
+    """Provisionne les modèles GGUF locaux de ./models/ dans Ollama avec limitation num_ctx."""
+    logger.info("=== Initialisation & Provisioning des Modèles GGUF Locaux ===")
+    from src.llm.ollama_client import llm_client
+
+    status = llm_client.ensure_local_gguf_models()
+    logger.info("Statut du provisioning des modèles : %s", status)
+
+
+def run_ingest_takeout(limit: Optional[int] = None) -> None:
+    """Lance l'ingestion complète des archives Google Takeout (Module 1)."""
+    logger.info("=== Lancement de l'Ingestion Google Takeout ===")
+    from src.ingestors.takeout_ingestor import TakeoutIngestor
+
+    ingestor = TakeoutIngestor()
+    result = ingestor.run(max_distill_sessions=limit)
+    logger.info("Ingestion Takeout achevée avec succès : %s", result)
+
+
 def run_daemon() -> None:
     """Lance le démon de télémétrie Windows en temps réel (0 Mo VRAM, < 2% CPU)."""
     logger.info("=== Lancement du Démon de Télémétrie Temps Réel ===")
@@ -44,6 +63,10 @@ def run_consolidate(date_str: Optional[str] = None) -> None:
     """Lance le consolidateur nocturne (Sommeil paradoxal en 3 passes VRAM)."""
     logger.info("=== Lancement du Consolidateur Nocturne ===")
     from src.consolidators.night_consolidator import NightConsolidator
+    from src.llm.ollama_client import llm_client
+
+    if llm_client.is_alive():
+        llm_client.ensure_local_gguf_models()
 
     target_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else None
     consolidator = NightConsolidator()
@@ -150,6 +173,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples d'utilisation :
+  python run_exocortex.py --init-models       # Provisionne les modèles GGUF locaux dans Ollama
+  python run_exocortex.py --ingest-takeout    # Ingestion complète Takeout (Module 1)
   python run_exocortex.py --daemon            # Démarre le démon de capture d'activité temps réel
   python run_exocortex.py --consolidate       # Exécute la consolidation nocturne bi-modèle
   python run_exocortex.py --compile-drive     # Met à jour les 4 méga-fichiers Google Drive Sync
@@ -159,6 +184,8 @@ Exemples d'utilisation :
         """,
     )
     group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--init-models", action="store_true", help="Provisionne les modèles GGUF locaux dans Ollama.")
+    group.add_argument("--ingest-takeout", action="store_true", help="Lance l'ingestion complète des archives Google Takeout.")
     group.add_argument("--daemon", action="store_true", help="Lance le démon de télémétrie temps réel Win32.")
     group.add_argument("--consolidate", action="store_true", help="Lance la consolidation nocturne bi-modèle.")
     group.add_argument("--compile-drive", action="store_true", help="Compile les 4 méga-documents Google Drive.")
@@ -167,13 +194,18 @@ Exemples d'utilisation :
     group.add_argument("--all", action="store_true", help="Lance tous les démons d'arrière-plan et le dashboard.")
 
     parser.add_argument("--date", type=str, default=None, help="Date optionnelle pour la consolidation (YYYY-MM-DD).")
+    parser.add_argument("--limit", type=int, default=None, help="Limite optionnelle de sessions à distiller lors du Takeout.")
 
     args = parser.parse_args()
 
     # S'assure que l'arborescence et la base sont prêtes
     settings.ensure_directories()
 
-    if args.daemon:
+    if args.init_models:
+        run_init_models()
+    elif args.ingest_takeout:
+        run_ingest_takeout(args.limit)
+    elif args.daemon:
         run_daemon()
     elif args.consolidate:
         run_consolidate(args.date)

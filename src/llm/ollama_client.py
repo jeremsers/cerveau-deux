@@ -140,6 +140,10 @@ class HybridLLMClient:
         except Exception:
             return False
 
+    def is_cloud_available(self) -> bool:
+        """Vérifie si une clé API Gemini Cloud SOTA est configurée."""
+        return bool(settings.GEMINI_API_KEY and len(settings.GEMINI_API_KEY.strip()) > 5)
+
     def ensure_local_gguf_models(self) -> Dict[str, bool]:
         """
         Vérifie et provisionne automatiquement les modèles GGUF locaux dans Ollama.
@@ -190,6 +194,7 @@ class HybridLLMClient:
             logger.info("Modèle '%s' absent d'Ollama. Création automatique depuis %s...", model_name, gguf_path.name)
             modelfile_content = (
                 f"FROM \"{gguf_path.resolve().as_posix()}\"\n"
+                "PARAMETER num_ctx 8192\n"
                 'TEMPLATE """{{ if .System }}<start_of_turn>system\n'
                 '{{ .System }}<end_of_turn>\n'
                 '{{ end }}{{ if .Prompt }}<start_of_turn>user\n'
@@ -279,7 +284,7 @@ class HybridLLMClient:
         prompt: str,
         system: str = "",
         model: Optional[str] = None,
-        keep_alive: int = 0,
+        keep_alive: Union[int, str] = 0,
         temperature: float = 0.2,
     ) -> str:
         """
@@ -335,7 +340,7 @@ class HybridLLMClient:
             resp = self._session.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
-            self.currently_loaded_model = effective_model if keep_alive != 0 else None
+            self.currently_loaded_model = effective_model if (keep_alive != 0 and keep_alive != "0") else None
             return data.get("message", {}).get("content", "").strip()
         except requests.RequestException as exc:
             logger.error("Erreur de requête HTTP vers Ollama (%s) : %s", url, exc)
@@ -347,7 +352,7 @@ class HybridLLMClient:
         image_path: Path,
         system: str = "",
         model: Optional[str] = None,
-        keep_alive: int = 0,
+        keep_alive: Union[int, str] = 0,
     ) -> str:
         """
         Analyse multimodale d'une capture d'écran (.webp) via gemma4:12b sur Ollama.
@@ -388,7 +393,7 @@ class HybridLLMClient:
             resp = self._session.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
-            self.currently_loaded_model = effective_model if keep_alive != 0 else None
+            self.currently_loaded_model = effective_model if (keep_alive != 0 and keep_alive != "0") else None
             return data.get("message", {}).get("content", "").strip()
         except Exception as exc:
             logger.warning("Échec de l'analyse visuelle de '%s' : %s", image_path.name, exc)
@@ -404,7 +409,7 @@ class HybridLLMClient:
         response_model: Type[T],
         system: str = "",
         model: Optional[str] = None,
-        keep_alive: int = 0,
+        keep_alive: Union[int, str] = 0,
     ) -> T:
         """
         Génère une réponse garantie conforme au schéma Pydantic v2 en mode format='json'.
@@ -463,7 +468,7 @@ class HybridLLMClient:
             resp = self._session.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
             raw_text = resp.json().get("message", {}).get("content", "").strip()
-            self.currently_loaded_model = effective_model if keep_alive != 0 else None
+            self.currently_loaded_model = effective_model if (keep_alive != 0 and keep_alive != "0") else None
 
             # Parsing JSON et validation Pydantic
             parsed_dict = json.loads(raw_text)
@@ -489,7 +494,7 @@ class HybridLLMClient:
         self,
         text: str,
         model: Optional[str] = None,
-        keep_alive: int = 0,
+        keep_alive: Union[int, str] = 0,
     ) -> List[float]:
         """Génère un vecteur d'embedding via bge-m3 sur Ollama."""
         target_model = model or settings.MODEL_EMBEDDING
@@ -510,7 +515,7 @@ class HybridLLMClient:
             resp = self._session.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
-            self.currently_loaded_model = target_model if keep_alive != 0 else None
+            self.currently_loaded_model = target_model if (keep_alive != 0 and keep_alive != "0") else None
             return data.get("embedding", [])
         except requests.RequestException as exc:
             logger.error("Erreur lors de la génération d'embeddings avec '%s' : %s", target_model, exc)

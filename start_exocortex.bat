@@ -2,6 +2,12 @@
 setlocal enabledelayedexpansion
 title Exocortex & Telemetrie Cognitive - Lanceur Windows
 
+:: Optimisations VRAM pour Ollama sur NVIDIA RTX 4070 Ti Super 16 Go
+set OLLAMA_FLASH_ATTENTION=1
+set OLLAMA_KV_CACHE_TYPE=q8_0
+set OLLAMA_MAX_LOADED_MODELS=1
+set OLLAMA_NUM_PARALLEL=1
+
 echo ============================================================
 echo ===      EXOCORTEX & TELEMETRIE COGNITIVE (V2.0)         ===
 echo ===       Architecture Locale & Infrence Hybride        ===
@@ -25,6 +31,10 @@ if %errorlevel% neq 0 (
     set PYTHONW_EXE=python.exe
 )
 
+echo [0/3] Provisioning des modeles GGUF locaux dans Ollama...
+python run_exocortex.py --init-models
+
+echo.
 echo [1/3] Demarrage silencieux du Demon de Telemetrie Temps Reel (Module 2)...
 start "" %PYTHONW_EXE% -m src.daemons.telemetry_daemon
 

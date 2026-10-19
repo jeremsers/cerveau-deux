@@ -10,7 +10,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -85,7 +85,7 @@ class VectorStore:
             logger.error("Erreur d'initialisation de la table LanceDB : %s", exc)
             raise
 
-    def get_embedding(self, text: str) -> List[float]:
+    def get_embedding(self, text: str, keep_alive: Union[int, str] = 0) -> List[float]:
         """
         Génère un vecteur d'embedding 1024-dim réel via bge-m3.
         Lève une RuntimeError si le modèle d'embedding est injoignable (interdiction des vecteurs SHA-256 factices).
@@ -94,7 +94,7 @@ class VectorStore:
         vec = llm_client.generate_embeddings(
             text=clean_text,
             model=settings.MODEL_EMBEDDING,
-            keep_alive=0,
+            keep_alive=keep_alive,
         )
         if not vec or len(vec) != EMBEDDING_DIM:
             raise RuntimeError(
@@ -103,7 +103,7 @@ class VectorStore:
             )
         return [float(x) for x in vec]
 
-    def index_concept_file(self, file_path: Path) -> bool:
+    def index_concept_file(self, file_path: Path, keep_alive: Union[int, str] = 0) -> bool:
         """Lit, parse le frontmatter et vectorise une note Markdown de 02_Concepts/."""
         if not file_path.exists() or file_path.suffix.lower() != ".md":
             return False
@@ -133,7 +133,7 @@ class VectorStore:
 
             # Texte à vectoriser : Titre + Sujet + Résumé / Contenu
             text_to_embed = f"Titre: {title}\nSujet: {topic}\nContenu:\n{body_content[:1500]}"
-            vector = self.get_embedding(text_to_embed)
+            vector = self.get_embedding(text_to_embed, keep_alive=keep_alive)
 
             record = {
                 "id": str(doc_id),
@@ -168,7 +168,7 @@ class VectorStore:
 
         indexed_count = 0
         for md_file in target_dir.glob("*.md"):
-            if self.index_concept_file(md_file):
+            if self.index_concept_file(md_file, keep_alive="5m"):
                 indexed_count += 1
 
         # Purge de la mémoire VRAM après le batch d'embeddings
