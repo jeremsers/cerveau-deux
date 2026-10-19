@@ -1,18 +1,49 @@
 # ==============================================================================
 # Git Ignore - Exocortex & Télémétrie Cognitive
+# Règle d'or : Conservation du scaffold / arborescence via .gitkeep,
+# exclusion stricte du contenu utilisateur, modèles lourds et buffers.
 # ==============================================================================
 
-# --- Données Brutes Takeout & Staging (Spécifié par l'utilisateur) ---
-takeout_raw/
-takeoutraw/
-takeout_staging/
-**/takeout_staging/
-Vault_Data/_System_Buffer/takeout_staging/
+# --- Modèles de Poids d'Inférence (GGUF, SafeTensors, Bin) ---
+models/*
+!models/.gitkeep
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.onnx
 
-# --- Tampons Systèmes, Télémétrie & Bases de Données Locales ---
-Vault_Data/_System_Buffer/screen_staging/
-Vault_Data/_System_Buffer/lancedb_store/
-Vault_Data/_System_Buffer/telemetry.db*
+# --- Données Brutes Takeout ---
+takeout_raw/*
+!takeout_raw/.gitkeep
+takeoutraw/*
+!takeoutraw/.gitkeep
+
+# --- Coffre Utilisateur (Arborescence préservée, contenu exclu) ---
+Vault_Data/00_Meta/*
+!Vault_Data/00_Meta/.gitkeep
+
+Vault_Data/01_Episodique/*
+!Vault_Data/01_Episodique/.gitkeep
+
+Vault_Data/02_Concepts/*
+!Vault_Data/02_Concepts/.gitkeep
+
+Vault_Data/Google_Drive_Sync/*
+!Vault_Data/Google_Drive_Sync/.gitkeep
+
+# --- Tampons Système, Télémétrie & Bases de Données Locales ---
+Vault_Data/_System_Buffer/*
+!Vault_Data/_System_Buffer/.gitkeep
+Vault_Data/_System_Buffer/screen_staging/*
+!Vault_Data/_System_Buffer/screen_staging/.gitkeep
+Vault_Data/_System_Buffer/takeout_staging/*
+!Vault_Data/_System_Buffer/takeout_staging/.gitkeep
+Vault_Data/_System_Buffer/lancedb_store/*
+!Vault_Data/_System_Buffer/lancedb_store/.gitkeep
+takeout_staging/*
+!takeout_staging/.gitkeep
+
 *.db
 *.db-wal
 *.db-shm
@@ -21,6 +52,7 @@ Vault_Data/_System_Buffer/telemetry.db*
 # --- Fichiers d'Environnement & Clés Secrètes ---
 .env
 .env.local
+.env.*.local
 *.key
 credentials.json
 
@@ -85,4 +117,3 @@ $RECYCLE.BIN/
 .DS_Store
 .AppleDouble
 .LSOverride
-
