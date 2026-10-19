@@ -1,0 +1,33 @@
+=== MODE MANUEL CLOUD SOTA (0 €) : CONSIGNES POUR GEMINI PRO WEB ===
+
+Instructions pour l'utilisateur :
+1. Rendez-vous sur https://gemini.google.com/app
+2. Assurez-vous d'utiliser le modèle Gemini 1.5 Pro ou Gemini 2.0 / 2.5 Pro (fenêtre 1M-2M tokens).
+3. Téléversez en pièce jointe le fichier '00_USER_PROMPTS_ONLY.md' situé dans :
+   C:\Users\Jijax\projets\cerveau-deux\Vault_Data\_System_Buffer\takeout_staging\00_USER_PROMPTS_ONLY.md
+4. Copiez-collez l'intégralité du prompt ci-dessous dans la zone de texte :
+
+--------------------------- DÉBUT DU PROMPT À COPIER ---------------------------
+Tu es un analyste en sciences cognitives computationnelles et architecte de données personnelles.
+Tu vas analyser un corpus brut contenant l'ensemble chronologique des prompts écrits par un utilisateur sur une longue période (1 à 2 ans d'activité intellectuelle pure).
+
+Ta mission est de produire DEUX livrables fondamentaux :
+1. LE PROFIL COGNITIF DÉTAILLÉ (Profil_Cognitif.md) :
+   - Style de raisonnement (déductif, exploratoire, itératif, pragmatique).
+   - Obsessions techniques majeures et secondaires.
+   - Préférences d'interaction (ton direct, refus de la flatterie, niveau d'exigence).
+   - Zones d'expertise démontrées et biais cognitifs identifiables (ex: perfectionnisme architectural, tendance au rabbit hole).
+   - Recommandations d'interface pour les agents IA du coffre.
+
+2. LA TAXONOMIE MAÎTRESSE DES TAGS (Taxonomie_Tags.md) :
+   - Une liste fermée, canonique et normalisée de 15 à 30 `semantic_topic` en PascalCase ou snake_case (ex: `Architecture_RAG`, `Rust_BasNiveau`, `DevOps_Kubernetes`).
+   - Pour chaque topic : description en 1 phrase et liste de 5 à 10 mots-clés associés.
+   - Cette taxonomie servira de référence fermée pour classifier 100 % des activités futures sans dérive de synonymes.
+
+
+Tu trouveras en pièce jointe le document '00_USER_PROMPTS_ONLY.md' contenant l'historique complet.
+Analyse l'intégralité de ces prompts et génère les deux livrables distincts séparés par '===SPLIT_LIVRABLE===' :
+1. Le document Markdown complet pour '00_Meta/Profil_Cognitif.md'
+2. Le document Markdown complet pour '00_Meta/Taxonomie_Tags.md' (15 à 30 topics normalisés).
+
+---------------------------- FIN DU PROMPT À COPIER ----------------------------

@@ -1,0 +1,39 @@
+# ==============================================================================
+# Exocortex & Télémétrie Cognitive - Dépendances du Projet
+# Python >= 3.10
+# ==============================================================================
+
+# --- Télémétrie Bas-Niveau & Sonde Matérielle (Win32 & GPU) ---
+pynvml>=11.5.0
+nvidia-ml-py>=12.535.133
+psutil>=5.9.0
+pywin32>=306
+mss>=9.0.1
+rapidocr-onnxruntime>=1.3.8
+imagehash>=4.3.1
+Pillow>=9.5.0
+pyperclip>=1.9.0
+pynput>=1.7.6
+
+# --- Couche Données, Parsing & Typage Strict ---
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+python-dotenv>=1.0.1
+lancedb>=0.17.0
+pyarrow>=14.0.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+python-dateutil>=2.8.2
+pyyaml>=6.0.1
+
+# --- Inférence Locale (Ollama) & Cloud SOTA (Gemini SDK) ---
+httpx>=0.27.0
+requests>=2.31.0
+google-genai>=1.0.0
+
+# --- Dashboard & Visualisation Interactive ---
+streamlit>=1.35.0
+plotly>=5.22.0
+rich>=13.7.0
+tqdm>=4.66.0
+
