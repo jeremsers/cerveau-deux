@@ -23,7 +23,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.config import settings
+from src.config import normalize_to_macro_topic, settings
 from src.database.db_manager import DBManager
 
 logger = logging.getLogger("Exocortex.DriveCompiler")
@@ -295,7 +295,7 @@ class DriveCompiler:
                         "title": title,
                         "updated_at": updated_at_str,
                         "time_min": time_min,
-                        "semantic_topic": meta.get("semantic_topic", "General"),
+                        "semantic_topic": normalize_to_macro_topic(meta.get("semantic_topic", "Dev_et_Architecture_Tech")),
                         "full_content": content.strip(),
                     })
                 except Exception as exc:
@@ -362,7 +362,8 @@ class DriveCompiler:
                                 k, v = line.split(":", 1)
                                 meta[k.strip()] = v.strip().strip("'\"")
 
-                    topic = meta.get("semantic_topic") or "Non_Classe"
+                    raw_topic = meta.get("semantic_topic") or "Dev_et_Architecture_Tech"
+                    topic = normalize_to_macro_topic(raw_topic)
                     title = meta.get("title") or cf.stem.replace("-", " ").title()
                     time_min = int(meta.get("total_time_invested_min") or 0)
                     updated_at = meta.get("updated_at") or meta.get("created_at") or "Inconnu"

@@ -23,7 +23,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.config import settings
+from src.config import normalize_to_macro_topic, settings
 
 # Configuration de la page Streamlit
 st.set_page_config(
@@ -265,11 +265,11 @@ def load_archaeology_data() -> pd.DataFrame:
             except Exception:
                 topics = []
             if not topics:
-                topics = ["General"]
+                topics = ["Dev_et_Architecture_Tech"]
             for top in topics:
                 records.append({
                     "timestamp": ts,
-                    "topic": top,
+                    "topic": normalize_to_macro_topic(top),
                     "turns": r["turn_count"],
                     "chars": r["user_char_count"],
                     "count": 1,

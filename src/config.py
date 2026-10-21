@@ -7,8 +7,142 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
+
+
+# ==============================================================================
+# TAXONOMIE FERMÉE DES 16 MACRO-CATÉGORIES OFFICIELLES (v0.1.2)
+# ==============================================================================
+
+AUTHORIZED_SEMANTIC_TOPICS: Dict[str, str] = {
+    "IA_et_LLM_Local": "Architectures RAG, LLM locaux, GGUF, VRAM, agents IA, fine-tuning et prompt engineering",
+    "Dev_et_Architecture_Tech": "Développement web (Astro, React, TS), backend, API, Python, bases de données, cloud et accessibilité",
+    "HomeLab_et_Hardware": "Serveurs domestiques (Plex, Riven, Debrid, Docker), réseau/DNS, montage/dépannage PC, périphériques et consoles handheld",
+    "Chefferie_Projet_et_Produit": "Gestion de projet digital, Product Ownership, cadrage MVP, UX/UI design, soutenances et méthodologie",
+    "Marketing_et_Acquisition": "Google Ads, GA4, GTM, SEO/SEA, tunnels de vente, copywriting, Stripe/Make/Brevo et conversion (CRO)",
+    "Freelance_et_Carriere": "Positionnement freelance, tarification, formations professionnelles (OpenClassrooms, France Travail) et carrière",
+    "Admin_Finance_et_Droit": "Démarches MDPH/AAH/RSDAE, droit français/suisse, fiscalité, immobilier, gestion patrimoniale et litiges",
+    "Introspection_et_Neuroatypie": "Fonctionnement HPI/TSA/TDAH/AuDHD, masking, monotropisme, bilans cliniques (ADOS-2, EMA, CRA) et métacognition",
+    "Sante_et_Pharmacologie": "Suivi médical, dentaire, sommeil/apnée, pharmacologie, vaporisation, cannabinoïdes et réduction des risques",
+    "Nutrition_et_Cuisine": "Volume eating, batch cooking, science culinaire, cuiseurs à riz, Ninja Creami, glycémie et équipements de cuisine",
+    "Philo_et_Epistemologie": "Absurdisme (Camus), spinozisme, épistémologie, éthique, logique formelle, métaphysique et physique théorique",
+    "Sociologie_et_Geopolitique": "Analyse systémique des sociétés, économie politique, géopolitique, mouvements sociaux, démographie et débats idéologiques",
+    "Gaming_et_GameDesign": "Jeux solo, RPG, modding, émulation, analyse de game design, jeux incrémentaux et jeux de plateau/JDR",
+    "MMORPG_et_Esport": "World of Warcraft (Mythic+, raid, guildes), Guild Wars 2, League of Legends, TFT, theorycrafting et scène esport",
+    "Musique_MAO_et_Culture_Pop": "Production musicale (Maschine, Ableton, VST), Suno AI, K-Pop, rap, webtoons, mangas, animes, séries et culture web",
+    "A_Trier": "Catégorie de quarantaine réservée aux échecs techniques de distillation en attente de retraitement",
+}
+
+
+def normalize_to_macro_topic(raw_topic: str) -> str:
+    """
+    Normalise de façon déterministe n'importe quel tag hérité ou émergent
+    vers l'une des 16 macro-catégories fermées de l'Exocortex.
+    """
+    if not raw_topic:
+        return "A_Trier"
+
+    clean = raw_topic.strip().strip("'\"`")
+    if clean in AUTHORIZED_SEMANTIC_TOPICS:
+        return clean
+
+    # Mappages directs pour tags v0.1.1 et historiques
+    EXACT_MAPPINGS = {
+        # IA & LLM
+        "LLM_Local_et_Hardware": "IA_et_LLM_Local",
+        "IA_Agentique_et_RAG": "IA_et_LLM_Local",
+        "Prompt_Engineering": "IA_et_LLM_Local",
+        "Fine_Tuning_LLM": "IA_et_LLM_Local",
+        "Architecture_RAG": "IA_et_LLM_Local",
+        "Inference_VRAM": "IA_et_LLM_Local",
+        # Dev & Tech
+        "Dev_Web_et_Stack_Astro": "Dev_et_Architecture_Tech",
+        "Data_Engineering": "Dev_et_Architecture_Tech",
+        "Systeme_Win32": "Dev_et_Architecture_Tech",
+        "Obsidian_Exocortex": "Dev_et_Architecture_Tech",
+        # HomeLab & Hardware
+        "HomeLab_MediaServer": "HomeLab_et_Hardware",
+        "HomeLab_Docker": "HomeLab_et_Hardware",
+        # Chefferie de projet & UX
+        "Chefferie_Projet_et_UX": "Chefferie_Projet_et_Produit",
+        # Freelance & Carrière
+        "Freelance_et_Acquisition": "Freelance_et_Carriere",
+        # Santé & Pharmacologie
+        "Sante_et_Admin_Perso": "Sante_et_Pharmacologie",
+        # Nutrition & Cuisine
+        "Nutrition_Volume_Eating": "Nutrition_et_Cuisine",
+        # Philo & Épistémologie
+        "Philo_Droit_et_Morale": "Philo_et_Epistemologie",
+        "Metaphysique_et_Physique": "Philo_et_Epistemologie",
+        # Sociologie & Géopolitique
+        "Sociologie_et_Politique": "Sociologie_et_Geopolitique",
+        # Gaming & GameDesign
+        "Gaming_Solo_et_Modding": "Gaming_et_GameDesign",
+        # MMORPG & Esport
+        "MMORPG_Theorycraft": "MMORPG_et_Esport",
+        # Musique, MAO & Pop Culture
+        "Analyse_Musicale_et_MAO": "Musique_MAO_et_Culture_Pop",
+        "Prompt_Engineering_et_Suno": "Musique_MAO_et_Culture_Pop",
+        "Webtoons_Manga_et_Anime": "Musique_MAO_et_Culture_Pop",
+        "Linguistique_et_Culture_Web": "Musique_MAO_et_Culture_Pop",
+        "Quantified_Self": "Introspection_et_Neuroatypie",
+        "General": "A_Trier",
+        "Non_Classe": "A_Trier",
+    }
+
+    if clean in EXACT_MAPPINGS:
+        return EXACT_MAPPINGS[clean]
+
+    # Analyse par préfixes et motifs réguliers
+    low = clean.lower()
+
+    if any(k in low for k in ["suno", "mao", "musique", "ableton", "kpop", "k-pop", "anime", "manga", "webtoon", "popculture", "cinema", "serie", "culture"]):
+        return "Musique_MAO_et_Culture_Pop"
+
+    if any(k in low for k in ["homelab", "docker", "riven", "plex", "debrid", "hardware", "nas", "pc", "handheld", "console", "routeur", "dns"]):
+        return "HomeLab_et_Hardware"
+
+    if any(k in low for k in ["rag", "llm", "gguf", "vram", "ollama", "agent", "prompt", "fine-tuning", "embedding", "gpt", "gemini", "claude"]):
+        return "IA_et_LLM_Local"
+
+    if any(k in low for k in ["astro", "react", "typescript", "python", "backend", "frontend", "api", "sqlite", "lancedb", "css", "tailwind", "devops", "git", "web", "cloud"]):
+        return "Dev_et_Architecture_Tech"
+
+    if any(k in low for k in ["ads", "marketing", "ga4", "gtm", "seo", "sea", "copywriting", "cro", "stripe", "brevo", "make", "tunnel", "acquisition"]):
+        return "Marketing_et_Acquisition"
+
+    if any(k in low for k in ["freelance", "tarification", "client", "commercial", "carriere", "openclassrooms", "france travail", "emploi", "cv", "stage", "prospection"]):
+        return "Freelance_et_Carriere"
+
+    if any(k in low for k in ["mdph", "aah", "rsdae", "droit", "juridique", "fiscal", "impot", "immobilier", "patrimoine", "finance", "litige", "suisse", "caf", "banque"]):
+        return "Admin_Finance_et_Droit"
+
+    if any(k in low for k in ["neuro", "hpi", "tsa", "tdah", "audhd", "autis", "masking", "monotropism", "ados", "cra", "psycho", "metacognit", "introspection", "atypie"]):
+        return "Introspection_et_Neuroatypie"
+
+    if any(k in low for k in ["sante", "santé", "medical", "dentaire", "sommeil", "apnee", "apnée", "pharmaco", "vapo", "cannab", "weed", "cbd", "thc", "ordonnance"]):
+        return "Sante_et_Pharmacologie"
+
+    if any(k in low for k in ["nutrition", "cuisine", "volume", "eating", "calorie", "repas", "cuiseur", "riz", "creami", "glycem", "recette", "aliment", "gastronomie"]):
+        return "Nutrition_et_Cuisine"
+
+    if any(k in low for k in ["philo", "spinoza", "camus", "absurd", "epistemol", "ethique", "logique", "metaphys", "physique", "morale"]):
+        return "Philo_et_Epistemologie"
+
+    if any(k in low for k in ["sociol", "geopolit", "politique", "economie", "demograph", "ideolog", "societe", "société", "histoire"]):
+        return "Sociologie_et_Geopolitique"
+
+    if any(k in low for k in ["mmorpg", "warcraft", "wow", "mythic", "raid", "guilde", "guild wars", "tft", "league of legends", "esport", "theorycraft"]):
+        return "MMORPG_et_Esport"
+
+    if any(k in low for k in ["gaming", "game", "modding", "emulat", "rpg", "jdr", "steam", "switch", "jeu"]):
+        return "Gaming_et_GameDesign"
+
+    if any(k in low for k in ["projet", "produit", "product", "mvp", "ux", "ui", "soutenance", "agile", "scrum", "cadrage"]):
+        return "Chefferie_Projet_et_Produit"
+
+    return "A_Trier"
 
 
 def _load_env_file(dotenv_path: Path) -> None:
@@ -81,6 +215,12 @@ class Settings(BaseModel):
     )
     FULL_DUAL_MODEL_VRAM_GB: float = Field(
         default_factory=lambda: float(os.getenv("FULL_DUAL_MODEL_VRAM_GB", "12.8"))
+    )
+    VRAM_STRICT_ABORT_FREE_GB: float = Field(
+        default_factory=lambda: float(os.getenv("VRAM_STRICT_ABORT_FREE_GB", "8.0"))
+    )
+    VRAM_REASONING_MIN_FREE_GB: float = Field(
+        default_factory=lambda: float(os.getenv("VRAM_REASONING_MIN_FREE_GB", "12.8"))
     )
     TAKEOUT_MAX_DISTILL_SESSIONS: int = Field(
         default_factory=lambda: int(os.getenv("TAKEOUT_MAX_DISTILL_SESSIONS", "0"))  # 0 = Toutes les sessions qualifiées
@@ -188,6 +328,10 @@ class Settings(BaseModel):
         return self.META_DIR / "Taxonomie_Tags.md"
 
     @property
+    def MISC_ARCHIVE_PATH(self) -> Path:
+        return self.META_DIR / "00_MISC_ET_BRUIT_ARCHIVE.md"
+
+    @property
     def EPISODIC_DIR(self) -> Path:
         return self.VAULT_ROOT / "01_Episodique"
 
@@ -222,6 +366,11 @@ class Settings(BaseModel):
     @property
     def GOOGLE_DRIVE_SYNC_DIR(self) -> Path:
         return self.VAULT_ROOT / "Google_Drive_Sync"
+
+    @property
+    def MODEL_REASONING(self) -> str:
+        """Alias pour MODEL_HEAVY_SYNTHESIS (gemma4:26b-a4b)."""
+        return self.MODEL_HEAVY_SYNTHESIS
 
     @property
     def GGUF_FAST_PATH(self) -> Path:

@@ -13,9 +13,10 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Permet l'exécution directe : python src/ingestors/takeout_ingestor.py
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -23,10 +24,13 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from pydantic import BaseModel, Field
+from tqdm import tqdm
 
-from src.config import settings
+from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
 from src.database.db_manager import (
+    ChatMessageRecord,
     ChatSessionRecord,
+    DailyMetricRecord,
     DBManager,
     HistoricalFootprintRecord,
 )
@@ -38,6 +42,7 @@ from src.llm.prompts import (
     PROMPT_COGNITIVE_PROFILING_USER,
     PROMPT_SESSION_DISTILLATION_SYSTEM,
     PROMPT_SESSION_DISTILLATION_USER,
+    PROMPT_STRICT_TAXONOMY_RULE,
     SYSTEM_PROMPT_ANTI_WIKIPEDIA,
 )
 
@@ -54,15 +59,15 @@ class DistilledConceptSchema(BaseModel):
     is_worth_indexing: bool = Field(description="False si la session n'est que du bruit ou un test trivial sans conclusion.")
     concept_title: str = Field(description="Titre conceptuel précis et canonique (ex: 'Configuration Serveur Plex & Riven sous Docker'). Jamais une phrase de prompt.")
     slug: str = Field(description="Slug kebab-case propre (ex: 'configuration-plex-riven-docker')")
-    semantic_topic: str = Field(description="Tag de la taxonomie existante ou nouveau tag Domaine_SousDomaine")
-    is_new_topic: bool = Field(default=False, description="True si semantic_topic est une nouvelle catégorie absente de la liste")
-    new_topic_description: Optional[str] = Field(default=None, description="Description en 1 phrase si nouveau topic")
-    tags: List[str] = Field(description="3 à 5 sous-tags techniques en minuscule")
+    semantic_topic: str = Field(description="Exactement l'une des 15 macro-catégories autorisées de la liste stricte.")
+    is_new_topic: bool = Field(default=False, description="Désormais déprécié, toujours False.")
+    new_topic_description: Optional[str] = Field(default=None, description="Description si nouveau topic.")
+    tags: List[str] = Field(default_factory=list, description="3 à 6 tags techniques libres en minuscules kebab-case.")
     summary_1_line: str = Field(description="Résumé dense en une seule phrase de la conclusion ou de l'architecture.")
     synthesized_markdown_body: str = Field(
         description="Synthèse structurée en Markdown (sections ### Contexte, ### Arbitrages & Architecture, ### Conclusions & Commandes Clés). Zéro intro Wikipédia."
     )
-    related_concepts: List[str] = Field(description="2 à 3 titres de concepts connexes pour le maillage Obsidian")
+    related_concepts: List[str] = Field(default_factory=list, description="2 à 3 titres de concepts connexes pour le maillage Obsidian")
 
 
 class ParsedTurn(BaseModel):
@@ -93,9 +98,7 @@ def sanitize_turn_text(text: str, max_turn_chars: int = 3500) -> str:
     """
     if not text:
         return ""
-    # 1. Suppression des séquences d'espaces/tabulations de scraping UI (ex: SillyTavern sliders)
     cleaned = re.sub(r"(?:[\t \xa0]{4,}\n){3,}", "\n[Dump d'interface UI omis]\n", text)
-    # 2. Compression des logs d'erreurs ou stacktraces de plus de 15 lignes consécutives
     lines = cleaned.splitlines()
     if len(lines) > 35:
         filtered_lines: List[str] = []
@@ -130,7 +133,7 @@ def compute_realistic_session_duration_min(turns: List[ParsedTurn], max_gap_min:
     """
     if not turns:
         return 0
-    total_sec = 180.0  # 3 min de base pour l'ouverture de session
+    total_sec = 180.0
     max_gap_sec = max_gap_min * 60.0
     for i in range(1, len(turns)):
         delta_sec = max(0.0, (turns[i].timestamp - turns[i - 1].timestamp).total_seconds())
@@ -138,27 +141,27 @@ def compute_realistic_session_duration_min(turns: List[ParsedTurn], max_gap_min:
     return max(5, int(round(total_sec / 60.0)))
 
 
+def ensure_strict_taxonomy_file() -> None:
+    """Écrit ou écrase Taxonomie_Tags.md avec la liste stricte et fermée des 16 macro-catégories."""
+    settings.TAXONOMIE_TAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Taxonomie Maîtresse des Tags (Liste Fermée)",
+        "",
+        "Liste stricte des 16 `semantic_topic` autorisés pour le coffre Exocortex :",
+        "",
+    ]
+    for topic, desc in AUTHORIZED_SEMANTIC_TOPICS.items():
+        lines.append(f"- **`{topic}`** : {desc}")
+    lines.append("")
+    settings.TAXONOMIE_TAGS_PATH.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Taxonomie maîtresse à 16 macro-catégories validée dans %s", settings.TAXONOMIE_TAGS_PATH.name)
+
+
 def register_new_taxonomy_tag(tag_name: str, description: Optional[str] = None) -> bool:
-    """
-    Ajoute proprement un nouveau topic validé au format strict Domaine_SousDomaine dans Taxonomie_Tags.md.
-    """
-    if not tag_name or not re.match(r"^[A-Za-z0-9]+_[A-Za-z0-9_]+$", tag_name):
-        return False
-    tax_path = settings.TAXONOMIE_TAGS_PATH
-    if not tax_path.exists():
-        return False
-
-    content = tax_path.read_text(encoding="utf-8")
-    if f"`{tag_name}`" in content or f"**{tag_name}**" in content:
-        return False
-
-    desc_text = description or "Sujet émergent qualifié par distillation"
-    new_entry = f"\n- `{tag_name}` : {desc_text}\n"
-
-    with open(tax_path, "a", encoding="utf-8") as f:
-        f.write(new_entry)
-    logger.info("Nouveau tag taxonomique enregistré dans %s : `%s`", tax_path.name, tag_name)
-    return True
+    """Déprécié en v0.1.2 : la taxonomie est fermée à 16 macro-catégories."""
+    macro = normalize_to_macro_topic(tag_name)
+    logger.debug("Tentative d'enregistrement de '%s' remappée vers la macro-catégorie '%s'", tag_name, macro)
+    return False
 
 
 # ==============================================================================
@@ -483,13 +486,14 @@ def sessionize_gemini_turns(
     inactivity_threshold_min: int = settings.INACTIVITY_SESSION_THRESHOLD_MIN,
     min_turns: int = settings.MIN_TURNS_THRESHOLD,
     min_user_chars: int = settings.MIN_USER_CHARS_THRESHOLD,
-) -> List[ReconstructedSession]:
+) -> Tuple[List[ReconstructedSession], List[ReconstructedSession]]:
     """
     Reconstruit les sessions cognitives à partir des tours individuels :
     1. Regroupe par session_id officiel (ou identifiant synthétique).
     2. Scinde en sous-sessions dès qu'une pause d'inactivité > 120 min est observée.
     3. Réordonne les tours par ordre chronologique strict (du plus ancien au plus récent).
-    4. Filtre le bruit : élimine les sessions avec turn_count < 3 ET user_char_count < 250.
+    4. Sépare les sessions qualifiées et les micro-sessions bruitées (< 3 tours OU < 250 caractères).
+    Retourne (sessions_qualifiees, sessions_bruit).
     """
     logger.info("Démarrage de la sessionisation sur %d tours...", len(turns))
     sorted_turns = sorted(turns, key=lambda t: t.timestamp)
@@ -514,7 +518,7 @@ def sessionize_gemini_turns(
 
     # 2. Scission intra-thread par seuil d'inactivité (120 min)
     reconstructed: List[ReconstructedSession] = []
-    filtered_out_noise = 0
+    noise_sessions: List[ReconstructedSession] = []
     inactivity_delta = timedelta(minutes=inactivity_threshold_min)
 
     for thread_key, t_list in threads_map.items():
@@ -533,16 +537,10 @@ def sessionize_gemini_turns(
         if current_sub:
             sub_sessions.append(current_sub)
 
-        # 3. Création des ReconstructedSession pour chaque sous-session qualifiée
+        # 3. Création des ReconstructedSession pour chaque sous-session
         for sub_idx, sub_turns in enumerate(sub_sessions, 1):
             t_count = len(sub_turns)
             total_chars = sum(t.user_char_count for t in sub_turns)
-
-            # Règle anti-bruit stricte : ignorer si moins de 3 tours OU moins de 250 caractères
-            if t_count < min_turns or total_chars < min_user_chars:
-                filtered_out_noise += 1
-                continue
-
             start_time = sub_turns[0].timestamp
             end_time = sub_turns[-1].timestamp
             first_prompt = sub_turns[0].user_prompt
@@ -554,26 +552,31 @@ def sessionize_gemini_turns(
             else:
                 final_sid = f"{thread_key}_s{sub_idx:02d}_{start_time.strftime('%Y%m%d')}"
 
-            reconstructed.append(
-                ReconstructedSession(
-                    session_id=final_sid,
-                    timestamp_start=start_time,
-                    timestamp_end=end_time,
-                    turns=sub_turns,
-                    turn_count=t_count,
-                    user_char_count=total_chars,
-                    summary=summary_clean,
-                )
+            sess_obj = ReconstructedSession(
+                session_id=final_sid,
+                timestamp_start=start_time,
+                timestamp_end=end_time,
+                turns=sub_turns,
+                turn_count=t_count,
+                user_char_count=total_chars,
+                summary=summary_clean,
             )
+
+            # Règle anti-bruit : si moins de 3 tours OU moins de 250 caractères -> bruit
+            if t_count < min_turns or total_chars < min_user_chars:
+                noise_sessions.append(sess_obj)
+            else:
+                reconstructed.append(sess_obj)
 
     # Tri final chronologique des sessions
     reconstructed.sort(key=lambda s: s.timestamp_start)
+    noise_sessions.sort(key=lambda s: s.timestamp_start)
     logger.info(
-        "Sessionisation achevée : %d sessions qualifiées retenues (%d sous-sessions bruitées écartées).",
+        "Sessionisation achevée : %d sessions qualifiées retenues (%d micro-sessions bruitées archivées).",
         len(reconstructed),
-        filtered_out_noise,
+        len(noise_sessions),
     )
-    return reconstructed
+    return reconstructed, noise_sessions
 
 
 # ==============================================================================
@@ -788,15 +791,551 @@ def perform_burst_clustering(
 # PASSE 2 & 3 : PROFILAGE ET DISTILLATION DES PREMIÈRES NOTES ATOMIQUES
 # ==============================================================================
 
+def scan_and_upgrade_existing_concepts(db: DBManager) -> Set[str]:
+    """
+    Scanne tous les fichiers Markdown existants dans Vault_Data/02_Concepts/ :
+    - Détecte et purge les faux succès (fallbacks heuristiques v0.1.1) du disque et de LanceDB.
+    - Assainit les fiches réussies sur place :
+        * Retrait des blocs de requêtes/vidéos corrélées YouTube/Search.
+        * Remapping déterministe vers les 15 macro-catégories maîtresses (+ insertion de l'ancien topic dans tags).
+        * Ajout de session_id et distillation_status: "success" dans le frontmatter.
+        * Synchronisation des statuts en base SQLite.
+    - Retourne l'ensemble des session_id complétées pour le mode Delta (Skip instantané).
+    """
+    ensure_strict_taxonomy_file()
+
+    completed_session_ids: Set[str] = set()
+    # Ajout des sessions déjà marquées success ou misc_noise dans SQLite
+    completed_session_ids.update(db.get_completed_session_ids_from_db())
+
+    concept_files = sorted(list(settings.CONCEPTS_DIR.glob("*.md")))
+    if not concept_files:
+        logger.info("Aucune fiche existante trouvée dans %s.", settings.CONCEPTS_DIR)
+        return completed_session_ids
+
+    purged_fallbacks = 0
+    upgraded_notes = 0
+
+    with tqdm(total=len(concept_files), desc="Assainissement Notes Existantes", unit="note") as pbar:
+        for fpath in concept_files:
+            if fpath.name.startswith("all-") or fpath.name.startswith("all_"):
+                pbar.update(1)
+                continue
+
+            try:
+                content = fpath.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning("Erreur lecture %s : %s", fpath.name, exc)
+                pbar.update(1)
+                continue
+
+            # Extraction de session_id
+            m_sid = re.search(r'session_id:\s*["\']?([^"\'\n\r]+)["\']?', content)
+            if m_sid:
+                extracted_sid = m_sid.group(1).strip()
+            else:
+                m_body_sid = re.search(r'Session Gemini [^\w]*([a-zA-Z0-9_-]+)', content)
+                extracted_sid = m_body_sid.group(1).strip() if m_body_sid else None
+
+            # Découpe du corps Markdown avant le bloc de télémétrie final de l'Exocortex (v0.1.3 Hotfix)
+            if "> - **Temps estimé sur ce sujet :**" in content:
+                body_before_abstract = content.split("> - **Temps estimé sur ce sujet :**")[0]
+                if "> [!abstract]-" in body_before_abstract:
+                    body_before_abstract = body_before_abstract.rsplit("> [!abstract]-", 1)[0]
+            elif "> [!abstract]-" in content:
+                body_before_abstract = content.rsplit("> [!abstract]-", 1)[0]
+            else:
+                body_before_abstract = content
+
+            body_before_abstract = body_before_abstract.strip()
+            non_empty_lines = [l.strip() for l in body_before_abstract.splitlines() if l.strip()]
+            last_line = non_empty_lines[-1] if non_empty_lines else ""
+
+            is_truncated = False
+            if last_line:
+                valid_endings = ('.', '!', '?', ')', '*', '`', '|', ':', '"', '»', ']', '}', '>')
+                if (
+                    last_line.endswith("pour assimiler la structure")
+                    or last_line.endswith("pour s'assurer que le")
+                ):
+                    is_truncated = True
+                elif not last_line.endswith(valid_endings):
+                    # Si la note fait plus de 500 caractères et possède une section de conclusion,
+                    # ne pas la rejeter si la dernière ligne est un tableau ou une puce/texte sans point final
+                    has_conclusion = bool(re.search(r"###\s*(?:Conclusions?|Synthèse|Bilan|Commandes\s*Clés)", body_before_abstract, re.IGNORECASE))
+                    is_table_or_bullet = last_line.startswith(("|", "*", "-", ">"))
+                    if len(body_before_abstract) > 500 and (has_conclusion or is_table_or_bullet):
+                        is_truncated = False
+                    else:
+                        is_truncated = True
+
+            # Détection des 5 critères de fallback dégradé ou troncature
+            is_fallback = (
+                is_truncated
+                or "takeout_coldstart" in content
+                or ("### Problématique & Contexte" in content and "- Session composée de" in content)
+                or bool(re.search(r'semantic_topic:\s*["\']?A_Trier["\']?', content))
+                or bool(re.search(r'distillation_status:\s*["\']?failed_fallback["\']?', content))
+            )
+
+            if is_fallback:
+                if is_truncated:
+                    logger.warning("Fiche tronquée détectée et purgée : %s (dernière ligne : '%s')", fpath.name, last_line[-40:])
+                # 1. Purge disque et LanceDB
+                try:
+                    fpath.unlink()
+                except Exception as exc:
+                    logger.warning("Impossible de supprimer %s : %s", fpath.name, exc)
+                vector_store.delete_by_slug(fpath.stem)
+                purged_fallbacks += 1
+                # Réinitialisation SQLite pour permettre la re-distillation
+                if extracted_sid:
+                    db.update_session_distillation_metadata(
+                        session_id=extracted_sid,
+                        topics_list=[],
+                        notes_list=[],
+                        distillation_status="pending",
+                    )
+                # Ne pas ajouter extracted_sid à completed_session_ids -> sera re-distillé
+            else:
+                # 2. Fiche réussie -> In-Place Upgrade
+                if extracted_sid:
+                    completed_session_ids.add(extracted_sid)
+
+                # Parsing YAML frontmatter
+                m_yaml = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
+                if m_yaml:
+                    yaml_raw = m_yaml.group(1)
+                    body_raw = m_yaml.group(2)
+                else:
+                    yaml_raw = ""
+                    body_raw = content
+
+                # Extraction / remapping du semantic_topic
+                m_topic = re.search(r'semantic_topic:\s*["\']?([^"\'\n\r]+)["\']?', yaml_raw)
+                raw_topic = m_topic.group(1).strip() if m_topic else "Dev_et_Architecture_Tech"
+                macro_topic = normalize_to_macro_topic(raw_topic)
+
+                # Extraction / mise à jour des tags
+                m_tags = re.search(r'tags:\s*(\[.*?\])', yaml_raw)
+                tags_list: List[str] = []
+                if m_tags:
+                    try:
+                        tags_list = json.loads(m_tags.group(1))
+                    except Exception:
+                        tags_list = []
+
+                if raw_topic != macro_topic:
+                    legacy_tag = raw_topic.lower()
+                    if legacy_tag not in [t.lower() for t in tags_list]:
+                        tags_list.append(legacy_tag)
+
+                # Construction du nouveau frontmatter
+                lines_yaml = yaml_raw.splitlines()
+                new_yaml_lines = []
+                has_sid = False
+                has_status = False
+
+                for line in lines_yaml:
+                    if line.strip().startswith("semantic_topic:"):
+                        new_yaml_lines.append(f'semantic_topic: "{macro_topic}"')
+                    elif line.strip().startswith("tags:"):
+                        new_yaml_lines.append(f"tags: {json.dumps(tags_list, ensure_ascii=False)}")
+                    elif line.strip().startswith("session_id:"):
+                        has_sid = True
+                        new_yaml_lines.append(line)
+                    elif line.strip().startswith("distillation_status:"):
+                        has_status = True
+                        new_yaml_lines.append('distillation_status: "success"')
+                    else:
+                        new_yaml_lines.append(line)
+
+                if not has_sid and extracted_sid:
+                    new_yaml_lines.append(f'session_id: "{extracted_sid}"')
+                if not has_status:
+                    new_yaml_lines.append('distillation_status: "success"')
+
+                # Nettoyage du corps Markdown
+                # a. Retrait du bloc Requêtes et vidéos corrélées
+                clean_body = re.sub(
+                    r'>\s*-\s*\*\*Requêtes et vidéos corrélées\s*:\*\*.*?(?=>\s*-\s*\*\*Connexions sémantiques|\Z)',
+                    '',
+                    body_raw,
+                    flags=re.DOTALL,
+                )
+                # b. Séparation du bloc officiel de télémétrie et suppression des blocs abstract internes/doublons du LLM
+                if "> - **Temps estimé sur ce sujet :**" in clean_body:
+                    parts = clean_body.split("> - **Temps estimé sur ce sujet :**", 1)
+                    pre_telemetry = parts[0]
+                    telemetry_part = "> - **Temps estimé sur ce sujet :**" + parts[1]
+                    if "> [!abstract]-" in pre_telemetry:
+                        pre_telemetry = pre_telemetry.rsplit("> [!abstract]-", 1)[0]
+                    # Suppression de tout bloc abstract interne
+                    clean_main = re.sub(r'>\s*\[!abstract\]-[^\n]*\n(?:>[^\n]*\n)*', '', pre_telemetry).strip()
+                    clean_body = f"{clean_main}\n\n> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)\n{telemetry_part.strip()}"
+                else:
+                    # S'il n'y a pas le bloc de télémétrie officiel, on supprime tout abstract interne résiduel
+                    clean_body = re.sub(r'>\s*\[!abstract\]-[^\n]*\n(?:>[^\n]*\n)*', '', clean_body).strip()
+
+                new_file_content = f"---\n{chr(10).join(new_yaml_lines).strip()}\n---\n\n{clean_body.strip()}\n"
+                try:
+                    fpath.write_text(new_file_content, encoding="utf-8")
+                    upgraded_notes += 1
+                except Exception as exc:
+                    logger.warning("Erreur écriture mise à niveau %s : %s", fpath.name, exc)
+
+                # Mise à jour en base SQLite
+                if extracted_sid:
+                    db.update_session_distillation_metadata(
+                        session_id=extracted_sid,
+                        topics_list=[macro_topic],
+                        notes_list=[fpath.stem],
+                        distillation_status="success",
+                    )
+
+            pbar.update(1)
+
+    # Intégration des sessions rejetées (bruit consolidé) pour éviter de les re-distiller
+    with db.get_connection() as conn:
+        cur = conn.execute("SELECT session_id FROM chat_sessions WHERE distillation_status = 'misc_noise';")
+        for row in cur.fetchall():
+            completed_session_ids.add(row[0])
+
+    logger.info(
+        "Assainissement terminé : %d fallbacks purgés, %d fiches assainies sur place, %d sessions complètes en mémoire.",
+        purged_fallbacks,
+        upgraded_notes,
+        len(completed_session_ids),
+    )
+    return completed_session_ids
+
+
+def compile_misc_noise_archive(
+    noise_sessions: List[ReconstructedSession],
+    llm_rejected_sessions: List[ReconstructedSession],
+    archive_path: Optional[Path] = None,
+) -> Path:
+    """
+    Compile un registre exhaustif et dense de toutes les micro-sessions (< 3 tours ou < 250 car.)
+    et des sessions rejetées par le LLM (is_worth_indexing=False) dans 00_Meta/00_MISC_ET_BRUIT_ARCHIVE.md.
+    """
+    out_path = archive_path or settings.MISC_ARCHIVE_PATH
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    entries = []
+    for s in noise_sessions:
+        entries.append((s, "Micro-session"))
+    for s in llm_rejected_sessions:
+        entries.append((s, "Rejeté par LLM"))
+
+    # Tri antéchronologique strict
+    entries.sort(key=lambda item: item[0].timestamp_start, reverse=True)
+
+    count_noise = len(noise_sessions)
+    count_llm = len(llm_rejected_sessions)
+    total = len(entries)
+
+    lines = [
+        "# Registre Consolidé du Bruit & Micro-Sessions",
+        "",
+        "Archive exhaustive et antéchronologique des micro-sessions (< 3 tours ou < 250 caractères) "
+        "et des requêtes déclarées triviales par le LLM (`is_worth_indexing=False`).",
+        "",
+        "| Statut | Total |",
+        "|---|---|",
+        f"| Micro-sessions (< 3 tours) | {count_noise} |",
+        f"| Rejetées par LLM (Triviales) | {count_llm} |",
+        f"| **Total archivé** | **{total}** |",
+        "",
+        "---",
+        "",
+        "## Chronologie Exhaustive du Bruit",
+        "",
+    ]
+
+    for s, origin in entries:
+        dt_str = s.timestamp_start.strftime("%Y-%m-%d %H:%M")
+        first_q = sanitize_turn_text(s.turns[0].user_prompt)[:140].replace("\n", " ").strip()
+        first_r = sanitize_turn_text(s.turns[0].ai_response)[:160].replace("\n", " ").strip() if s.turns[0].ai_response else "N/A"
+        line = f"- **[{dt_str}]** (`{s.session_id}` | {s.turn_count}t, {s.user_char_count}c | *{origin}*) — **Q:** {first_q} ➔ **R:** {first_r}"
+        lines.append(line)
+
+    lines.append("")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Registre du bruit compilé dans %s (%d sessions archivées).", out_path.name, total)
+    return out_path
+
+
+def generate_cold_start_episodic_journals(sessions: List[ReconstructedSession], db: DBManager) -> int:
+    """
+    Génère les journaux quotidiens rétroactifs 01_Episodique/YYYY-MM-DD.md
+    et peuple daily_metrics à partir de l'historique Takeout (sessions Gemini).
+    """
+    settings.EPISODIC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Récupération de l'état des sessions depuis SQLite pour obtenir les notes et topics associés
+    session_meta_map: Dict[str, Dict[str, Any]] = {}
+    with db.get_connection() as conn:
+        cur = conn.execute("SELECT session_id, extracted_topics_json, generated_notes_json, summary, distillation_status FROM chat_sessions;")
+        for row in cur.fetchall():
+            session_meta_map[row["session_id"]] = {
+                "topics": json.loads(row["extracted_topics_json"]) if row["extracted_topics_json"] else [],
+                "notes": json.loads(row["generated_notes_json"]) if row["generated_notes_json"] else [],
+                "summary": row["summary"] or "",
+                "status": row["distillation_status"] or "pending",
+            }
+
+    # Regroupement des sessions par date YYYY-MM-DD
+    by_date: Dict[str, List[ReconstructedSession]] = {}
+    for s in sessions:
+        d_str = s.timestamp_start.strftime("%Y-%m-%d")
+        by_date.setdefault(d_str, []).append(s)
+
+    sorted_dates = sorted(by_date.keys())
+    generated_count = 0
+
+    with tqdm(total=len(sorted_dates), desc="Génération Journaux Épisodiques", unit="jour") as pbar:
+        for d_str in sorted_dates:
+            day_sessions = sorted(by_date[d_str], key=lambda s: s.timestamp_start)
+
+            total_duration_min = sum(compute_realistic_session_duration_min(s.turns) for s in day_sessions)
+            total_duration_sec = total_duration_min * 60
+
+            max_sess = max(day_sessions, key=lambda s: compute_realistic_session_duration_min(s.turns))
+            max_hf_min = compute_realistic_session_duration_min(max_sess.turns)
+            max_hf_sec = max_hf_min * 60
+            max_meta = session_meta_map.get(max_sess.session_id, {})
+            max_topic = (max_meta.get("topics") or ["General"])[0]
+
+            topic_seconds: Dict[str, int] = {}
+            topic_session_counts: Dict[str, int] = {}
+            for s in day_sessions:
+                dur_sec = compute_realistic_session_duration_min(s.turns) * 60
+                meta = session_meta_map.get(s.session_id, {})
+                t_list = meta.get("topics") or ["General"]
+                primary_t = normalize_to_macro_topic(t_list[0])
+                topic_seconds[primary_t] = topic_seconds.get(primary_t, 0) + dur_sec
+                topic_session_counts[primary_t] = topic_session_counts.get(primary_t, 0) + 1
+
+            sorted_topics = sorted(topic_seconds.items(), key=lambda x: x[1], reverse=True)
+
+            # Mise à jour SQLite daily_metrics si aucune activité OS présente
+            day_obj = datetime.strptime(d_str, "%Y-%m-%d").date()
+            with db.get_connection() as conn:
+                cur = conn.execute("SELECT total_screen_sec FROM daily_metrics WHERE date = ?;", (d_str,))
+                existing_m = cur.fetchone()
+
+            if not existing_m or existing_m["total_screen_sec"] == 0:
+                top_topics_clean = {k: v for k, v in sorted_topics}
+                db.upsert_daily_metrics(
+                    DailyMetricRecord(
+                        date=day_obj,
+                        total_screen_sec=total_duration_sec,
+                        active_production_sec=int(total_duration_sec * 0.7),
+                        passive_exploration_sec=int(total_duration_sec * 0.3),
+                        max_hyperfocus_sec=max_hf_sec,
+                        max_hyperfocus_topic=max_topic,
+                        context_switches_per_hour=round(len(day_sessions) / max(1.0, total_duration_sec / 3600.0), 2),
+                        read_vs_write_ratio=0.4,
+                        top_topics_json=json.dumps(top_topics_clean, ensure_ascii=False),
+                    )
+                )
+
+            # Génération de la note 01_Episodique/YYYY-MM-DD.md
+            episodic_file = settings.EPISODIC_DIR / f"{d_str}.md"
+            should_write = True
+            if episodic_file.exists():
+                try:
+                    f_content = episodic_file.read_text(encoding="utf-8")
+                    if 'origin: "takeout_cold_start"' not in f_content and 'origin: takeout_cold_start' not in f_content:
+                        should_write = False
+                except Exception:
+                    should_write = True
+
+            if should_write:
+                total_duration_fmt = f"{total_duration_min // 60}h{total_duration_min % 60:02d}" if total_duration_min >= 60 else f"{total_duration_min} min"
+                max_hf_fmt = f"{max_hf_min // 60}h{max_hf_min % 60:02d}" if max_hf_min >= 60 else f"{max_hf_min} min"
+
+                table_rows = []
+                for top_name, top_sec in sorted_topics:
+                    cnt = topic_session_counts.get(top_name, 1)
+                    t_min = top_sec // 60
+                    table_rows.append(f"| `{top_name}` | {cnt} | {t_min} min |")
+                table_md = "\n".join(table_rows) if table_rows else "| `General` | 1 | 0 min |"
+
+                sessions_md_lines = []
+                for s in day_sessions:
+                    s_hm = s.timestamp_start.strftime("%H:%M")
+                    e_hm = s.timestamp_end.strftime("%H:%M")
+                    s_dur = compute_realistic_session_duration_min(s.turns)
+                    s_meta = session_meta_map.get(s.session_id, {})
+                    s_notes = s_meta.get("notes") or []
+                    s_summary = s_meta.get("summary") or s.summary
+
+                    if s_notes:
+                        note_slug = s_notes[0]
+                        link_target = f"[[{note_slug}]]"
+                        sessions_md_lines.append(f"- **{s_hm} - {e_hm}** ({s.turn_count} tours, {s_dur} min) — {link_target} : *{s_summary}*")
+                    else:
+                        sessions_md_lines.append(f"- **{s_hm} - {e_hm}** ({s.turn_count} tours, {s_dur} min) — `{s.session_id}` : *{s_summary}*")
+
+                sessions_md = "\n".join(sessions_md_lines)
+                topics_header_json = json.dumps([t[0] for t in sorted_topics], ensure_ascii=False)
+
+                ep_content = f"""---
+id: "{d_str.replace('-', '')}"
+date: "{d_str}"
+type: "episodic_journal"
+origin: "takeout_cold_start"
+total_reflection_min: {total_duration_min}
+sessions_count: {len(day_sessions)}
+top_topics: {topics_header_json}
+---
+
+# Journal Épisodique — {d_str}
+
+## 1. Vue d'Ensemble & Télémétrie
+- **Temps total de réflexion / dialogue IA :** {total_duration_fmt}
+- **Nombre de sessions cognitives :** {len(day_sessions)}
+- **Session d'hyperfocus maximale :** {max_hf_fmt} (`{max_topic}`)
+
+### Répartition Thématique
+| Macro-Catégorie | Sessions | Temps Estimé |
+|---|---|---|
+{table_md}
+
+## 2. Sessions Cognitives Réalisées
+{sessions_md}
+"""
+                episodic_file.write_text(ep_content, encoding="utf-8")
+                generated_count += 1
+
+            pbar.update(1)
+
+    logger.info("Cold Start Épisodique achevé : %d journaux quotidiens rédigés dans 01_Episodique/.", generated_count)
+    return generated_count
+
+
+def save_distilled_concept_note(
+    sess: ReconstructedSession,
+    distilled: Optional[DistilledConceptSchema],
+    db: DBManager,
+    allow_quarantine: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Écrit la note conceptuelle Markdown et met à jour SQLite chat_sessions.
+    Retourne (success: bool, status: 'success' | 'misc_noise' | 'failed_fallback' | 'skipped').
+    Applique une protection stricte anti-écrasement : ne remplace jamais une note existante valide par #A_Trier.
+    """
+    duration_min = compute_realistic_session_duration_min(sess.turns)
+    duration_fmt = f"{duration_min // 60}h{duration_min % 60:02d}" if duration_min >= 60 else f"{duration_min} min"
+
+    if distilled and not distilled.is_worth_indexing:
+        db.update_session_distillation_metadata(
+            session_id=sess.session_id,
+            topics_list=[],
+            notes_list=[],
+            summary=sess.summary,
+            distillation_status="misc_noise",
+        )
+        return False, "misc_noise"
+
+    if not distilled:
+        if not allow_quarantine:
+            return False, "failed"
+
+        # Protection anti-écrasement : si une note valide existe déjà sur disque, ne jamais l'écraser par #A_Trier
+        for existing_f in settings.CONCEPTS_DIR.glob("*.md"):
+            try:
+                txt = existing_f.read_text(encoding="utf-8", errors="replace")
+                if f'session_id: "{sess.session_id}"' in txt and 'distillation_status: "success"' in txt:
+                    logger.info("Protection anti-écrasement activée : note valide %s préservée pour %s.", existing_f.name, sess.session_id)
+                    return True, "skipped"
+            except Exception:
+                pass
+
+        first_user = sanitize_turn_text(sess.turns[0].user_prompt)[:100]
+        clean_title = re.sub(r"[^\w\s-]", "", first_user).strip().title() or f"Session-{sess.session_id}"
+        slug = f"a-trier-{sess.session_id.lower()}"
+        macro_topic = "A_Trier"
+        tags_list = ["a-trier", "failed-fallback"]
+        summary_1l = sess.summary[:140] if sess.summary else first_user
+        body_md = (
+            f"### Problématique & Contexte\n{first_user}\n\n"
+            f"### Arbitrages Techniques & Solutions\n"
+            f"- Session en quarantaine technique après échec de distillation.\n"
+            f"- {sess.turn_count} échanges techniques sauvegardés dans SQLite (`chat_messages`)."
+        )
+        related_list: List[str] = []
+        dist_status = "failed_fallback"
+    else:
+        clean_title = distilled.concept_title
+        slug = distilled.slug
+        macro_topic = normalize_to_macro_topic(distilled.semantic_topic)
+        tags_list = distilled.tags or []
+        if macro_topic != distilled.semantic_topic and distilled.semantic_topic.lower() not in [t.lower() for t in tags_list]:
+            tags_list.append(distilled.semantic_topic.lower())
+        summary_1l = distilled.summary_1_line
+        raw_body_md = distilled.synthesized_markdown_body
+        body_md = re.sub(r'>\s*\[!abstract\]-[^\n]*\n(?:>[^\n]*\n)*', '', raw_body_md).strip()
+        related_list = distilled.related_concepts or []
+        dist_status = "success"
+
+    concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
+    created_date_str = sess.timestamp_start.strftime("%Y-%m-%d")
+    updated_date_str = sess.timestamp_end.strftime("%Y-%m-%d")
+    concept_id = sess.timestamp_start.strftime("%Y%m%d%H%M")
+    related_md = ", ".join([f"[[{rc}]]" for rc in related_list]) if related_list else "[[Exocortex]]"
+    tags_json = json.dumps(tags_list, ensure_ascii=False)
+    summary_clean = summary_1l.replace('"', "'")
+
+    note_content = f"""---
+id: "{concept_id}"
+title: "{clean_title}"
+type: "concept"
+origin: ["gemini_takeout"]
+semantic_topic: "{macro_topic}"
+tags: {tags_json}
+session_id: "{sess.session_id}"
+distillation_status: "{dist_status}"
+created_at: "{created_date_str}"
+updated_at: "{updated_date_str}"
+total_time_invested_min: {duration_min}
+summary_1_line: "{summary_clean}"
+---
+
+# {clean_title}
+
+{body_md}
+
+> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
+> - **Temps estimé sur ce sujet :** {duration_fmt}
+> - **Sources épisodiques :**
+>   - Session Gemini `{sess.session_id}` du {created_date_str} ({sess.turn_count} échanges, {sess.user_char_count} chars écrits)
+> - **Connexions sémantiques suggérées :** {related_md}
+"""
+    concept_file.write_text(note_content, encoding="utf-8")
+
+    db.update_session_distillation_metadata(
+        session_id=sess.session_id,
+        topics_list=[macro_topic],
+        notes_list=[slug],
+        summary=summary_1l,
+        distillation_status=dist_status,
+    )
+    return True, dist_status
+
+
 def initialize_meta_and_concepts(
     sessions: List[ReconstructedSession],
+    noise_sessions: List[ReconstructedSession],
     db: DBManager,
     max_distill_sessions: Optional[int] = None,
 ) -> None:
     """
-    Initialise 00_Meta/ et génère les premières fiches conceptuelles atomiques dans 02_Concepts/.
-    En mode Cloud API : sollicite l'API SOTA.
-    En mode Web Manuel : crée le profil socle et distille les fiches majeures.
+    Initialise 00_Meta/, assainit l'existant, distille les sessions restantes via l'architecture
+    à 3 vagues séquentielles (Multi-Pass VRAM Queue : 26B Thinking -> 26B No-Think -> 12B Fallback),
+    compile le registre du bruit et reconstitue les journaux épisodiques.
     """
     settings.ensure_directories()
 
@@ -816,197 +1355,237 @@ def initialize_meta_and_concepts(
                 "- Télémétrie d'OS bas niveau (Win32 API) et persistance ACID (SQLite WAL).\n"
             )
 
-    # Création de la taxonomie maîtresse initiale si non existante
-    default_topics = [
-        ("Architecture_RAG", "Pipelines vectoriels, embeddings locaux et recherche sémantique hybride"),
-        ("Inference_VRAM", "Gestion de la mémoire GPU, modèles MoE et déchargement keep_alive=0"),
-        ("Systeme_Win32", "Télémétrie Windows, hooks d'OS, API Win32 et non-keylogging"),
-        ("Data_Engineering", "Parsing Takeout, sessionisation et persistance SQLite WAL"),
-        ("Quantified_Self", "Métriques d'attention, tunnels d'hyperfocus et fragmentation cognitive"),
-        ("Obsidian_Exocortex", "Structuration de base de connaissances locale et fiches atomiques"),
-    ]
+    # 1. Validation de la taxonomie maîtresse fermée
+    ensure_strict_taxonomy_file()
 
-    if not settings.TAXONOMIE_TAGS_PATH.exists():
-        logger.info("Création de la taxonomie maîtresse fermée : %s", settings.TAXONOMIE_TAGS_PATH.name)
-        with open(settings.TAXONOMIE_TAGS_PATH, "w", encoding="utf-8") as f:
-            f.write("# Taxonomie Maîtresse des Tags (Liste Fermée)\n\n")
-            f.write("Liste stricte des `semantic_topic` autorisés pour le coffre Exocortex :\n\n")
-            for t_name, t_desc in default_topics:
-                f.write(f"- **`{t_name}`** : {t_desc}\n")
+    # 2. Scanner d'Assainissement & Mode Delta (Skip des ~392 fiches déjà réussies)
+    completed_session_ids = scan_and_upgrade_existing_concepts(db)
 
-    # Lecture et extraction de la taxonomie maîtresse
-    allowed_topics_list: List[str] = []
-    if settings.TAXONOMIE_TAGS_PATH.exists():
-        with open(settings.TAXONOMIE_TAGS_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                m_tag = re.search(r"-\s*`?([A-Za-z0-9]+_[A-Za-z0-9_]+)`?", line)
-                if m_tag:
-                    allowed_topics_list.append(m_tag.group(1))
+    # Préparation de la liste taxonomique pour le prompt LLM
+    allowed_topics_str = "\n".join([f"- `{k}` : {v}" for k, v in AUTHORIZED_SEMANTIC_TOPICS.items() if k != "A_Trier"])
 
-    if not allowed_topics_list:
-        allowed_topics_list = [
-            "Dev_Web_et_Stack_Astro", "IA_Agentique_et_RAG", "LLM_Local_et_Hardware",
-            "Chefferie_Projet_et_UX", "Freelance_et_Acquisition", "Gaming_Solo_et_Modding",
-            "MMORPG_Theorycraft", "Webtoons_Manga_et_Anime", "Analyse_Musicale_et_MAO",
-            "Nutrition_Volume_Eating", "Sante_et_Admin_Perso", "Introspection_et_Neuroatypie",
-        ]
-    allowed_topics_str = "\n".join([f"- `{t}`" for t in allowed_topics_list])
-
-    # Sélection des sessions les plus qualifiées pour la distillation initiale (débridage v0.1.1)
+    # Sélection des sessions qualifiées
     qualified_sessions = sorted(
         [s for s in sessions if s.turn_count >= settings.MIN_TURNS_THRESHOLD and s.user_char_count >= settings.MIN_USER_CHARS_THRESHOLD],
         key=lambda s: s.user_char_count,
         reverse=True,
     )
     limit = max_distill_sessions if max_distill_sessions is not None else settings.TAKEOUT_MAX_DISTILL_SESSIONS
-    top_sessions = qualified_sessions[:limit] if limit and limit > 0 else qualified_sessions
+    target_sessions = qualified_sessions[:limit] if limit and limit > 0 else qualified_sessions
 
-    if llm_client.is_alive():
+    # Filtrage Delta : seules les sessions non complétées (ou purgées) sont distillées
+    sessions_to_distill = [s for s in target_sessions if s.session_id not in completed_session_ids]
+    logger.info(
+        "Plan de distillation LLM : %d sessions à traiter (%d déjà complétées ignorées via Mode Delta).",
+        len(sessions_to_distill),
+        len(completed_session_ids),
+    )
+
+    if sessions_to_distill and llm_client.is_alive():
         llm_client.ensure_local_gguf_models()
 
-    created_notes_count = 0
-    for sess in top_sessions:
-        # Récupération des empreintes corrélées à cette session
-        footprints = db.get_footprints_for_session(sess.session_id)
-        footprints_md = ""
-        if footprints:
-            footprints_md = "> - **Requêtes et vidéos corrélées :**\n"
-            for fp in footprints[:8]:
-                footprints_md += f">   - [{fp['source']}] {fp['title_or_query']}\n"
+    ok_count = 0
+    misc_count = 0
+    a_trier_count = 0
+    llm_rejected_sessions: List[ReconstructedSession] = []
 
-        # Calcul mathématique réaliste du temps investi
-        duration_min = compute_realistic_session_duration_min(sess.turns)
-        duration_fmt = f"{duration_min // 60}h{duration_min % 60:02d}" if duration_min >= 60 else f"{duration_min} min"
+    vague1_queue: List[ReconstructedSession] = list(sessions_to_distill)
+    vague2_queue: List[ReconstructedSession] = []
+    vague3_queue: List[ReconstructedSession] = []
 
-        # Nettoyage et assainissement des tours pour le LLM
-        clean_turns_text: List[str] = []
-        for t in sess.turns:
-            u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=1500)
-            a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=2000)
-            clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
-        session_text = "\n\n---\n\n".join(clean_turns_text)[:12000]
+    # ==========================================================================
+    # VAGUE 1 : gemma4:26b-a4b (Thinking ACTIF, num_predict=8192, Prompt Complet)
+    # ==========================================================================
+    if vague1_queue and llm_client.is_alive():
+        logger.info("--- DÉMARRAGE VAGUE 1 : gemma4:26b-a4b (Thinking ACTIF, num_predict=8192) [%d sessions] ---", len(vague1_queue))
+        free_gb = llm_client.force_clear_vram()
+        min_strict = getattr(settings, "VRAM_STRICT_ABORT_FREE_GB", 8.0)
+        if free_gb < min_strict:
+            logger.error("VRAM insuffisante avant Vague 1 (%.2f Go < %.2f Go). Report.", free_gb, min_strict)
+            raise VRAMInsufficientError(f"VRAM insuffisante ({free_gb:.2f} Go < {min_strict} Go)")
 
-        # Appel LLM structuré pour distillation réelle
-        distilled: Optional[DistilledConceptSchema] = None
-        user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
-            allowed_taxonomy=allowed_topics_str,
-            session_text=session_text,
+        with tqdm(total=len(vague1_queue), desc="Distillation Vague 1 (26B Thinking)", unit="sess") as pbar:
+            for sess in vague1_queue:
+                clean_turns_text: List[str] = []
+                for t in sess.turns:
+                    u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=2500)
+                    a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=3500)
+                    clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
+                session_text = "\n\n---\n\n".join(clean_turns_text)[:20000]
+
+                user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
+                    allowed_taxonomy=allowed_topics_str,
+                    session_text=session_text,
+                )
+
+                distilled: Optional[DistilledConceptSchema] = None
+                if settings.TAKEOUT_MODE == "cloud_api" and llm_client.is_cloud_available():
+                    try:
+                        distilled = llm_client.generate_cloud_sota(
+                            prompt=user_prompt,
+                            system=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                            response_model=DistilledConceptSchema,
+                        )
+                    except Exception as exc:
+                        logger.warning("Échec Cloud SOTA pour %s : %s", sess.session_id, exc)
+
+                if not distilled and llm_client.is_alive():
+                    try:
+                        distilled = llm_client.generate_structured(
+                            prompt=user_prompt,
+                            response_model=DistilledConceptSchema,
+                            system=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                            model=settings.MODEL_HEAVY_SYNTHESIS,
+                            keep_alive="30m",
+                            enable_thinking=True,
+                            num_predict=8192,
+                            allow_model_switch_fallback=False,
+                        )
+                    except Exception as exc:
+                        logger.warning("Échec Vague 1 pour session %s (%s). Mise en file d'attente Vague 2.", sess.session_id, exc)
+                        vague2_queue.append(sess)
+                        pbar.set_postfix({"ok": ok_count, "v2_pending": len(vague2_queue)})
+                        pbar.update(1)
+                        continue
+
+                if distilled:
+                    _, st = save_distilled_concept_note(sess, distilled, db, allow_quarantine=False)
+                    if st == "success":
+                        ok_count += 1
+                    elif st == "misc_noise":
+                        misc_count += 1
+                        llm_rejected_sessions.append(sess)
+
+                pbar.set_postfix({"ok": ok_count, "v2_pending": len(vague2_queue)})
+                pbar.update(1)
+
+    # ==========================================================================
+    # VAGUE 2 : gemma4:26b-a4b (Toujours en VRAM, Prompt Condensé, think=False, num_predict=4096)
+    # ==========================================================================
+    if vague2_queue and llm_client.is_alive():
+        logger.info("--- DÉMARRAGE VAGUE 2 : gemma4:26b-a4b (Prompt Condensé, think=False, num_predict=4096) [%d sessions] ---", len(vague2_queue))
+        condensed_system_prompt = (
+            PROMPT_SESSION_DISTILLATION_SYSTEM
+            + "\n\nCONSIGNE STRICTE : Le champ synthesized_markdown_body doit être direct, dense et faire entre 250 et 400 mots maximum. Réponds immédiatement en JSON."
         )
 
-        # 1. Tentative Cloud SOTA si configuré
-        if settings.TAKEOUT_MODE == "cloud_api" and llm_client.is_cloud_available():
-            try:
-                distilled = llm_client.generate_cloud_sota(
-                    prompt=user_prompt,
-                    system=PROMPT_SESSION_DISTILLATION_SYSTEM,
-                    response_model=DistilledConceptSchema,
+        with tqdm(total=len(vague2_queue), desc="Distillation Vague 2 (26B No-Think)", unit="sess") as pbar:
+            for sess in vague2_queue:
+                clean_turns_text = []
+                for t in sess.turns:
+                    u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=800)
+                    a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=1000)
+                    clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
+                session_text = "\n\n---\n\n".join(clean_turns_text)[:6000]
+
+                user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
+                    allowed_taxonomy=allowed_topics_str,
+                    session_text=session_text,
                 )
-            except Exception as exc:
-                logger.warning("Échec de distillation Cloud SOTA pour session %s : %s", sess.session_id, exc)
 
-        # 2. Tentative LLM Local (Ollama ou llama_server)
-        if not distilled and llm_client.is_alive():
-            try:
-                distilled = llm_client.generate_structured(
-                    prompt=user_prompt,
-                    response_model=DistilledConceptSchema,
-                    system=PROMPT_SESSION_DISTILLATION_SYSTEM,
-                    model=settings.MODEL_HEAVY_SYNTHESIS,
-                    keep_alive="5m",
-                )
-            except Exception as exc:
-                logger.warning("Échec de distillation locale pour session %s : %s", sess.session_id, exc)
+                distilled = None
+                try:
+                    distilled = llm_client.generate_structured(
+                        prompt=user_prompt,
+                        response_model=DistilledConceptSchema,
+                        system=condensed_system_prompt,
+                        model=settings.MODEL_HEAVY_SYNTHESIS,
+                        keep_alive="30m",
+                        enable_thinking=False,
+                        num_predict=4096,
+                        allow_model_switch_fallback=False,
+                    )
+                except Exception as exc:
+                    logger.warning("Échec Vague 2 pour session %s (%s). Mise en file d'attente Vague 3 (12B).", sess.session_id, exc)
+                    vague3_queue.append(sess)
+                    pbar.set_postfix({"ok": ok_count, "v3_pending": len(vague3_queue)})
+                    pbar.update(1)
+                    continue
 
-        # 3. Repli heuristique si le LLM est inaccessible
-        if not distilled:
-            first_user = sanitize_turn_text(sess.turns[0].user_prompt)[:100]
-            clean_title = re.sub(r"[^\w\s-]", "", first_user).strip().title()
-            slug = re.sub(r"[\s_]+", "-", clean_title.lower())[:50].strip("-") or f"session-{sess.session_id}"
-            
-            # Détection de topic par mots-clés
-            matched_topic = "A_Trier"
-            text_low = (sess.summary + " " + first_user).lower()
-            for cand in allowed_topics_list:
-                cand_kws = cand.lower().split("_")
-                if any(kw in text_low for kw in cand_kws if len(kw) > 3):
-                    matched_topic = cand
-                    break
+                if distilled:
+                    _, st = save_distilled_concept_note(sess, distilled, db, allow_quarantine=False)
+                    if st == "success":
+                        ok_count += 1
+                    elif st == "misc_noise":
+                        misc_count += 1
+                        llm_rejected_sessions.append(sess)
 
-            distilled = DistilledConceptSchema(
-                is_worth_indexing=True,
-                concept_title=clean_title,
-                slug=slug,
-                semantic_topic=matched_topic,
-                is_new_topic=False,
-                tags=[matched_topic.lower(), "takeout_coldstart"],
-                summary_1_line=sess.summary[:140],
-                synthesized_markdown_body=(
-                    f"### Problématique & Contexte\n{first_user}\n\n"
-                    f"### Arbitrages Techniques & Solutions\n"
-                    f"- Session composée de {sess.turn_count} échanges techniques.\n"
-                    f"- Conclusion principale : {sanitize_turn_text(sess.turns[-1].ai_response)[:400]}..."
-                ),
-                related_concepts=[matched_topic],
-            )
+                pbar.set_postfix({"ok": ok_count, "v3_pending": len(vague3_queue)})
+                pbar.update(1)
 
-        if not distilled.is_worth_indexing:
-            logger.info("Session %s considérée comme bruit par la distillation.", sess.session_id)
-            continue
+    # Déchargement UNIQUE du 26B à la fin de la Vague 2
+    if llm_client.is_alive():
+        llm_client.unload_model(settings.MODEL_HEAVY_SYNTHESIS)
+        time.sleep(1.0)
 
-        # Gestion de la taxonomie dynamique émergente
-        if distilled.is_new_topic and distilled.semantic_topic:
-            register_new_taxonomy_tag(distilled.semantic_topic, distilled.new_topic_description)
-            if distilled.semantic_topic not in allowed_topics_list:
-                allowed_topics_list.append(distilled.semantic_topic)
-
-        # Sauvegarde de la note dans 02_Concepts/
-        concept_file = settings.CONCEPTS_DIR / f"{distilled.slug}.md"
-        created_date_str = sess.timestamp_start.strftime("%Y-%m-%d")
-        updated_date_str = sess.timestamp_end.strftime("%Y-%m-%d")
-        concept_id = sess.timestamp_start.strftime("%Y%m%d%H%M")
-
-        related_md = ", ".join([f"[[{rc}]]" for rc in distilled.related_concepts]) if distilled.related_concepts else "[[Exocortex]]"
-        tags_json = json.dumps(distilled.tags, ensure_ascii=False)
-
-        note_content = f"""---
-id: "{concept_id}"
-title: "{distilled.concept_title}"
-type: "concept"
-origin: ["gemini_takeout"]
-semantic_topic: "{distilled.semantic_topic}"
-tags: {tags_json}
-created_at: "{created_date_str}"
-updated_at: "{updated_date_str}"
-total_time_invested_min: {duration_min}
-summary_1_line: "{distilled.summary_1_line.replace('"', "'")}"
----
-
-# {distilled.concept_title}
-
-{distilled.synthesized_markdown_body}
-
-> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
-> - **Temps estimé sur ce sujet :** {duration_fmt}
-> - **Sources épisodiques :**
->   - Session Gemini `{sess.session_id}` du {created_date_str} ({sess.turn_count} échanges, {sess.user_char_count} chars écrits)
-{footprints_md}> - **Connexions sémantiques suggérées :** {related_md}
-"""
-        with open(concept_file, "w", encoding="utf-8") as f:
-            f.write(note_content)
-        created_notes_count += 1
-        logger.info("Fiche conceptuelle distillée créée : %s (#%s)", concept_file.name, distilled.semantic_topic)
-
-        # Mise à jour des métadonnées dans SQLite (chat_sessions)
-        db.update_session_distillation_metadata(
-            session_id=sess.session_id,
-            topics_list=[distilled.semantic_topic],
-            notes_list=[distilled.slug],
-            summary=distilled.summary_1_line,
+    # ==========================================================================
+    # VAGUE 3 : gemma4:12b (Chargé UNE seule fois, think=False, num_predict=4096)
+    # ==========================================================================
+    if vague3_queue and llm_client.is_alive():
+        logger.info("--- DÉMARRAGE VAGUE 3 : gemma4:12b (Repli final, think=False, num_predict=4096) [%d sessions] ---", len(vague3_queue))
+        condensed_system_prompt = (
+            PROMPT_SESSION_DISTILLATION_SYSTEM
+            + "\n\nCONSIGNE STRICTE : Le champ synthesized_markdown_body doit être direct, dense et faire entre 250 et 400 mots maximum. Réponds immédiatement en JSON."
         )
+
+        with tqdm(total=len(vague3_queue), desc="Distillation Vague 3 (12B Fallback)", unit="sess") as pbar:
+            for sess in vague3_queue:
+                clean_turns_text = []
+                for t in sess.turns:
+                    u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=800)
+                    a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=1000)
+                    clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
+                session_text = "\n\n---\n\n".join(clean_turns_text)[:6000]
+
+                user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
+                    allowed_taxonomy=allowed_topics_str,
+                    session_text=session_text,
+                )
+
+                distilled = None
+                try:
+                    distilled = llm_client.generate_structured(
+                        prompt=user_prompt,
+                        response_model=DistilledConceptSchema,
+                        system=condensed_system_prompt,
+                        model=settings.MODEL_FAST_VISION,  # gemma4:12b
+                        keep_alive="30m",
+                        enable_thinking=False,
+                        num_predict=4096,
+                        allow_model_switch_fallback=False,
+                    )
+                except Exception as exc:
+                    logger.error("Échec définitif Vague 3 pour session %s (%s). Quarantaine #A_Trier.", sess.session_id, exc)
+
+                if distilled:
+                    _, st = save_distilled_concept_note(sess, distilled, db, allow_quarantine=False)
+                    if st == "success":
+                        ok_count += 1
+                    elif st == "misc_noise":
+                        misc_count += 1
+                        llm_rejected_sessions.append(sess)
+                else:
+                    # Échec définitif -> Sauvegarde en quarantaine avec protection anti-écrasement
+                    _, st = save_distilled_concept_note(sess, None, db, allow_quarantine=True)
+                    if st == "failed_fallback":
+                        a_trier_count += 1
+
+                pbar.set_postfix({"ok": ok_count, "a_trier": a_trier_count})
+                pbar.update(1)
+
+        # Déchargement UNIQUE du 12B à la fin de la Vague 3
+        llm_client.unload_model(settings.MODEL_FAST_VISION)
+        time.sleep(1.0)
 
     # Déchargement complet de la VRAM après la distillation
     llm_client.unload_all_models()
-    logger.info("Distillation LLM achevée : %d fiches conceptuelles créées dans 02_Concepts/.", created_notes_count)
+    logger.info("Distillation LLM achevée : %d réussies, %d en quarantaine, %d bruit LLM.", ok_count, a_trier_count, misc_count)
+
+    # 4. Compilation du registre consolidé du bruit (00_Meta/00_MISC_ET_BRUIT_ARCHIVE.md)
+    compile_misc_noise_archive(noise_sessions, llm_rejected_sessions)
+
+    # 5. Cold Start Épisodique Rétroactif (01_Episodique/YYYY-MM-DD.md & daily_metrics)
+    generate_cold_start_episodic_journals(sessions, db)
 
 
 # ==============================================================================
@@ -1087,9 +1666,26 @@ class TakeoutIngestor:
             except Exception as exc:
                 logger.error("Erreur parsing Gemini '%s' : %s", gf.name, exc)
 
-        sessions = sessionize_gemini_turns(gemini_turns)
+        qualified_sessions, noise_sessions = sessionize_gemini_turns(gemini_turns)
+        all_sessions = qualified_sessions + noise_sessions
 
-        # 4. Injection SQLite des sessions
+        # 3b. Insertion exhaustive de tous les messages individuels dans chat_messages
+        all_chat_messages: List[Tuple[str, int, datetime, str, str, int]] = []
+        for sess in all_sessions:
+            for turn_idx, turn in enumerate(sess.turns, 1):
+                all_chat_messages.append((
+                    sess.session_id,
+                    turn_idx,
+                    turn.timestamp,
+                    turn.user_prompt,
+                    turn.ai_response,
+                    turn.user_char_count,
+                ))
+        if all_chat_messages:
+            self.db.insert_chat_messages_batch(all_chat_messages)
+            logger.info("Table chat_messages synchronisée : %d messages insérés.", len(all_chat_messages))
+
+        # 4. Injection SQLite des sessions qualifiées uniquement (v0.1.3 : 480 sessions)
         session_records = [
             ChatSessionRecord(
                 session_id=s.session_id,
@@ -1098,22 +1694,28 @@ class TakeoutIngestor:
                 turn_count=s.turn_count,
                 user_char_count=s.user_char_count,
                 summary=s.summary,
+                distillation_status="pending",
             )
-            for s in sessions
+            for s in qualified_sessions
         ]
         self.db.insert_chat_sessions_batch(session_records)
 
-        # 5. Jointure temporelle [-60 min ; +30 min]
-        linked_count = perform_temporal_join(sessions, self.db)
+        # 5. Jointure temporelle [-60 min ; +30 min] (sur les sessions qualifiées)
+        linked_count = perform_temporal_join(qualified_sessions, self.db)
 
         # 6. Burst Clustering sur les traces restantes
         burst_count = perform_burst_clustering(self.db)
 
         # 7. Génération des fichiers de staging
-        user_prompts_file, batch_files, web_prompt_file = generate_staging_files(sessions)
+        user_prompts_file, batch_files, web_prompt_file = generate_staging_files(qualified_sessions)
 
-        # 8. Initialisation de 00_Meta et des premières fiches conceptuelles
-        initialize_meta_and_concepts(sessions, self.db, max_distill_sessions=max_distill_sessions)
+        # 8. Initialisation de 00_Meta, assainissement existant, distillation Delta et Cold Start épisodique
+        initialize_meta_and_concepts(
+            qualified_sessions,
+            noise_sessions,
+            self.db,
+            max_distill_sessions=max_distill_sessions,
+        )
 
         # 9. Synchronisation Vectorielle LanceDB & Compilation Google Drive
         logger.info("--- SYNCHRONISATION VECTORIELLE LANCEDB ---")
@@ -1128,7 +1730,8 @@ class TakeoutIngestor:
         logger.info("Statistiques SQLite finales : %s", db_stats)
 
         return {
-            "sessions_count": len(sessions),
+            "sessions_count": len(qualified_sessions),
+            "noise_sessions_count": len(noise_sessions),
             "linked_footprints": linked_count,
             "burst_clusters": burst_count,
             "staging_prompts_file": str(user_prompts_file),

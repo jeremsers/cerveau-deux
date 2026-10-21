@@ -24,8 +24,9 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from pydantic import BaseModel, Field
+from tqdm import tqdm
 
-from src.config import settings
+from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
 from src.database.db_manager import (
     DailyMetricRecord,
     DBManager,
@@ -38,6 +39,7 @@ from src.ingestors.takeout_ingestor import register_new_taxonomy_tag
 from src.llm.ollama_client import HardwareProbe, VRAMInsufficientError, llm_client
 from src.llm.prompts import (
     SYSTEM_PROMPT_ANTI_WIKIPEDIA,
+    PROMPT_STRICT_TAXONOMY_RULE,
     PROMPT_DYNAMIC_TAXONOMY_RULE,
     PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
     PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
@@ -69,45 +71,8 @@ def load_authorized_taxonomy() -> Tuple[List[str], Dict[str, str]]:
     Lit et extrait la liste fermée des tags autorisés depuis Vault_Data/00_Meta/Taxonomie_Tags.md.
     Retourne (liste_des_tags, dictionnaire_tag_description).
     """
-    tax_path = settings.TAXONOMIE_TAGS_PATH
-    if not tax_path.exists():
-        logger.warning("Fichier de taxonomie introuvable (%s). Utilisation de tags par défaut.", tax_path)
-        default_tags = [
-            "IA_Agentique_et_RAG",
-            "LLM_Local_et_Hardware",
-            "Prompt_Engineering_et_Suno",
-            "Dev_Web_et_Stack_Astro",
-            "Chefferie_Projet_et_UX",
-            "Freelance_et_Acquisition",
-            "Philo_Droit_et_Morale",
-            "Metaphysique_et_Physique",
-            "Sociologie_et_Politique",
-            "Linguistique_et_Culture_Web",
-            "MMORPG_Theorycraft",
-            "Gaming_Solo_et_Modding",
-            "Webtoons_Manga_et_Anime",
-            "Analyse_Musicale_et_MAO",
-            "Nutrition_Volume_Eating",
-            "Sante_et_Admin_Perso",
-            "Introspection_et_Neuroatypie",
-        ]
-        return default_tags, {t: "Topic cognitif standard" for t in default_tags}
-
-    with open(tax_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    tags: List[str] = []
-    descriptions: Dict[str, str] = {}
-
-    for line in content.splitlines():
-        # Match lignes comme: - `IA_Agentique_et_RAG` : Exocortex, Obsidian...
-        m = re.search(r"-\s*[`\*]{1,2}([A-Za-z0-9_]+)[`\*]{1,2}\s*:\s*(.*)", line)
-        if m:
-            tag = m.group(1).strip()
-            desc = m.group(2).strip()
-            tags.append(tag)
-            descriptions[tag] = desc
-
+    tags = list(AUTHORIZED_SEMANTIC_TOPICS.keys())
+    descriptions = dict(AUTHORIZED_SEMANTIC_TOPICS)
     logger.info("Taxonomie chargée : %d topics autorisés identifiés.", len(tags))
     return tags, descriptions
 
@@ -125,26 +90,26 @@ def heuristic_fallback_classification(
     text = f"{executable} {window_title} {ocr_snippet or ''}".lower()
 
     if any(k in text for k in ["code.exe", "visual studio", "terminal", "powershell", "astro", "react", "typescript", "git", "github", "npm"]):
-        return "Dev_Web_et_Stack_Astro", "production"
+        return "Dev_et_Architecture_Tech", "production"
     if any(k in text for k in ["ollama", "lancedb", "exocortex", "obsidian", "rag", "embedding"]):
-        return "IA_Agentique_et_RAG", "production"
+        return "IA_et_LLM_Local", "production"
     if any(k in text for k in ["gemini", "chatgpt", "claude.ai", "sillytavern"]):
-        return "IA_Agentique_et_RAG", "chat_ia"
+        return "IA_et_LLM_Local", "chat_ia"
     if any(k in text for k in ["wow.exe", "world of warcraft", "warcraft", "guild wars", "lost ark"]):
-        return "MMORPG_Theorycraft", "gaming"
+        return "MMORPG_et_Esport", "gaming"
     if any(k in text for k in ["minecraft", "skyrim", "cheat engine", "yuzu", "steam"]):
-        return "Gaming_Solo_et_Modding", "gaming"
+        return "Gaming_et_GameDesign", "gaming"
     if any(k in text for k in ["youtube", "stremio", "plex", "netflix", "crunchyroll", "anime", "webtoon", "asura", "reaper"]):
-        return "Webtoons_Manga_et_Anime", "media"
+        return "Musique_MAO_et_Culture_Pop", "media"
     if any(k in text for k in ["suno", "spotify", "fl studio", "maschine", "k-pop", "nmixx"]):
-        return "Analyse_Musicale_et_MAO", "media"
+        return "Musique_MAO_et_Culture_Pop", "media"
     if any(k in text for k in ["calorie", "myfitnesspal", "recette", "repas", "volume eating"]):
-        return "Nutrition_Volume_Eating", "exploration"
+        return "Nutrition_et_Cuisine", "exploration"
     if any(k in text for k in ["droit", "jurisprudence", "loi", "philo", "spinoza", "camus"]):
-        return "Philo_Droit_et_Morale", "exploration"
+        return "Philo_et_Epistemologie", "exploration"
 
     # Repli par défaut sur A_Trier pour éviter de polluer les tags nobles
-    fallback_tag = "A_Trier" if allowed_tags and "A_Trier" in allowed_tags else "A_Trier"
+    fallback_tag = "A_Trier"
     mode = "production" if any(k in executable.lower() for k in ["code", "devenv", "notepad"]) else "exploration"
     return fallback_tag, mode
 
@@ -173,6 +138,7 @@ class NightConsolidator:
         3. Purge immédiate de la VRAM (keep_alive=0).
         """
         logger.info("--- DÉBUT PASSE 1 : VISION & TAGGING (gemma4:12b) ---")
+        llm_client.force_clear_vram()
         free_gb, total_gb = HardwareProbe.get_vram_info()
         logger.info("VRAM disponible avant Passe 1 : %.2f Go / %.2f Go", free_gb, total_gb)
 
@@ -183,7 +149,7 @@ class NightConsolidator:
         screenshot_activities = self.db.get_unprocessed_activities_with_screenshots(limit=50)
         logger.info("Nombre d'activités avec capture d'écran à analyser : %d", len(screenshot_activities))
 
-        for act in screenshot_activities:
+        for act in tqdm(screenshot_activities, desc="Consolidation Nocturne (Captures)", unit="img"):
             act_id = act["id"]
             img_path = Path(act["screenshot_path"])
             visual_summary = ""
@@ -234,7 +200,7 @@ class NightConsolidator:
 
         is_ollama_ready = llm_client.is_alive()
 
-        for (exe, title, ocr), row_ids in signatures.items():
+        for (exe, title, ocr), row_ids in tqdm(signatures.items(), desc="Consolidation Nocturne (Signatures)", unit="sig"):
             chosen_topic = None
             chosen_mode = None
 
@@ -246,7 +212,7 @@ class NightConsolidator:
                     f"- Titre de la fenêtre : {title}\n"
                     f"- Extrait visuel/OCR : {ocr or 'Aucun'}\n\n"
                     f"Taxonomie actuelle autorisée pour semantic_topic :\n{taxonomy_list}\n\n"
-                    f"{PROMPT_DYNAMIC_TAXONOMY_RULE}\n"
+                    f"{PROMPT_STRICT_TAXONOMY_RULE}\n"
                     "Modes cognitifs autorisés : 'production', 'exploration', 'chat_ia', 'gaming', 'media'.\n"
                     "Assigne le semantic_topic exact et le cognitive_mode le plus pertinent."
                 )
@@ -257,25 +223,10 @@ class NightConsolidator:
                         system="Tu es un classificateur de télémétrie strict. Réponds uniquement en JSON valide conforme au schéma.",
                         model=settings.MODEL_FAST_VISION,
                         keep_alive="5m",
+                        enable_thinking=False,
+                        num_predict=2048,
                     )
-                    # Enregistrement dynamique des nouveaux topics émergents
-                    if res.is_new_topic and res.confidence >= 0.75:
-                        clean_tag = res.semantic_topic.strip()
-                        if re.match(r"^[A-Za-z0-9]+_[A-Za-z0-9_]+$", clean_tag):
-                            if clean_tag not in self.allowed_tags:
-                                desc = res.new_topic_description or "Topic émergent issu de l'activité écran"
-                                if register_new_taxonomy_tag(clean_tag, desc):
-                                    self.allowed_tags.append(clean_tag)
-                                    self.tag_descriptions[clean_tag] = desc
-                                    chosen_topic = clean_tag
-                            else:
-                                chosen_topic = clean_tag
-
-                    if not chosen_topic:
-                        if res.semantic_topic in self.allowed_tags:
-                            chosen_topic = res.semantic_topic
-                        else:
-                            chosen_topic, _ = heuristic_fallback_classification(exe, title, ocr, self.allowed_tags)
+                    chosen_topic = normalize_to_macro_topic(res.semantic_topic)
                     chosen_mode = res.cognitive_mode
                 except Exception as exc:
                     logger.debug("Repli heuristique pour [%s] '%s' (%s)", exe, title, exc)
@@ -283,6 +234,7 @@ class NightConsolidator:
             else:
                 chosen_topic, chosen_mode = heuristic_fallback_classification(exe, title, ocr, self.allowed_tags)
 
+            chosen_topic = normalize_to_macro_topic(chosen_topic or "A_Trier")
             for rid in row_ids:
                 updates.append((rid, chosen_topic, chosen_mode))
 
@@ -434,6 +386,7 @@ class NightConsolidator:
             return
 
         logger.info("--- DÉBUT PASSE 2 : SYNTHÈSE ÉPISODIQUE & CONCEPTS ---")
+        llm_client.force_clear_vram()
         free_gb, _ = HardwareProbe.get_vram_info()
 
         # Choix du modèle selon la VRAM libre
@@ -709,7 +662,7 @@ summary_1_line: "Synthèse et développement des réflexions sur {topic_name.rep
         logger.info("Journées à agréger et synthétiser : %s", [d.isoformat() for d in dates_to_process])
 
         # Pour chaque date : agrégation SQLite & Passe 2
-        for d in dates_to_process:
+        for d in tqdm(dates_to_process, desc="Consolidation Nocturne (Journaux)", unit="jour"):
             metric = self.calculate_daily_metrics_for_date(d)
             self.run_pass_2_synthesis(d, metric)
 

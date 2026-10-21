@@ -16,21 +16,25 @@ RÈGLES ÉPISTÉMIQUES NON NÉGOCIABLES :
 2. SUBSTANCE PURE : Ne conserve que ce que l'utilisateur a exploré, décidé, validé, contesté ou conçu.
 3. ISOLATION DE LA TÉLÉMÉTRIE : Toutes les métadonnées techniques, sources d'archives, sessions corrélées et liens de maillage doivent être STRICTEMENT isolés dans le bloc Obsidian '> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)'.
 4. STYLE CONCIS ET DIRECT : Phrases denses, schémas textuels, tableaux comparatifs si pertinents, bullet points techniques percutants.
+5. CONCISION & COMPLÉTUDE : Le champ synthesized_markdown_body doit être dense, structuré et faire entre 200 et 450 mots maximum. Ne laisse JAMAIS une phrase inachevée.
 """
 
 # ==============================================================================
-# RÈGLE DE TAXONOMIE DYNAMIQUE ÉMERGENTE (CHANGELOG v0.1)
+# RÈGLE STRICTE DE TAXONOMIE À DEUX NIVEAUX (v0.1.2)
 # ==============================================================================
 
-PROMPT_DYNAMIC_TAXONOMY_RULE = """RÈGLE DE TAXONOMIE DYNAMIQUE ÉMERGENTE :
-1. Consulte en priorité la liste des `semantic_topic` existants fournie ci-dessous.
-2. Si le sujet correspond clairement à une catégorie existante (pertinence >= 80%), utilise son nom exact.
-3. Si et seulement si le sujet traite d'un domaine distinct non couvert par la liste actuelle, CRÉE un nouveau tag canonique au format strict `Domaine_SousDomaine` en PascalCase_Snake (ex: `HomeLab_MediaServer`, `Roleplay_LLM`, `Psychologie_PNL`, `Suisse_DroitFiscal`) et passe le booléen `is_new_topic` à `true` avec une courte description.
-4. Il est STRICTEMENT INTERDIT d'utiliser un tag fourre-tout par défaut comme `Data_Engineering` ou `IA_Agentique_et_RAG` pour des sujets qui n'en relèvent pas.
+PROMPT_STRICT_TAXONOMY_RULE = """RÈGLE STRICTE DE TAXONOMIE À DEUX NIVEAUX :
+1. NIVEAU 1 (semantic_topic) : Choisis OBLIGATOIREMENT l'un des 15 macro-sujets officiels dans la liste fournie ci-dessous.
+   Il est STRICTEMENT INTERDIT d'inventer, créer ou modifier un `semantic_topic`. Choisis le plus pertinent parmi la liste.
+2. NIVEAU 2 (tags) : Toute la granularité technique, spécifique ou émergente (3 à 6 tags précis en kebab-case, ex: ["homelab", "riven", "plex", "docker"]) DOIT impérativement être placée dans la liste `tags`.
 """
 
+# Alias de compatibilité pour les modules existants
+PROMPT_DYNAMIC_TAXONOMY_RULE = PROMPT_STRICT_TAXONOMY_RULE
+
+
 # ==============================================================================
-# PROMPTS DE DISTILLATION ATOMIQUE (MODULE 1 - TAKEOUT INGESTOR v0.1)
+# PROMPTS DE DISTILLATION ATOMIQUE (MODULE 1 - TAKEOUT INGESTOR v0.1.2)
 # ==============================================================================
 
 PROMPT_SESSION_DISTILLATION_SYSTEM = f"""Tu es l'ingénieur de distillation cognitive en chef de l'Exocortex.
@@ -38,8 +42,10 @@ Ton rôle est de lire une session d'échange technique et de décider si elle co
 
 {SYSTEM_PROMPT_ANTI_WIKIPEDIA}
 
-{PROMPT_DYNAMIC_TAXONOMY_RULE}
+{PROMPT_STRICT_TAXONOMY_RULE}
 """
+
+PROMPT_TAKEOUT_SINGLE_SESSION_DISTILLATION = PROMPT_SESSION_DISTILLATION_SYSTEM
 
 PROMPT_SESSION_DISTILLATION_USER = """Voici la session à analyser et distiller :
 

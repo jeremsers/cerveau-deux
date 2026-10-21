@@ -149,27 +149,44 @@ class VectorStore:
 
             # Suppression de l'ancienne version si existante puis ajout
             try:
-                self._table.delete(f'id = "{doc_id}"')
+                safe_id = str(doc_id).replace("'", "''")
+                self._table.delete(f"id = '{safe_id}'")
             except Exception:
                 pass
 
             self._table.add([record])
-            logger.info("Note '%s' indexée avec succès dans LanceDB.", file_path.name)
+            logger.debug("Note '%s' indexée avec succès dans LanceDB.", file_path.name)
             return True
         except Exception as exc:
             logger.error("Échec d'indexation de la note '%s' : %s", file_path.name, exc)
             return False
 
+    def delete_by_slug(self, slug: str) -> bool:
+        """Supprime une note de la table vectorielle LanceDB par son slug ou son id."""
+        try:
+            safe_slug = str(slug).replace("'", "''")
+            self._table.delete(f"slug = '{safe_slug}' OR id = '{safe_slug}'")
+            logger.debug("Document '%s' supprimé de LanceDB.", slug)
+            return True
+        except Exception as exc:
+            logger.warning("Erreur suppression LanceDB pour slug '%s': %s", slug, exc)
+            return False
+
     def sync_all_concepts(self, concepts_dir: Optional[Path] = None) -> int:
         """Parcourt 02_Concepts/ et synchronise toutes les notes Markdown dans LanceDB."""
+        from tqdm import tqdm
+
         target_dir = concepts_dir or settings.CONCEPTS_DIR
         if not target_dir.exists():
             return 0
 
+        md_files = sorted(list(target_dir.glob("*.md")))
         indexed_count = 0
-        for md_file in target_dir.glob("*.md"):
-            if self.index_concept_file(md_file, keep_alive="5m"):
-                indexed_count += 1
+        with tqdm(total=len(md_files), desc="Indexation LanceDB (bge-m3)", unit="note") as pbar:
+            for md_file in md_files:
+                if self.index_concept_file(md_file, keep_alive="5m"):
+                    indexed_count += 1
+                pbar.update(1)
 
         # Purge de la mémoire VRAM après le batch d'embeddings
         llm_client.unload_model(settings.MODEL_EMBEDDING)

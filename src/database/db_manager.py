@@ -12,7 +12,7 @@ import sys
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -68,6 +68,18 @@ class ChatSessionRecord(BaseModel):
     extracted_topics_json: str = "[]"
     generated_notes_json: str = "[]"
     summary: str = ""
+    distillation_status: str = "pending"
+
+
+class ChatMessageRecord(BaseModel):
+    """Représente un message/tour individuel dans une session de chat."""
+    id: Optional[int] = None
+    session_id: str
+    turn_index: int
+    timestamp: datetime
+    user_prompt: str
+    ai_response: str
+    user_char_count: int
 
 
 class HistoricalFootprintRecord(BaseModel):
@@ -180,11 +192,37 @@ class DBManager:
                     user_char_count INTEGER NOT NULL,
                     extracted_topics_json TEXT NOT NULL,
                     generated_notes_json TEXT NOT NULL,
-                    summary TEXT NOT NULL
+                    summary TEXT NOT NULL,
+                    distillation_status TEXT DEFAULT 'pending'
                 );
                 """
             )
+            # Migration automatique si la table existait sans la colonne distillation_status
+            cursor_cs = conn.execute("PRAGMA table_info(chat_sessions);")
+            cs_columns = [row[1] for row in cursor_cs.fetchall()]
+            if "distillation_status" not in cs_columns:
+                conn.execute("ALTER TABLE chat_sessions ADD COLUMN distillation_status TEXT DEFAULT 'pending';")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_date ON chat_sessions(timestamp_start);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_status ON chat_sessions(distillation_status);")
+
+            # 3b. Table chat_messages (Granularité fine des échanges Takeout / LLM)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    user_prompt TEXT NOT NULL,
+                    ai_response TEXT NOT NULL,
+                    user_char_count INTEGER NOT NULL,
+                    UNIQUE(session_id, turn_index)
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_session ON chat_messages(session_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts ON chat_messages(timestamp);")
 
             # 4. Table historical_footprints
             conn.execute(
@@ -206,6 +244,31 @@ class DBManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_session ON historical_footprints(linked_gemini_session_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_cluster ON historical_footprints(cluster_id);")
 
+            # Déduplication et contrainte d'unicité v0.1.3
+            conn.execute(
+                """
+                DELETE FROM historical_footprints
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM historical_footprints
+                    GROUP BY source, timestamp, title_or_query
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_footprint
+                ON historical_footprints(source, timestamp, title_or_query);
+                """
+            )
+
+            # Nettoyage des micro-sessions bruitées de chat_sessions (v0.1.3)
+            conn.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE turn_count < 3 OR user_char_count < 250;
+                """
+            )
+
     # ==========================================================================
     # INSERTIONS PAR LOTS (BATCH OPERATIONS)
     # ==========================================================================
@@ -217,8 +280,9 @@ class DBManager:
         sql = """
             INSERT OR REPLACE INTO chat_sessions (
                 session_id, timestamp_start, timestamp_end, turn_count,
-                user_char_count, extracted_topics_json, generated_notes_json, summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                user_char_count, extracted_topics_json, generated_notes_json, summary,
+                distillation_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         payload = [
             (
@@ -230,6 +294,7 @@ class DBManager:
                 s.extracted_topics_json,
                 s.generated_notes_json,
                 s.summary,
+                s.distillation_status,
             )
             for s in sessions
         ]
@@ -243,10 +308,11 @@ class DBManager:
         topics_list: List[str],
         notes_list: List[str],
         summary: Optional[str] = None,
+        distillation_status: str = "success",
     ) -> bool:
         """
         Met à jour les métadonnées de distillation post-LLM d'une session Gemini :
-        topics extraits, fiches conceptuelles générées et résumé mis à jour.
+        topics extraits, fiches conceptuelles générées, résumé et statut de distillation.
         """
         topics_json = json.dumps(topics_list, ensure_ascii=False)
         notes_json = json.dumps(notes_list, ensure_ascii=False)
@@ -256,28 +322,67 @@ class DBManager:
                 conn.execute(
                     """
                     UPDATE chat_sessions
-                    SET extracted_topics_json = ?, generated_notes_json = ?, summary = ?
+                    SET extracted_topics_json = ?, generated_notes_json = ?, summary = ?, distillation_status = ?
                     WHERE session_id = ?;
                     """,
-                    (topics_json, notes_json, summary, session_id),
+                    (topics_json, notes_json, summary, distillation_status, session_id),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE chat_sessions
-                    SET extracted_topics_json = ?, generated_notes_json = ?
+                    SET extracted_topics_json = ?, generated_notes_json = ?, distillation_status = ?
                     WHERE session_id = ?;
                     """,
-                    (topics_json, notes_json, session_id),
+                    (topics_json, notes_json, distillation_status, session_id),
                 )
         return True
 
+    def insert_chat_messages_batch(
+        self,
+        messages: List[Union[ChatMessageRecord, Tuple[str, int, Union[datetime, str], str, str, int], Dict[str, Any]]],
+    ) -> int:
+        """Insère ou remplace un lot de messages/tours de conversation dans chat_messages."""
+        if not messages:
+            return 0
+        sql = """
+            INSERT OR REPLACE INTO chat_messages (
+                session_id, turn_index, timestamp, user_prompt, ai_response, user_char_count
+            ) VALUES (?, ?, ?, ?, ?, ?);
+        """
+        payload = []
+        for m in messages:
+            if isinstance(m, ChatMessageRecord):
+                ts = m.timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(m.timestamp, datetime) else str(m.timestamp)
+                payload.append((m.session_id, m.turn_index, ts, m.user_prompt, m.ai_response, m.user_char_count))
+            elif isinstance(m, tuple):
+                ts = m[2].strftime("%Y-%m-%d %H:%M:%S") if isinstance(m[2], datetime) else str(m[2])
+                payload.append((m[0], m[1], ts, m[3], m[4], m[5]))
+            elif isinstance(m, dict):
+                ts_val = m["timestamp"]
+                ts = ts_val.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts_val, datetime) else str(ts_val)
+                payload.append((m["session_id"], m["turn_index"], ts, m["user_prompt"], m["ai_response"], m["user_char_count"]))
+        with self.get_connection() as conn:
+            conn.executemany(sql, payload)
+        return len(payload)
+
+    def get_completed_session_ids_from_db(self) -> Set[str]:
+        """Retourne l'ensemble des session_id déjà traitées avec succès ou bruit consolidé."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT session_id FROM chat_sessions
+                WHERE distillation_status IN ('success', 'misc_noise');
+                """
+            )
+            return {row[0] for row in cursor.fetchall()}
+
     def insert_historical_footprints_batch(self, footprints: List[HistoricalFootprintRecord]) -> int:
-        """Insère un lot d'empreintes Search/YouTube dans historical_footprints."""
+        """Insère un lot d'empreintes Search/YouTube dans historical_footprints avec déduplication native."""
         if not footprints:
             return 0
         sql = """
-            INSERT INTO historical_footprints (
+            INSERT OR IGNORE INTO historical_footprints (
                 source, timestamp, title_or_query, url, channel_or_domain,
                 cluster_id, semantic_topic, linked_gemini_session_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
@@ -555,7 +660,7 @@ class DBManager:
         """Retourne un dictionnaire récapitulatif du nombre d'enregistrements par table."""
         with self.get_connection() as conn:
             stats = {}
-            for table in ["raw_activity", "daily_metrics", "chat_sessions", "historical_footprints"]:
+            for table in ["raw_activity", "daily_metrics", "chat_sessions", "historical_footprints", "chat_messages"]:
                 cursor = conn.execute(f"SELECT COUNT(*) FROM {table};")
                 stats[table] = cursor.fetchone()[0]
             return stats
