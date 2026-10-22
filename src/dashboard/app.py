@@ -23,70 +23,59 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.config import normalize_to_macro_topic, settings
+from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
 
-# Configuration de la page Streamlit
-st.set_page_config(
-    page_title="Exocortex — Bandeur de Stats",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Thème sombre et styles CSS avancés
-st.markdown(
-    """
-    <style>
-    .main {
-        background-color: #0b0f19;
-        color: #f3f4f6;
-    }
-    .stMetric {
-        background-color: #131b2e;
-        padding: 18px;
-        border-radius: 12px;
-        border: 1px solid #1f293d;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
-    }
-    .stMetric label {
-        color: #94a3b8 !important;
-        font-size: 0.85rem !important;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-    .stMetric div[data-testid="stMetricValue"] {
-        color: #38bdf8 !important;
-        font-size: 1.8rem !important;
-        font-weight: 800;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 10px;
-        background-color: #0f172a;
-        padding: 8px 12px;
-        border-radius: 10px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        padding: 10px 20px;
-        color: #94a3b8;
-        border-radius: 6px;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #2563eb !important;
-        color: #ffffff !important;
-        font-weight: bold;
-    }
-    .card-box {
-        background-color: #131b2e;
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 20px;
-        margin-bottom: 20px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# Configuration de styles CSS avancés
+APP_CUSTOM_CSS = """
+<style>
+.main {
+    background-color: #0b0f19;
+    color: #f3f4f6;
+}
+.stMetric {
+    background-color: #131b2e;
+    padding: 18px;
+    border-radius: 12px;
+    border: 1px solid #1f293d;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+}
+.stMetric label {
+    color: #94a3b8 !important;
+    font-size: 0.85rem !important;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.stMetric div[data-testid="stMetricValue"] {
+    color: #38bdf8 !important;
+    font-size: 1.8rem !important;
+    font-weight: 800;
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap: 10px;
+    background-color: #0f172a;
+    padding: 8px 12px;
+    border-radius: 10px;
+}
+.stTabs [data-baseweb="tab"] {
+    padding: 10px 20px;
+    color: #94a3b8;
+    border-radius: 6px;
+}
+.stTabs [aria-selected="true"] {
+    background-color: #2563eb !important;
+    color: #ffffff !important;
+    font-weight: bold;
+}
+.card-box {
+    background-color: #131b2e;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+</style>
+"""
 
 
 @st.cache_resource
@@ -98,8 +87,11 @@ def get_ro_connection() -> sqlite3.Connection:
     """Ouvre une connexion SQLite en lecture seule stricte (file:telemetry.db?mode=ro)."""
     db_path = get_db_path()
     if not db_path.exists():
-        st.error(f"Base de données introuvable : {db_path}")
-        st.stop()
+        try:
+            st.error(f"Base de données introuvable : {db_path}")
+            st.stop()
+        except Exception:
+            raise FileNotFoundError(f"Base de données introuvable : {db_path}")
     uri = f"file:{db_path.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
@@ -137,23 +129,31 @@ def load_macro_kpis() -> Dict[str, Any]:
         passive_exp_sec = passive_exp_sec or 0
         os_hours = round(total_os_sec / 3600.0, 1)
 
-        # 3. Daily metrics stats (hyperfocus record, avg context switch)
+        # 3. Daily metrics stats (agrégation découplée et record d'hyperfocus déterministe)
         cur = conn.execute(
             """
             SELECT 
-                MAX(max_hyperfocus_sec),
-                max_hyperfocus_topic,
                 AVG(context_switches_per_hour),
                 AVG(read_vs_write_ratio)
-            FROM daily_metrics
-            WHERE max_hyperfocus_sec IS NOT NULL;
+            FROM daily_metrics;
             """
         )
-        row = cur.fetchone()
-        max_hyperfocus_sec = row[0] if row and row[0] else 0
-        max_hyperfocus_topic = row[1] if row and row[1] else "N/A"
-        avg_switch_rate = round(row[2], 2) if row and row[2] else 0.0
-        avg_read_ratio = round(row[3], 2) if row and row[3] else 0.4
+        row_avg = cur.fetchone()
+        avg_switch_rate = round(row_avg[0], 2) if row_avg and row_avg[0] is not None else 0.0
+        avg_read_ratio = round(row_avg[1], 2) if row_avg and row_avg[1] is not None else 0.4
+
+        cur = conn.execute(
+            """
+            SELECT max_hyperfocus_sec, max_hyperfocus_topic
+            FROM daily_metrics
+            WHERE max_hyperfocus_sec IS NOT NULL
+            ORDER BY max_hyperfocus_sec DESC
+            LIMIT 1;
+            """
+        )
+        row_hf = cur.fetchone()
+        max_hyperfocus_sec = row_hf[0] if row_hf and row_hf[0] else 0
+        max_hyperfocus_topic = row_hf[1] if row_hf and row_hf[1] else "N/A"
 
         # 4. Footprints count
         cur = conn.execute("SELECT COUNT(*) FROM historical_footprints;")
@@ -307,6 +307,172 @@ def load_circadian_data() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30)
+def load_chat_search_results(
+    query: str = "",
+    topic_filter: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Recherche full-text dans les sessions et messages Gemini."""
+    with get_ro_connection() as conn:
+        params: List[Any] = []
+        conditions = []
+
+        if query.strip():
+            q_like = f"%{query.strip()}%"
+            conditions.append(
+                "(cs.session_id IN (SELECT session_id FROM chat_messages WHERE user_prompt LIKE ? OR ai_response LIKE ?) OR cs.summary LIKE ?)"
+            )
+            params.extend([q_like, q_like, q_like])
+
+        if topic_filter and topic_filter != "Tous les topics":
+            conditions.append("cs.extracted_topics_json LIKE ?")
+            params.append(f"%{topic_filter}%")
+
+        if status_filter and status_filter != "Tous":
+            conditions.append("cs.distillation_status = ?")
+            params.append(status_filter)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        sql = f"""
+            SELECT cs.session_id, cs.timestamp_start, cs.timestamp_end, cs.turn_count,
+                   cs.user_char_count, cs.extracted_topics_json, cs.generated_notes_json,
+                   cs.summary, cs.distillation_status
+            FROM chat_sessions cs
+            {where_clause}
+            ORDER BY cs.timestamp_start DESC
+            LIMIT {limit};
+        """
+        cur = conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+@st.cache_data(ttl=30)
+def load_messages_for_session(session_id: str) -> List[Dict[str, Any]]:
+    """Récupère l'ensemble des tours de conversation d'une session de chat."""
+    with get_ro_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT id, turn_index, timestamp, user_prompt, ai_response, user_char_count
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY turn_index ASC;
+            """,
+            (session_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+@st.cache_data(ttl=30)
+def load_footprints_summary() -> Dict[str, Any]:
+    """Calcule les métriques globales sur la table historical_footprints."""
+    with get_ro_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN source = 'youtube' THEN 1 ELSE 0 END) as youtube_count,
+                SUM(CASE WHEN source = 'google_search' THEN 1 ELSE 0 END) as search_count,
+                SUM(CASE WHEN cluster_id IS NOT NULL AND cluster_id != '' THEN 1 ELSE 0 END) as clustered_count,
+                SUM(CASE WHEN linked_gemini_session_id IS NOT NULL AND linked_gemini_session_id != '' THEN 1 ELSE 0 END) as linked_count
+            FROM historical_footprints;
+            """
+        )
+        r = cur.fetchone()
+        return {
+            "total": r["total"] or 0,
+            "youtube": r["youtube_count"] or 0,
+            "search": r["search_count"] or 0,
+            "clustered": r["clustered_count"] or 0,
+            "linked": r["linked_count"] or 0,
+        }
+
+
+@st.cache_data(ttl=30)
+def load_top_channels_and_domains(limit: int = 15) -> pd.DataFrame:
+    """Agrège le top 15 des chaînes YouTube et domaines consultés."""
+    with get_ro_connection() as conn:
+        cur = conn.execute(
+            f"""
+            SELECT channel_or_domain, source, COUNT(*) as footprint_count
+            FROM historical_footprints
+            WHERE channel_or_domain IS NOT NULL AND channel_or_domain != ''
+            GROUP BY channel_or_domain, source
+            ORDER BY footprint_count DESC
+            LIMIT {limit};
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["channel_or_domain", "source", "footprint_count"])
+
+
+@st.cache_data(ttl=30)
+def load_burst_clusters_summary(limit: int = 25) -> pd.DataFrame:
+    """Identifie les tunnels de recherche denses (Burst Clusters) d'au moins 3 événements."""
+    with get_ro_connection() as conn:
+        cur = conn.execute(
+            f"""
+            SELECT 
+                cluster_id,
+                source,
+                semantic_topic,
+                COUNT(*) as event_count,
+                MIN(timestamp) as start_time,
+                MAX(timestamp) as end_time,
+                GROUP_CONCAT(title_or_query, ' ➔ ') as samples
+            FROM historical_footprints
+            WHERE cluster_id IS NOT NULL AND cluster_id != ''
+            GROUP BY cluster_id, source, semantic_topic
+            HAVING event_count >= 3
+            ORDER BY event_count DESC, start_time DESC
+            LIMIT {limit};
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def search_historical_footprints(
+    query: str = "",
+    source_filter: str = "Toutes",
+    only_clustered: bool = False,
+    only_linked: bool = False,
+    limit: int = 100,
+) -> pd.DataFrame:
+    """Recherche dynamique d'empreintes avec filtres multiples."""
+    with get_ro_connection() as conn:
+        conditions = []
+        params = []
+        if query.strip():
+            conditions.append("(title_or_query LIKE ? OR channel_or_domain LIKE ?)")
+            params.extend([f"%{query.strip()}%", f"%{query.strip()}%"])
+        if source_filter and source_filter != "Toutes":
+            conditions.append("source = ?")
+            params.append(source_filter)
+        if only_clustered:
+            conditions.append("cluster_id IS NOT NULL AND cluster_id != ''")
+        if only_linked:
+            conditions.append("linked_gemini_session_id IS NOT NULL AND linked_gemini_session_id != ''")
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        cur = conn.execute(
+            f"""
+            SELECT timestamp, source, channel_or_domain, title_or_query, cluster_id, semantic_topic, linked_gemini_session_id
+            FROM historical_footprints
+            {where_clause}
+            ORDER BY timestamp DESC
+            LIMIT {limit};
+            """,
+            params,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+            "timestamp", "source", "channel_or_domain", "title_or_query", "cluster_id", "semantic_topic", "linked_gemini_session_id"
+        ])
+
+
 # ==============================================================================
 # EN-TÊTE PRINCIPAL & BANDEAU DE KPIS MACRO
 # ==============================================================================
@@ -361,11 +527,12 @@ st.markdown("---")
 # NAVIGATION PAR ONGLETS
 # ==============================================================================
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⏱️ Chronologie & Focus Quotidien",
     "🗺️ Cartographie des Obsessions",
     "📜 Archéologie Longitudinale",
     "🌙 Rythmes Circadiens",
+    "🔍 Explorateur Épistémique & Empreintes",
 ])
 
 # ------------------------------------------------------------------------------
@@ -651,4 +818,201 @@ with tab4:
                 """,
                 unsafe_allow_html=True,
             )
+
+# ------------------------------------------------------------------------------
+# ONGLET 5 : EXPLORATEUR ÉPISTÉMIQUE & EMPREINTES
+# ------------------------------------------------------------------------------
+with tab5:
+    st.subheader("🔍 Explorateur Épistémique & Archéologie des Empreintes")
+    st.caption("Recherche full-text dans les échanges Gemini historiques (6 649 messages) et analyse des 73 153 empreintes numériques.")
+
+    tab5_sub1, tab5_sub2 = st.tabs([
+        "💬 Volet A : Moteur de Recherche Gemini (Sessions & Messages)",
+        "🌐 Volet B : Archéologie des Empreintes & Tunnels de Recherche",
+    ])
+
+    # ==========================================================================
+    # VOLET A : MOTEUR DE RECHERCHE DANS LES SESSIONS ET MESSAGES GEMINI
+    # ==========================================================================
+    with tab5_sub1:
+        st.markdown("#### Moteur de Recherche Full-Text (Takeout & Échanges Gemini)")
+        st.caption("Explorez les 6 649 messages et 480 sessions indexées dans la base épistémique.")
+
+        c_q, c_top, c_st = st.columns([3, 2, 1])
+        search_query = c_q.text_input(
+            "Recherche plein texte (mots-clés, concepts, requêtes, réponses) :",
+            placeholder="ex: lancedb, quantization, astro, docker...",
+            key="gemini_search_text_input",
+        )
+        macro_topics = ["Tous les topics"] + sorted(list(AUTHORIZED_SEMANTIC_TOPICS.keys()))
+        filter_topic = c_top.selectbox(
+            "Filtrer par Sujet Sémantique :",
+            macro_topics,
+            index=0,
+            key="gemini_topic_select",
+        )
+        filter_status = c_st.selectbox(
+            "Statut Distillation :",
+            ["Tous", "distilled", "skipped", "pending"],
+            index=0,
+            key="gemini_status_select",
+        )
+
+        matched_sessions = load_chat_search_results(
+            query=search_query,
+            topic_filter=filter_topic,
+            status_filter=filter_status,
+            limit=50,
+        )
+
+        if not matched_sessions:
+            st.info("Aucune session Gemini ne correspond aux critères de recherche.")
+        else:
+            st.success(f"**{len(matched_sessions)} session(s) identifiée(s)** (affichage limité aux 50 plus récentes).")
+
+            session_labels = {
+                s["session_id"]: f"[{str(s['timestamp_start'])[:10]}] {s['summary'][:70] or s['session_id']} ({s['turn_count']} tours)"
+                for s in matched_sessions
+            }
+            selected_sid = st.selectbox(
+                "Sélectionner une session à inspecter :",
+                options=list(session_labels.keys()),
+                format_func=lambda sid: session_labels.get(sid, sid),
+                key="gemini_session_selector",
+            )
+
+            current_sess = next((s for s in matched_sessions if s["session_id"] == selected_sid), matched_sessions[0])
+
+            # Cartouche d'en-tête de session
+            meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
+            meta_col1.metric("Date & Heure", str(current_sess["timestamp_start"])[:16])
+            meta_col2.metric("Échanges", f"{current_sess['turn_count']} tours", f"{current_sess['user_char_count']} cars")
+            meta_col3.metric("Statut", current_sess["distillation_status"])
+
+            topics_raw = current_sess.get("extracted_topics_json") or "[]"
+            try:
+                parsed_topics = json.loads(topics_raw)
+            except Exception:
+                parsed_topics = []
+            topics_badges = " ".join([f"`#{t}`" for t in parsed_topics]) if parsed_topics else "*Aucun topic*"
+            meta_col4.markdown(f"**Topics Détectés :**\n{topics_badges}")
+
+            # Résumé cognitif de la session
+            if current_sess.get("summary"):
+                st.markdown(
+                    f"""
+                    <div class="card-box" style="margin-top: 10px; margin-bottom: 15px;">
+                        <b style="color: #38bdf8;">📝 Résumé Analytique Exocortex :</b><br>
+                        <span style="color: #e2e8f0;">{current_sess['summary']}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            # Fiches conceptuelles associées
+            notes_raw = current_sess.get("generated_notes_json") or "[]"
+            try:
+                parsed_notes = json.loads(notes_raw)
+            except Exception:
+                parsed_notes = []
+
+            if parsed_notes:
+                st.markdown("**📚 Fiches Conceptuelles Liées (Vault 02_Concepts) :**")
+                for note_slug in parsed_notes:
+                    concept_p = settings.CONCEPTS_DIR / f"{note_slug}.md"
+                    if concept_p.exists():
+                        with st.expander(f"📄 Voir la fiche : `{note_slug}.md`"):
+                            st.markdown(concept_p.read_text(encoding="utf-8", errors="replace"))
+                    else:
+                        st.markdown(f"- `[[{note_slug}]]` *(non matérialisée sur disque)*")
+
+            # Tours complets de conversation
+            st.markdown("#### 💬 Tours de Conversation Complets")
+            messages = load_messages_for_session(current_sess["session_id"])
+            if not messages:
+                st.info("Aucun détail de message disponible pour cette session.")
+            else:
+                for msg in messages:
+                    t_idx = msg.get("turn_index", 0) + 1
+                    t_time = str(msg.get("timestamp", ""))[:19]
+                    cars = msg.get("user_char_count", 0)
+                    with st.expander(f"Tour {t_idx} — [{t_time}] ({cars} caractères)", expanded=(t_idx == 1)):
+                        st.markdown(f"**🧑 Utilisateur :**\n\n{msg.get('user_prompt', '')}")
+                        st.markdown("---")
+                        st.markdown(f"**🤖 Gemini :**\n\n{msg.get('ai_response', '')}")
+
+    # ==========================================================================
+    # VOLET B : ARCHÉOLOGIE DES EMPREINTES & BURST CLUSTERS
+    # ==========================================================================
+    with tab5_sub2:
+        st.markdown("#### Archéologie des Empreintes Numériques (YouTube & Google Search)")
+        st.caption("Visualisez les 73 153 empreintes passées, les clusters de recherche en rafale et les connexions aux sessions Gemini.")
+
+        # KPI bandeau
+        fp_kpis = load_footprints_summary()
+        fk1, fk2, fk3, fk4, fk5 = st.columns(5)
+        fk1.metric("Total Empreintes", f"{fp_kpis['total']:,}".replace(",", " "))
+        fk2.metric("Vidéos YouTube", f"{fp_kpis['youtube']:,}".replace(",", " "))
+        fk3.metric("Recherches Google", f"{fp_kpis['search']:,}".replace(",", " "))
+        fk4.metric("En Burst Clusters", f"{fp_kpis['clustered']:,}".replace(",", " "))
+        fk5.metric("Liées à Gemini", f"{fp_kpis['linked']:,}".replace(",", " "))
+
+        st.markdown("---")
+
+        # Visualisation Top 15 Chaînes et Domaines
+        st.markdown("#### 🏆 Top 15 des Chaînes YouTube & Domaines Web Consultés")
+        df_top15 = load_top_channels_and_domains(limit=15)
+        if not df_top15.empty:
+            fig_top = px.bar(
+                df_top15,
+                x="footprint_count",
+                y="channel_or_domain",
+                color="source",
+                orientation="h",
+                labels={"footprint_count": "Nombre d'occurrences", "channel_or_domain": "Chaîne / Domaine", "source": "Source"},
+                template="plotly_dark",
+                height=420,
+            )
+            fig_top.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig_top, use_container_width=True)
+        else:
+            st.info("Aucune donnée d'empreinte disponible.")
+
+        # Burst Clusters
+        st.markdown("#### ⚡ Tunnels d'Exploration Denses (Burst Clusters)")
+        st.caption("Regroupements temporels d'au moins 3 requêtes ou vidéos survenues dans un intervalle court (< 45 min).")
+        df_clusters = load_burst_clusters_summary(limit=25)
+        if not df_clusters.empty:
+            st.dataframe(
+                df_clusters[["cluster_id", "source", "semantic_topic", "event_count", "start_time", "end_time", "samples"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Aucun cluster dense n'a encore été formé.")
+
+        # Moteur d'exploration tabulaire des empreintes
+        st.markdown("#### 🔎 Explorateur et Filtre d'Empreintes")
+        fc1, fc2, fc3, fc4 = st.columns([3, 1, 1, 1])
+        fp_q = fc1.text_input("Recherche textuelle (requête, titre vidéo, chaîne, domaine) :", key="fp_text_search")
+        fp_src = fc2.selectbox("Source :", ["Toutes", "youtube", "google_search"], key="fp_src_filter")
+        fp_only_cluster = fc3.checkbox("Burst Clusters uniquement", value=False, key="fp_only_clust")
+        fp_only_linked = fc4.checkbox("Liées à Gemini uniquement", value=False, key="fp_only_link")
+
+        df_footprints = search_historical_footprints(
+            query=fp_q,
+            source_filter=fp_src,
+            only_clustered=fp_only_cluster,
+            only_linked=fp_only_linked,
+            limit=100,
+        )
+
+        if not df_footprints.empty:
+            st.dataframe(
+                df_footprints[["timestamp", "source", "channel_or_domain", "title_or_query", "cluster_id", "semantic_topic", "linked_gemini_session_id"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Aucune empreinte ne correspond à cette sélection.")
 

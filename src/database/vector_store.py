@@ -125,7 +125,12 @@ class VectorStore:
                         k, v = line.split(":", 1)
                         frontmatter[k.strip()] = v.strip().strip("'\"")
 
-            doc_id = frontmatter.get("id") or file_path.stem
+            raw_id = frontmatter.get("id")
+            if raw_id and raw_id != file_path.stem:
+                doc_id = f"{raw_id}_{file_path.stem[:32]}"
+            else:
+                doc_id = file_path.stem
+
             title = frontmatter.get("title") or file_path.stem.replace("-", " ").title()
             topic = frontmatter.get("semantic_topic") or "General"
             created_at = frontmatter.get("created_at") or ""
@@ -147,10 +152,10 @@ class VectorStore:
                 "vector": vector,
             }
 
-            # Suppression de l'ancienne version si existante puis ajout
+            # Suppression préalable ciblée par slug unique (évite d'écraser une note tierce ayant le même timestamp minute)
             try:
-                safe_id = str(doc_id).replace("'", "''")
-                self._table.delete(f"id = '{safe_id}'")
+                safe_slug = str(file_path.stem).replace("'", "''")
+                self._table.delete(f"slug = '{safe_slug}'")
             except Exception:
                 pass
 

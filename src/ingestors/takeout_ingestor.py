@@ -1281,9 +1281,24 @@ def save_distilled_concept_note(
         related_list = distilled.related_concepts or []
         dist_status = "success"
 
-    concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
     created_date_str = sess.timestamp_start.strftime("%Y-%m-%d")
     updated_date_str = sess.timestamp_end.strftime("%Y-%m-%d")
+
+    concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
+    if dist_status == "success" and concept_file.exists():
+        try:
+            existing_content = concept_file.read_text(encoding="utf-8", errors="replace")
+            m_sid = re.search(r'session_id:\s*["\']?([^"\'\n\r]+)["\']?', existing_content)
+            existing_sid = m_sid.group(1).strip() if m_sid else None
+            if existing_sid and existing_sid != sess.session_id:
+                # Collision de slug entre deux sessions distinctes
+                short_sid = re.sub(r"[^a-zA-Z0-9]", "", sess.session_id)[:6].lower()
+                slug = f"{slug}-{created_date_str}-{short_sid}"
+                concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
+                logger.info("Anti-collision slug activée : renommage en '%s.md' pour session %s.", slug, sess.session_id)
+        except Exception as exc:
+            logger.warning("Erreur vérification collision slug pour %s : %s", concept_file.name, exc)
+
     concept_id = sess.timestamp_start.strftime("%Y%m%d%H%M")
     related_md = ", ".join([f"[[{rc}]]" for rc in related_list]) if related_list else "[[Exocortex]]"
     tags_json = json.dumps(tags_list, ensure_ascii=False)

@@ -35,7 +35,6 @@ from src.database.db_manager import (
 )
 from src.database.vector_store import vector_store
 from src.consolidators.drive_compiler import DriveCompiler
-from src.ingestors.takeout_ingestor import register_new_taxonomy_tag
 from src.llm.ollama_client import HardwareProbe, VRAMInsufficientError, llm_client
 from src.llm.prompts import (
     SYSTEM_PROMPT_ANTI_WIKIPEDIA,
@@ -60,6 +59,16 @@ class WindowClassification(BaseModel):
     new_topic_description: Optional[str] = Field(default=None, description="Description courte si nouveau topic.")
     cognitive_mode: str = Field(description="Mode cognitif : production, exploration, chat_ia, gaming, media")
     confidence: float = Field(default=0.9, description="Score de confiance entre 0.0 et 1.0")
+
+
+class NightConceptSynthesisSchema(BaseModel):
+    """Schéma structuré pour la création d'une fiche conceptuelle issue de la télémétrie nocturne."""
+    concept_title: str = Field(description="Titre conceptuel précis et canonique du sujet travaillé (ex: 'Optimisation Pipeline RAG LanceDB'). Jamais le nom générique de la macro-catégorie.")
+    slug: str = Field(description="Slug kebab-case spécifique au sujet (ex: 'optimisation-pipeline-rag-lancedb').")
+    tags: List[str] = Field(default_factory=list, description="3 à 6 tags techniques libres en kebab-case.")
+    summary_1_line: str = Field(description="Résumé dense en une phrase des travaux et arbitrages réalisés.")
+    synthesized_markdown_body: str = Field(description="Corps analytique structuré en Markdown (### Contexte & Problématique, ### Choix Techniques & Implémentation, ### Arbitrages & Prochaines Étapes). Zéro intro Wikipédia.")
+    related_concepts: List[str] = Field(default_factory=list, description="2 à 3 titres de concepts connexes.")
 
 
 # ==============================================================================
@@ -370,6 +379,54 @@ class NightConsolidator:
         )
         return metric
 
+    def _find_matching_existing_concept_cpu(self, topic_name: str, topic_items: List[str]) -> Optional[Path]:
+        """
+        Recherche purement CPU (sans inférence vectorielle pour préserver l'exclusion mutuelle VRAM)
+        d'une note conceptuelle existante appartenant à topic_name et présentant un fort recouvrement
+        lexical avec les fenêtres et activités actives du jour.
+        """
+        if not topic_items or not settings.CONCEPTS_DIR.exists():
+            return None
+
+        raw_text = " ".join(topic_items).lower()
+        activity_words = set(re.findall(r"\b[a-zA-ZÀ-ÿ0-9_-]{4,}\b", raw_text))
+        stopwords = {
+            "chrome", "firefox", "edge", "google", "youtube", "document", "fichier",
+            "page", "fenetre", "visual", "studio", "code", "apercu", "visuel", "http",
+            "https", "pour", "dans", "avec", "cette", "sans", "plus", "tout", "faire"
+        }
+        keywords = activity_words - stopwords
+        if not keywords:
+            return None
+
+        generic_slug = re.sub(r"[\s_]+", "-", topic_name.lower()).strip("-")
+        best_match: Optional[Path] = None
+        best_score = 0
+
+        for fpath in settings.CONCEPTS_DIR.glob("*.md"):
+            if fpath.name.startswith("all-") or fpath.name.startswith("all_") or fpath.stem == generic_slug:
+                continue
+            try:
+                head = fpath.read_text(encoding="utf-8", errors="replace")[:1500].lower()
+                if f'semantic_topic: "{topic_name.lower()}"' not in head and f'semantic_topic: "{topic_name}"' not in head:
+                    m_top = re.search(r'semantic_topic:\s*["\']?([^"\'\n\r]+)["\']?', head)
+                    if not m_top or m_top.group(1).strip() != topic_name:
+                        continue
+
+                title_slug_text = fpath.stem.replace("-", " ") + " " + head
+                matches = sum(1 for kw in keywords if kw in title_slug_text)
+                if matches > best_score:
+                    best_score = matches
+                    best_match = fpath
+            except Exception:
+                continue
+
+        # Seuil strict de recouvrement (au moins 3 mots-clés significatifs partagés)
+        if best_score >= 3:
+            logger.info("Correspondance conceptuelle CPU trouvée pour topic '%s' : %s (score: %d)", topic_name, best_match.name if best_match else "", best_score)
+            return best_match
+        return None
+
     # ==========================================================================
     # PASSE 2 : SYNTHÈSE ÉPISODIQUE & FICHES CONCEPTS (GEMMA 4:26B OU 12B)
     # ==========================================================================
@@ -495,19 +552,20 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
             f.write(episodic_content)
         logger.info("Journal épisodique généré : %s", episodic_file.name)
 
-        # 3. Distillation ou enrichissement des fiches conceptuelles (seuil >= 45 min = 2700s)
+        # 3. Distillation ou enrichissement des fiches conceptuelles atomiques (seuil >= 45 min = 2700s)
         for topic_name, duration_secs in top_topics_dict.items():
             if duration_secs < 2700:  # Seuil strict de 45 minutes
                 continue
 
-            slug = re.sub(r"[\s_]+", "-", topic_name.lower()).strip("-")
-            concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
             duration_fmt = f"{duration_secs // 3600}h{(duration_secs % 3600) // 60:02d}"
-
             topic_items = topic_activities.get(topic_name, [])
             topic_context_str = "\n".join(topic_items[:12])
 
-            if concept_file.exists():
+            # Recherche préalable CPU d'une fiche conceptuelle atomique existante (Exclusion mutuelle VRAM)
+            matched_file = self._find_matching_existing_concept_cpu(topic_name, topic_items)
+
+            if matched_file and matched_file.exists():
+                concept_file = matched_file
                 with open(concept_file, "r", encoding="utf-8") as cf:
                     existing_text = cf.read()
 
@@ -543,60 +601,93 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                             else:
                                 m_updated = f"{m_updated.rstrip()}\n\n{enrich_text.strip()}\n"
                     except Exception as exc:
-                        logger.warning("Erreur enrichissement concept %s : %s", slug, exc)
+                        logger.warning("Erreur enrichissement concept %s : %s", concept_file.name, exc)
 
                 with open(concept_file, "w", encoding="utf-8") as cf:
                     cf.write(m_updated)
                 logger.info("Fiche conceptuelle enrichie : %s (+%s)", concept_file.name, duration_fmt)
             else:
+                # Génération d'une nouvelle fiche conceptuelle ATOMIQUE (et non du nom de la macro-catégorie)
                 concept_id = datetime.now().strftime("%Y%m%d%H%M")
-                synthesized_body = ""
+                generic_slug = re.sub(r"[\s_]+", "-", topic_name.lower()).strip("-")
+
+                distilled: Optional[NightConceptSynthesisSchema] = None
                 if llm_client.is_alive() and topic_context_str:
                     concept_prompt = (
-                        f"L'utilisateur a passé {duration_fmt} de concentration continue sur le sujet '{topic_name}' le {date_str}.\n"
-                        f"Fenêtres, outils et activités associées :\n{topic_context_str}\n\n"
-                        "Rédige le corps analytique d'une note conceptuelle (2 à 3 sections Markdown avec sous-titres : "
-                        "### Contexte & Problématique, ### Choix Techniques & Implémentation, ### Arbitrages & Prochaines Étapes). "
-                        "Zéro paraphrase Wikipédia, uniquement du contenu ancré dans l'activité réelle."
+                        f"L'utilisateur a passé {duration_fmt} de concentration continue sur des activités rattachées au macro-domaine '{topic_name}' le {date_str}.\n"
+                        f"Traces, fenêtres et outils observés :\n{topic_context_str}\n\n"
+                        "Génère une fiche conceptuelle ATOMIQUE et PRÉCISE modélisant le cœur technique ou conceptuel de ces travaux. "
+                        "Le titre et le slug doivent refléter l'objet spécifique du travail (ex: 'Optimisation Pipeline RAG LanceDB' -> 'optimisation-pipeline-rag-lancedb'), "
+                        "et JAMAIS le nom générique de la macro-catégorie.\n"
+                        "Rédige un corps dense en Markdown (### Contexte & Problématique, ### Choix Techniques & Implémentation, ### Arbitrages & Prochaines Étapes). "
+                        "Zéro paraphrase encyclopédique Wikipédia."
                     )
                     try:
-                        synthesized_body = llm_client.generate_text(
+                        distilled = llm_client.generate_structured(
                             prompt=concept_prompt,
+                            response_model=NightConceptSynthesisSchema,
                             system=PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
                             model=effective_model,
                             keep_alive="5m",
                         )
                     except Exception as exc:
-                        logger.warning("Erreur génération corps concept %s : %s", slug, exc)
+                        logger.warning("Erreur génération structurée concept nocturne pour %s : %s", topic_name, exc)
 
-                if not synthesized_body.strip():
+                if distilled and distilled.concept_title and distilled.synthesized_markdown_body:
+                    title = distilled.concept_title.strip()
+                    raw_slug = re.sub(r"[^a-z0-9_-]+", "-", (distilled.slug or "").lower()).strip("-")
+                    slug = raw_slug if raw_slug and raw_slug != generic_slug else re.sub(r"[^a-z0-9_-]+", "-", title.lower()).strip("-")
+                    if not slug or slug == generic_slug:
+                        slug = f"{generic_slug}-{date_str.replace('-', '')}"
+                    tags = [re.sub(r"[^a-z0-9_-]+", "-", t.lower()).strip("-") for t in (distilled.tags or []) if t]
+                    if generic_slug not in tags:
+                        tags.insert(0, generic_slug)
+                    if "screen_telemetry" not in tags:
+                        tags.append("screen_telemetry")
+                    summary_1_line = distilled.summary_1_line.strip()
+                    synthesized_body = distilled.synthesized_markdown_body.strip()
+                    related_links = [f"[[{rc.strip()}]]" for rc in (distilled.related_concepts or []) if rc.strip()]
+                    related_links_str = ", ".join(related_links) if related_links else f"[[{topic_name}]]"
+                else:
+                    title = f"{topic_name.replace('_', ' ')} - Travaux du {date_str}"
+                    slug = f"{generic_slug}-{date_str.replace('-', '')}"
+                    tags = [generic_slug, "screen_telemetry"]
+                    summary_1_line = f"Synthèse et développements techniques sur {topic_name.replace('_', ' ')} observés le {date_str}."
                     synthesized_body = (
                         f"### Contexte & Investigations\n"
                         f"Session d'hyperfocus de {duration_fmt} consacrée à {topic_name.replace('_', ' ')}.\n\n"
                         f"### Activités & Traces Notables\n"
-                        + "\n".join([f"- {it}" for it in topic_items[:6]])
+                        + "\n".join([f"- {it}" for it in topic_items[:8]])
                     )
+                    related_tags = [t for t in self.allowed_tags if t != topic_name][:2]
+                    related_links_str = ", ".join([f"[[{t}]]" for t in related_tags]) if related_tags else f"[[{topic_name}]]"
 
-                # Connexions sémantiques dynamiques
-                related_tags = [t for t in self.allowed_tags if t != topic_name][:2]
-                related_links_str = ", ".join([f"[[{t}]]" for t in related_tags]) if related_tags else f"[[{topic_name}]]"
+                # Sécurisation anti-collision sur le slug
+                concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
+                if concept_file.exists():
+                    slug = f"{slug}-{date_str.replace('-', '')}"
+                    concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
+                if concept_file.exists():
+                    slug = f"{slug}-{datetime.now().strftime('%H%M%S')}"
+                    concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
 
+                tags_json = json.dumps(tags, ensure_ascii=False)
                 new_concept = f"""---
 id: "{concept_id}"
-title: "{topic_name.replace('_', ' ')}"
+title: "{title}"
 type: "concept"
 origin: ["screen_telemetry"]
 semantic_topic: "{topic_name}"
-tags: ["{topic_name.lower()}", "screen_telemetry"]
+tags: {tags_json}
 created_at: "{date_str}"
 updated_at: "{date_str}"
 total_time_invested_min: {duration_secs // 60}
-summary_1_line: "Synthèse et développement des réflexions sur {topic_name.replace('_', ' ')}."
+summary_1_line: "{summary_1_line}"
 ---
 
-# {topic_name.replace('_', ' ')}
+# {title}
 
-{synthesized_body.strip()}
+{synthesized_body}
 
 > [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
 > - **Temps cumulé sur ce sujet :** {duration_fmt}
@@ -606,7 +697,7 @@ summary_1_line: "Synthèse et développement des réflexions sur {topic_name.rep
 """
                 with open(concept_file, "w", encoding="utf-8") as cf:
                     cf.write(new_concept)
-                logger.info("Nouvelle fiche conceptuelle créée via synthèse LLM : %s", concept_file.name)
+                logger.info("Nouvelle fiche conceptuelle atomique créée via synthèse LLM : %s", concept_file.name)
 
         # Purge de la VRAM après la synthèse
         llm_client.unload_model(effective_model)

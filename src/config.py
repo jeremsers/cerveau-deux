@@ -239,7 +239,7 @@ class Settings(BaseModel):
 
     # --- Paramètres de Sessionisation & Filtrage Bruit (Module 1) ---
     INACTIVITY_SESSION_THRESHOLD_MIN: int = Field(
-        default_factory=lambda: int(os.getenv("INACTIVITY_SESSION_THRESHOLD_MIN", "120"))
+        default_factory=lambda: int(os.getenv("INACTIVITY_SESSION_THRESHOLD_MIN", "45"))
     )
     MIN_TURNS_THRESHOLD: int = Field(
         default_factory=lambda: int(os.getenv("MIN_TURNS_THRESHOLD", "3"))
