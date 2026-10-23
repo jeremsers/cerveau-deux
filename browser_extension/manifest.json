@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Exocortex Cognitive Telemetry Connector",
+  "version": "0.3.5",
+  "description": "Capteur passif d'onglets actifs et des échanges IA (Gemini, Claude, ChatGPT) pour l'Exocortex local.",
+  "permissions": [
+    "tabs",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8502/*",
+    "https://gemini.google.com/*",
+    "https://claude.ai/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "<all_urls>"
+      ],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
+

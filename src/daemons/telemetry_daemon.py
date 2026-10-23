@@ -40,6 +40,8 @@ except Exception:
         pass
 
 from src.config import settings
+from src.daemons.git_ide_probe import GitIDEProbe
+from src.daemons.browser_telemetry_receiver import BrowserTelemetryServer
 from src.database.db_manager import DBManager, RawActivityRecord
 
 logger = logging.getLogger("Exocortex.TelemetryDaemon")
@@ -118,6 +120,8 @@ class WindowSessionState:
         self.screenshot_path: Optional[str] = None
         self.last_dhash: Optional[int] = None
         self.last_screenshot_ts: Optional[datetime] = None
+        self.url_or_path: Optional[str] = None
+        self.ocr_snippet: Optional[str] = None
 
     @property
     def duration_sec(self) -> int:
@@ -294,8 +298,39 @@ class TelemetryDaemon:
         self.current_state: Optional[WindowSessionState] = None
         self.context_switches_count: int = 0
         self.drift_guard = DriftGuard()
+        self.git_ide_probe = GitIDEProbe()
+        self.browser_server: Optional[BrowserTelemetryServer] = None
+        self._known_projects_cache: List[Dict[str, Any]] = []
+        self._last_projects_refresh_ts: float = 0.0
         self.running: bool = False
         self._setup_signals()
+
+    def get_known_projects(self) -> List[Dict[str, Any]]:
+        """Retourne la liste des projets suivis en base (avec cache court en RAM)."""
+        now = time.time()
+        if (now - self._last_projects_refresh_ts) > 30.0 or not self._known_projects_cache:
+            try:
+                self._known_projects_cache = self.db.get_projects()
+                self._last_projects_refresh_ts = now
+            except Exception:
+                pass
+        return self._known_projects_cache
+
+    def start_browser_receiver(self, port: Optional[int] = None) -> BrowserTelemetryServer:
+        """Démarre le serveur récepteur de télémétrie navigateur en arrière-plan."""
+        if self.browser_server is None:
+            self.browser_server = BrowserTelemetryServer(db_manager=self.db, daemon=self, port=port)
+            self.browser_server.start()
+        return self.browser_server
+
+    def stop_browser_receiver(self) -> None:
+        """Arrête le serveur récepteur de télémétrie navigateur."""
+        if self.browser_server:
+            try:
+                self.browser_server.stop()
+            except Exception:
+                pass
+            self.browser_server = None
 
     def _setup_signals(self) -> None:
         """Enregistre les gestionnaires d'arrêt gracieux SIGINT / SIGTERM."""
@@ -440,7 +475,8 @@ class TelemetryDaemon:
             duration_sec=duration,
             executable=state.executable,
             window_title=state.window_title,
-            ocr_snippet=None,
+            url_or_path=state.url_or_path,
+            ocr_snippet=state.ocr_snippet,
             screenshot_path=state.screenshot_path,
             active_input=state.is_active_input,
             input_intensity=state.input_intensity,
@@ -450,12 +486,13 @@ class TelemetryDaemon:
         )
         self.db.insert_raw_activities_batch([record])
         logger.info(
-            "Activité enregistrée : [%s] '%s' (%d s, input_intensity=%.2f, capture=%s)",
+            "Activité enregistrée : [%s] '%s' (%d s, input_intensity=%.2f, capture=%s, url_or_path=%s)",
             state.executable,
             state.window_title[:40],
             duration,
             state.input_intensity,
             bool(state.screenshot_path),
+            state.url_or_path,
         )
 
     def step(self) -> None:
@@ -491,6 +528,28 @@ class TelemetryDaemon:
         if self.current_state:
             self.current_state.record_tick(is_physically_active)
 
+            # 1. Sonde Git/IDE pour les éditeurs de code et terminaux
+            if self.git_ide_probe.is_ide_or_terminal(executable):
+                _, pid = win32process.GetWindowThreadProcessId(hwnd) if hwnd else (0, 0)
+                git_info = self.git_ide_probe.probe_active_ide(
+                    pid=pid,
+                    executable=executable,
+                    window_title=title,
+                    known_projects=self.get_known_projects(),
+                )
+                if git_info:
+                    self.current_state.url_or_path = git_info
+
+            # 2. Rattachement automatique du dernier onglet navigateur si applicable
+            elif any(b_name in executable.lower() for b_name in ["chrome", "msedge", "brave", "firefox", "opera"]):
+                if self.browser_server and self.browser_server.last_tab_telemetry:
+                    last_tab = self.browser_server.last_tab_telemetry
+                    if (datetime.now() - last_tab["timestamp"]).total_seconds() < 45.0:
+                        if not self.current_state.url_or_path:
+                            self.current_state.url_or_path = last_tab["url"]
+                        if last_tab.get("h1") and not self.current_state.ocr_snippet:
+                            self.current_state.ocr_snippet = last_tab["h1"][:200]
+
             # Déclenchement de la capture visuelle différée si session prolongée (>= 180s)
             duration = self.current_state.duration_sec
             if duration >= settings.PROLONGED_SESSION_THRESHOLD_SEC:
@@ -504,10 +563,22 @@ class TelemetryDaemon:
                 if should_capture and hwnd > 0:
                     self.capture_window_webp(hwnd)
 
-    def run_loop(self, max_cycles: Optional[int] = None, interval_sec: Optional[float] = None) -> None:
+    def run_loop(
+        self,
+        max_cycles: Optional[int] = None,
+        interval_sec: Optional[float] = None,
+        enable_browser_receiver: bool = True,
+    ) -> None:
         """Boucle de polling principale du démon."""
         polling_interval = interval_sec or settings.POLLING_INTERVAL_SEC
         self.running = True
+
+        if enable_browser_receiver:
+            try:
+                self.start_browser_receiver()
+            except Exception as exc:
+                logger.warning("Échec démarrage récepteur navigateur HTTP : %s", exc)
+
         logger.info("=== DÉMON DE TÉLÉMÉTRIE DÉMARRÉ (0 VRAM, polling=%.1f s) ===", polling_interval)
 
         cycles = 0
@@ -522,6 +593,7 @@ class TelemetryDaemon:
             self._handle_exit(signal.SIGINT, None)
         finally:
             self.flush_current_window()
+            self.stop_browser_receiver()
 
 
 if __name__ == "__main__":

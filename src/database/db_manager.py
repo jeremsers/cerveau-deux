@@ -466,6 +466,114 @@ class DBManager:
             conn.executemany(sql, payload)
         return len(payload)
 
+    def upsert_live_chat_turn(
+        self,
+        platform: str,
+        session_id: str,
+        user_prompt: str,
+        ai_response: str,
+        timestamp: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Insère ou met à jour de façon idempotente un tour de conversation capturé en direct
+        par le récepteur d'extension navigateur (v0.3.5 / EXO-011).
+
+        Déduplique sur le couple (session_id, user_prompt) :
+        - Si un message avec le même user_prompt existe déjà dans la session, met à jour
+          la réponse IA si elle a évolué, sans incrémenter turn_count.
+        - Sinon, ajoute le nouveau tour (turn_index = len(messages)) et incrémente turn_count
+          dans chat_sessions.
+        """
+        now_dt = timestamp or datetime.now()
+        ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        clean_prompt = user_prompt.strip()
+        clean_response = ai_response.strip()
+        u_chars = len(clean_prompt)
+
+        with self.get_connection() as conn:
+            # 1. Vérifier si la session existe
+            cur_sess = conn.execute(
+                "SELECT session_id, turn_count, user_char_count FROM chat_sessions WHERE session_id = ?;",
+                (session_id,),
+            )
+            sess_row = cur_sess.fetchone()
+
+            # 2. Récupérer les messages existants pour cette session
+            cur_msgs = conn.execute(
+                "SELECT turn_index, user_prompt, ai_response FROM chat_messages WHERE session_id = ? ORDER BY turn_index ASC;",
+                (session_id,),
+            )
+            existing_msgs = cur_msgs.fetchall()
+
+            # 3. Déduplication par prompt
+            for row in existing_msgs:
+                t_idx, existing_prompt, existing_ai = row[0], row[1], row[2]
+                if existing_prompt.strip() == clean_prompt:
+                    if existing_ai.strip() != clean_response and clean_response:
+                        conn.execute(
+                            "UPDATE chat_messages SET ai_response = ? WHERE session_id = ? AND turn_index = ?;",
+                            (clean_response, session_id, t_idx),
+                        )
+                        conn.execute(
+                            "UPDATE chat_sessions SET timestamp_end = ? WHERE session_id = ?;",
+                            (ts_str, session_id),
+                        )
+                        return {
+                            "session_id": session_id,
+                            "turn_index": t_idx,
+                            "status": "updated",
+                            "is_new": False,
+                        }
+                    return {
+                        "session_id": session_id,
+                        "turn_index": t_idx,
+                        "status": "duplicate",
+                        "is_new": False,
+                    }
+
+            # 4. Nouveau tour de conversation
+            new_turn_index = len(existing_msgs)
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    session_id, turn_index, timestamp, user_prompt, ai_response, user_char_count
+                ) VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (session_id, new_turn_index, ts_str, clean_prompt, clean_response, u_chars),
+            )
+
+            # 5. Création ou mise à jour de la session parent
+            if not sess_row:
+                conn.execute(
+                    """
+                    INSERT INTO chat_sessions (
+                        session_id, timestamp_start, timestamp_end, turn_count,
+                        user_char_count, extracted_topics_json, generated_notes_json,
+                        summary, distillation_status
+                    ) VALUES (?, ?, ?, 1, ?, '[]', '[]', '', 'pending');
+                    """,
+                    (session_id, ts_str, ts_str, u_chars),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET timestamp_end = ?,
+                        turn_count = turn_count + 1,
+                        user_char_count = user_char_count + ?
+                    WHERE session_id = ?;
+                    """,
+                    (ts_str, u_chars, session_id),
+                )
+
+        return {
+            "session_id": session_id,
+            "turn_index": new_turn_index,
+            "status": "created",
+            "is_new": True,
+        }
+
     def get_completed_session_ids_from_db(self) -> Set[str]:
         """Retourne l'ensemble des session_id déjà traitées avec succès ou bruit consolidé."""
         with self.get_connection() as conn:

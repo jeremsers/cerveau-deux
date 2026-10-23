@@ -272,6 +272,12 @@ class Settings(BaseModel):
     DHASH_MAX_HAMMING_DISTANCE: int = Field(
         default_factory=lambda: int(os.getenv("DHASH_MAX_HAMMING_DISTANCE", "5"))
     )
+    BROWSER_RECEIVER_HOST: str = Field(
+        default_factory=lambda: os.getenv("BROWSER_RECEIVER_HOST", "127.0.0.1")
+    )
+    BROWSER_RECEIVER_PORT: int = Field(
+        default_factory=lambda: int(os.getenv("BROWSER_RECEIVER_PORT", "8502"))
+    )
 
     # --- Détection Anti-Dérive / Rabbit Hole (v0.3.0 - Module 8) ---
     DRIFT_MAX_SWITCHES_30MIN: int = Field(
