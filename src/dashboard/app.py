@@ -21,9 +21,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import pyperclip
 import streamlit as st
 
 from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
+from src.consolidators.kanban_engine import kanban_engine
+from src.database.db_manager import ProjectRecord
 
 # Configuration de styles CSS avancés
 APP_CUSTOM_CSS = """
@@ -527,12 +530,13 @@ st.markdown("---")
 # NAVIGATION PAR ONGLETS
 # ==============================================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "⏱️ Chronologie & Focus Quotidien",
     "🗺️ Cartographie des Obsessions",
     "📜 Archéologie Longitudinale",
     "🌙 Rythmes Circadiens",
     "🔍 Explorateur Épistémique & Empreintes",
+    "📋 Kanban & Studio SOTA",
 ])
 
 # ------------------------------------------------------------------------------
@@ -1015,4 +1019,280 @@ with tab5:
             )
         else:
             st.info("Aucune empreinte ne correspond à cette sélection.")
+
+# ------------------------------------------------------------------------------
+# ONGLET 6 : KANBAN EXÉCUTIF & STUDIO SOTA (v0.2.0 - Module 7)
+# ------------------------------------------------------------------------------
+with tab6:
+    st.subheader("📋 Kanban Exécutif Multi-Projets & Studio SOTA")
+    st.caption("Gestion agile dynamique, pont presse-papier 1-clic avec Gemini Web App et file d'attente agent codeur.")
+
+    # Synchronisation idempotente des specs historiques tech specs/
+    kanban_engine.sync_existing_tech_specs()
+
+    projects = kanban_engine.db.get_projects()
+    if not projects:
+        projects = [{"project_id": "exocortex", "name": "Exocortex & Télémétrie Cognitive", "prefix": "EXO"}]
+
+    # --- BARRE SUPÉRIEURE (1 Projet = 1 Vue) ---
+    p_col1, p_col2 = st.columns([3, 1])
+    with p_col1:
+        proj_options = [p["project_id"] for p in projects]
+        selected_project_id = st.selectbox(
+            "Projet Actif (1 Projet = 1 Vue) :",
+            options=proj_options,
+            format_func=lambda pid: next((p["name"] for p in projects if p["project_id"] == pid), pid),
+            key="kanban_active_proj",
+        )
+
+    with p_col2:
+        with st.popover("➕ Nouveau Projet"):
+            st.markdown("##### 🚀 Créer un Nouveau Projet")
+            new_pname = st.text_input("Nom d'affichage *", placeholder="ex: Homelab Media", key="new_proj_name")
+            new_pid = st.text_input("Slug Unique *", placeholder="ex: homelab-media", key="new_proj_id")
+            new_prefix = st.text_input("Préfixe Tickets *", placeholder="ex: HLAB", max_chars=5, key="new_proj_prefix")
+            new_repo = st.text_input("Chemin Local Dépôt (optionnel)", placeholder="C:/chemin/vers/repo", key="new_proj_repo")
+            new_desc = st.text_area("Description du projet", placeholder="Contexte architectural et objectifs...", key="new_proj_desc")
+            if st.button("Enregistrer le Projet", key="btn_save_proj", use_container_width=True):
+                if new_pname.strip() and new_pid.strip() and new_prefix.strip():
+                    kanban_engine.db.upsert_project(
+                        ProjectRecord(
+                            project_id=new_pid.strip().lower(),
+                            name=new_pname.strip(),
+                            prefix=new_prefix.strip().upper(),
+                            repo_path=new_repo.strip() or None,
+                            description=new_desc.strip(),
+                        )
+                    )
+                    st.success(f"Projet '{new_pname}' créé !")
+                    st.rerun()
+                else:
+                    st.error("Nom, Slug et Préfixe sont obligatoires.")
+
+    active_proj = next((p for p in projects if p["project_id"] == selected_project_id), None)
+    if active_proj:
+        st.info(f"**Périmètre :** {active_proj.get('description', '')} | **Dépôt :** `{active_proj.get('repo_path') or 'Non configuré'}`")
+
+    # --- FILTRES SECONDAIRES ---
+    all_proj_tasks = kanban_engine.db.get_kanban_tasks(project_id=selected_project_id)
+    unique_tags = sorted(list({t["component_tag"] for t in all_proj_tasks if t.get("component_tag")}))
+    tag_options = ["Tous"] + unique_tags
+
+    f_col1, f_col2 = st.columns([2, 2])
+    with f_col1:
+        selected_tag = st.selectbox("Filtrer par sous-module (component_tag) :", options=tag_options, key="kanban_filter_tag")
+    with f_col2:
+        search_query = st.text_input("Recherche textuelle dans les tickets :", key="kanban_search_text")
+
+    filtered_tasks = all_proj_tasks
+    if selected_tag != "Tous":
+        filtered_tasks = [t for t in filtered_tasks if t.get("component_tag") == selected_tag]
+    if search_query.strip():
+        q_low = search_query.strip().lower()
+        filtered_tasks = [
+            t for t in filtered_tasks
+            if q_low in t["title"].lower()
+            or q_low in t.get("summary_pitch", "").lower()
+            or q_low in t["task_id"].lower()
+        ]
+
+    # --- BARRE D'ACTIONS RAPIDES ---
+    st.markdown("---")
+    act_col1, act_col2 = st.columns(2)
+    with act_col1:
+        with st.expander("➕ Nouvelle Idée / Tâche"):
+            nt_title = st.text_input("Titre de la tâche / idée *", key="nt_title")
+            nt_sub1, nt_sub2, nt_sub3 = st.columns(3)
+            with nt_sub1:
+                nt_tag = st.text_input("Sous-module", value="general", key="nt_tag")
+            with nt_sub2:
+                nt_prio = st.selectbox(
+                    "Priorité",
+                    options=[1, 2, 3, 4],
+                    index=1,
+                    format_func=lambda x: {1: "P1 (Urgent)", 2: "P2 (Normal)", 3: "P3 (Secondaire)", 4: "P4 (Optionnel)"}[x],
+                    key="nt_prio",
+                )
+            with nt_sub3:
+                nt_cplx = st.selectbox("Complexité", options=["S", "M", "L", "XL"], index=1, key="nt_cplx")
+            nt_status = st.selectbox(
+                "Statut initial",
+                options=["radar", "needs_spec"],
+                format_func=lambda s: "📡 Radar (À arbitrer)" if s == "radar" else "📝 Nécessite Spec + Prompt",
+                key="nt_status",
+            )
+            nt_pitch = st.text_area("Pitch / Contexte & Objectifs", key="nt_pitch")
+            if st.button("Créer la Tâche", key="btn_create_task", use_container_width=True):
+                if nt_title.strip():
+                    new_tid = kanban_engine.create_task(
+                        project_id=selected_project_id,
+                        title=nt_title.strip(),
+                        component_tag=nt_tag.strip() or "general",
+                        summary_pitch=nt_pitch.strip(),
+                        priority=nt_prio,
+                        complexity=nt_cplx,
+                        initial_status=nt_status,
+                    )
+                    st.toast(f"Tâche {new_tid} créée !")
+                    st.rerun()
+                else:
+                    st.error("Le titre de la tâche est obligatoire.")
+
+    with act_col2:
+        with st.expander("📥 Ingérer Spec + Prompt depuis Gemini Web"):
+            st.caption("Collez le Markdown retourné par Gemini Web App (avec frontmatter YAML et sections).")
+            if st.button("📋 Coller depuis le Presse-Papier Windows", key="btn_paste_clip", use_container_width=True):
+                try:
+                    clip_text = pyperclip.paste()
+                    if clip_text and clip_text.strip():
+                        attached = kanban_engine.attach_spec_to_task(clip_text)
+                        st.toast(f"Spec ingérée avec succès pour {attached.get('task_id', 'le ticket')} !")
+                        st.rerun()
+                    else:
+                        st.warning("Le presse-papier est vide.")
+                except Exception as exc:
+                    st.error(f"Erreur presse-papier : {exc}")
+
+            manual_spec = st.text_area("Ou coller manuellement le Markdown ici :", height=100, key="manual_spec_area")
+            if st.button("Valider l'Ingestion Manuelle", key="btn_manual_ingest", use_container_width=True):
+                if manual_spec.strip():
+                    attached = kanban_engine.attach_spec_to_task(manual_spec.strip())
+                    st.toast(f"Spec ingérée avec succès pour {attached.get('task_id', 'le ticket')} !")
+                    st.rerun()
+
+    # --- TABLEAU KANBAN EN 4 COLONNES VISUELLES ---
+    st.markdown("---")
+    kcol1, kcol2, kcol3, kcol4 = st.columns(4)
+
+    radar_tasks = [t for t in filtered_tasks if t["status"] == "radar"]
+    needs_spec_tasks = [t for t in filtered_tasks if t["status"] == "needs_spec"]
+    ready_and_in_progress = [t for t in filtered_tasks if t["status"] in ("ready_for_agent", "in_progress")]
+    done_tasks = [t for t in filtered_tasks if t["status"] == "done"]
+    icebox_tasks = [t for t in filtered_tasks if t["status"] == "icebox"]
+
+    # 1. RADAR / IDÉES
+    with kcol1:
+        st.markdown(f"### 📡 Radar ({len(radar_tasks)})")
+        for t in radar_tasks:
+            with st.container(border=True):
+                st.markdown(f"**`{t['task_id']}`** `{t['component_tag']}` | P{t['priority']} | {t['complexity']}")
+                st.markdown(f"**{t['title']}**")
+                if t.get("summary_pitch"):
+                    st.caption(t["summary_pitch"][:160] + ("..." if len(t["summary_pitch"]) > 160 else ""))
+                rc1, rc2 = st.columns(2)
+                if rc1.button("✅ Valider", key=f"val_{t['task_id']}", use_container_width=True):
+                    kanban_engine.db.update_kanban_task_status(t["task_id"], "needs_spec")
+                    st.rerun()
+                if rc2.button("🧊 Frigo", key=f"frigo_{t['task_id']}", use_container_width=True):
+                    kanban_engine.db.update_kanban_task_status(t["task_id"], "icebox")
+                    st.rerun()
+
+    # 2. NÉCESSITE SPEC + PROMPT
+    with kcol2:
+        st.markdown(f"### 📝 Spec Requise ({len(needs_spec_tasks)})")
+        for t in needs_spec_tasks:
+            with st.container(border=True):
+                st.markdown(f"**`{t['task_id']}`** `{t['component_tag']}` | P{t['priority']} | {t['complexity']}")
+                st.markdown(f"**{t['title']}**")
+                if t.get("summary_pitch"):
+                    st.caption(t["summary_pitch"][:160] + ("..." if len(t["summary_pitch"]) > 160 else ""))
+
+                if st.button("📋 Copier Context-Pack", key=f"cp_{t['task_id']}", use_container_width=True):
+                    prompt_text = kanban_engine.build_sota_context_pack_prompt(t["task_id"])
+                    try:
+                        pyperclip.copy(prompt_text)
+                        st.toast(f"Context-Pack {t['task_id']} copié ! Collez-le dans Gemini Web.")
+                    except Exception as e:
+                        st.error(f"Erreur presse-papier : {e}")
+
+                if st.button("📥 Lier Spec Presse-Papier", key=f"link_{t['task_id']}", use_container_width=True):
+                    try:
+                        c_text = pyperclip.paste()
+                        if c_text and c_text.strip():
+                            kanban_engine.attach_spec_to_task(c_text, target_task_id=t["task_id"])
+                            st.toast(f"Spec rattachée à {t['task_id']} !")
+                            st.rerun()
+                        else:
+                            st.warning("Presse-papier vide.")
+                    except Exception as e:
+                        st.error(f"Erreur : {e}")
+
+                sb1, sb2 = st.columns(2)
+                if sb1.button("⬅️ Radar", key=f"back_rad_{t['task_id']}", use_container_width=True):
+                    kanban_engine.db.update_kanban_task_status(t["task_id"], "radar")
+                    st.rerun()
+                if sb2.button("🧊 Frigo", key=f"back_frg_{t['task_id']}", use_container_width=True):
+                    kanban_engine.db.update_kanban_task_status(t["task_id"], "icebox")
+                    st.rerun()
+
+    # 3. PRÊT POUR AGENT & EN COURS
+    with kcol3:
+        st.markdown(f"### 🎯 Prêt & ⚙️ En Cours ({len(ready_and_in_progress)})")
+        for t in ready_and_in_progress:
+            with st.container(border=True):
+                if t["status"] == "in_progress":
+                    st.markdown("`:violet-background[⚙️ EN COURS]`")
+                else:
+                    st.markdown("`:green-background[🎯 PRÊT POUR AGENT]`")
+
+                st.markdown(f"**`{t['task_id']}`** `{t['component_tag']}` | P{t['priority']} | {t['complexity']}")
+                st.markdown(f"**{t['title']}**")
+
+                if st.button("🤖 Copier Prompt Codeur", key=f"coder_{t['task_id']}", use_container_width=True):
+                    coder_prompt = kanban_engine.extract_coder_prompt_from_spec(t["task_id"])
+                    try:
+                        pyperclip.copy(coder_prompt)
+                        kanban_engine.db.update_kanban_task_status(t["task_id"], "in_progress")
+                        kanban_engine.compile_agent_queue_manifest()
+                        st.toast(f"Prompt {t['task_id']} copié & tâche passée En Cours !")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erreur presse-papier : {e}")
+
+                if t.get("spec_file_path") and Path(t["spec_file_path"]).exists():
+                    with st.expander("📄 Lire Spec & Prompt"):
+                        st.markdown(Path(t["spec_file_path"]).read_text(encoding="utf-8", errors="ignore"))
+
+                if st.button("✅ Marquer Terminé", key=f"done_{t['task_id']}", use_container_width=True):
+                    kanban_engine.db.update_kanban_task_status(t["task_id"], "done")
+                    kanban_engine.compile_agent_queue_manifest()
+                    st.toast(f"Tâche {t['task_id']} marquée terminée !")
+                    st.rerun()
+
+    # 4. TERMINÉ
+    with kcol4:
+        st.markdown(f"### ✅ Terminé ({len(done_tasks)})")
+        for t in done_tasks:
+            with st.container(border=True):
+                st.markdown(f"**`{t['task_id']}`** `{t['component_tag']}`")
+                st.markdown(f"**{t['title']}**")
+                if t.get("spec_file_path") and Path(t["spec_file_path"]).exists():
+                    with st.expander("📄 Voir Spécification"):
+                        p_file = Path(t["spec_file_path"])
+                        txt = p_file.read_text(encoding="utf-8", errors="ignore")
+                        st.markdown(txt[:2500] + ("\n\n*(tronqué pour affichage)*" if len(txt) > 2500 else ""))
+
+    # --- FRIGO (ICEBOX) ---
+    st.markdown("---")
+    show_icebox = st.checkbox("🧊 Afficher le Frigo (Idées écartées)", value=False, key="kanban_show_icebox")
+    if show_icebox:
+        st.markdown(f"#### 🧊 Frigo ({len(icebox_tasks)} idées écartées)")
+        if not icebox_tasks:
+            st.info("Aucune idée n'est actuellement au frigo.")
+        else:
+            ib_cols = st.columns(3)
+            for idx, t in enumerate(icebox_tasks):
+                with ib_cols[idx % 3]:
+                    with st.container(border=True):
+                        st.markdown(f"**`{t['task_id']}`** `{t['component_tag']}` | P{t['priority']} | {t['complexity']}")
+                        st.markdown(f"**{t['title']}**")
+                        if t.get("summary_pitch"):
+                            st.caption(t["summary_pitch"])
+                        ib1, ib2 = st.columns(2)
+                        if ib1.button("♻️ Restaurer", key=f"restore_{t['task_id']}", use_container_width=True):
+                            kanban_engine.db.update_kanban_task_status(t["task_id"], "radar")
+                            st.rerun()
+                        if ib2.button("🗑️ Supprimer", key=f"del_{t['task_id']}", use_container_width=True):
+                            kanban_engine.db.delete_kanban_task(t["task_id"])
+                            st.rerun()
 

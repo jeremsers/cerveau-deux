@@ -33,6 +33,7 @@ Vault_Data/Google_Drive_Sync/*
 !Vault_Data/Google_Drive_Sync/.gitkeep
 
 # --- Tampons Système, Télémétrie & Bases de Données Locales ---
+Vault_Data/.obsidian/*
 Vault_Data/_System_Buffer/*
 !Vault_Data/_System_Buffer/.gitkeep
 Vault_Data/_System_Buffer/screen_staging/*

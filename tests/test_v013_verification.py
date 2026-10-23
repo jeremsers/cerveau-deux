@@ -235,5 +235,10 @@ def run_checks():
     print("=" * 70)
 
 
+def test_v013_suite():
+    """Wrapper pytest pour la validation de la suite v0.1.3."""
+    run_checks()
+
+
 if __name__ == "__main__":
     run_checks()

@@ -7,6 +7,7 @@ et fournit des méthodes optimisées d'insertion et d'analyse par lots.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from contextlib import contextmanager
@@ -93,6 +94,31 @@ class HistoricalFootprintRecord(BaseModel):
     cluster_id: Optional[str] = None
     semantic_topic: Optional[str] = None
     linked_gemini_session_id: Optional[str] = None
+
+
+class ProjectRecord(BaseModel):
+    """Projet suivi dans le Kanban Exocortex (1 Projet = 1 Vue)."""
+    project_id: str
+    name: str
+    prefix: str
+    repo_path: Optional[str] = None
+    description: str = ""
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class KanbanTaskRecord(BaseModel):
+    """Tâche ou idée du Kanban exécutif."""
+    task_id: str
+    project_id: str
+    component_tag: str = "general"
+    title: str
+    summary_pitch: str = ""
+    status: str = "radar"  # 'radar', 'needs_spec', 'ready_for_agent', 'in_progress', 'done', 'icebox'
+    priority: int = 2      # 1 (Urgent), 2 (Normal), 3 (Secondaire), 4 (Optionnel)
+    complexity: str = "M"  # 'S', 'M', 'L', 'XL'
+    spec_file_path: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
 
 
 # ==============================================================================
@@ -267,6 +293,56 @@ class DBManager:
                 DELETE FROM chat_sessions
                 WHERE turn_count < 3 OR user_char_count < 250;
                 """
+            )
+
+            # 5. Tables Kanban & Multi-Projets (v0.2.0 - Module 7)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    prefix TEXT NOT NULL,
+                    repo_path TEXT,
+                    description TEXT NOT NULL,
+                    created_at DATETIME NOT NULL
+                );
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kanban_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    component_tag TEXT NOT NULL DEFAULT 'general',
+                    title TEXT NOT NULL,
+                    summary_pitch TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'radar',
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    complexity TEXT NOT NULL DEFAULT 'M',
+                    spec_file_path TEXT,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kanban_proj_status ON kanban_tasks(project_id, status);")
+
+            # Amorçage idempotent du projet exocortex
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO projects (project_id, name, prefix, repo_path, description, created_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    "exocortex",
+                    "Exocortex & Télémétrie Cognitive",
+                    "EXO",
+                    str(_PROJECT_ROOT),
+                    "Second cerveau automatisé Obsidian, démon Win32, consolidation nocturne bi-modèle, LanceDB et Dashboard Streamlit.",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
             )
 
     # ==========================================================================
@@ -660,7 +736,15 @@ class DBManager:
         """Retourne un dictionnaire récapitulatif du nombre d'enregistrements par table."""
         with self.get_connection() as conn:
             stats = {}
-            for table in ["raw_activity", "daily_metrics", "chat_sessions", "historical_footprints", "chat_messages"]:
+            for table in [
+                "raw_activity",
+                "daily_metrics",
+                "chat_sessions",
+                "historical_footprints",
+                "chat_messages",
+                "projects",
+                "kanban_tasks",
+            ]:
                 cursor = conn.execute(f"SELECT COUNT(*) FROM {table};")
                 stats[table] = cursor.fetchone()[0]
             return stats
@@ -754,4 +838,197 @@ class DBManager:
                     stats["last_active"] = fp_max
 
         return stats
+
+    # ==========================================================================
+    # MÉTHODES DU MODULE 7 : KANBAN EXÉCUTIF & MULTI-PROJETS (v0.2.0)
+    # ==========================================================================
+
+    def get_projects(self) -> List[Dict[str, Any]]:
+        """Retourne tous les projets suivis, ordonnés par date de création croissante."""
+        with self.get_connection() as conn:
+            cur = conn.execute("SELECT * FROM projects ORDER BY created_at ASC;")
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_project_by_id(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Récupère un projet spécifique par son project_id."""
+        with self.get_connection() as conn:
+            cur = conn.execute("SELECT * FROM projects WHERE project_id = ?;", (project_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def upsert_project(self, project: ProjectRecord) -> None:
+        """Insère ou met à jour un projet."""
+        created_str = (
+            project.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(project.created_at, datetime)
+            else str(project.created_at)
+        )
+        sql = """
+            INSERT OR REPLACE INTO projects (project_id, name, prefix, repo_path, description, created_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                sql,
+                (
+                    project.project_id,
+                    project.name,
+                    project.prefix,
+                    project.repo_path,
+                    project.description,
+                    created_str,
+                ),
+            )
+
+    def generate_next_task_id(self, project_id: str) -> str:
+        """
+        Génère le prochain identifiant déterministe séquentiel pour un projet (ex: EXO-001, EXO-002).
+        Analyse les IDs existants pour ce préfixe et incrémente le numéro maximal.
+        """
+        proj = self.get_project_by_id(project_id)
+        prefix = proj["prefix"].strip().upper() if proj and proj.get("prefix") else project_id.upper()[:4]
+
+        pattern = f"{prefix}-%"
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "SELECT task_id FROM kanban_tasks WHERE project_id = ? OR task_id LIKE ?;",
+                (project_id, pattern),
+            )
+            rows = cur.fetchall()
+
+        max_num = 0
+        for row in rows:
+            tid = str(row["task_id"]).strip()
+            match = re.match(rf"^{re.escape(prefix)}-(\d+)$", tid)
+            if match:
+                num = int(match.group(1))
+                if num > max_num:
+                    max_num = num
+
+        return f"{prefix}-{max_num + 1:03d}"
+
+    def upsert_kanban_task(self, task: KanbanTaskRecord) -> str:
+        """Insère ou remplace une tâche Kanban et retourne son task_id."""
+        created_str = (
+            task.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(task.created_at, datetime)
+            else str(task.created_at)
+        )
+        updated_str = (
+            task.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(task.updated_at, datetime)
+            else str(task.updated_at)
+        )
+        sql = """
+            INSERT OR REPLACE INTO kanban_tasks (
+                task_id, project_id, component_tag, title, summary_pitch,
+                status, priority, complexity, spec_file_path, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        with self.get_connection() as conn:
+            conn.execute(
+                sql,
+                (
+                    task.task_id,
+                    task.project_id,
+                    task.component_tag,
+                    task.title,
+                    task.summary_pitch,
+                    task.status,
+                    task.priority,
+                    task.complexity,
+                    task.spec_file_path,
+                    created_str,
+                    updated_str,
+                ),
+            )
+        return task.task_id
+
+    def update_kanban_task_status(
+        self, task_id: str, new_status: str, spec_file_path: Optional[str] = None
+    ) -> bool:
+        """Met à jour le statut d'une tâche, sa date de mise à jour, et optionnellement son chemin de spec."""
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_connection() as conn:
+            if spec_file_path is not None:
+                cur = conn.execute(
+                    """
+                    UPDATE kanban_tasks
+                    SET status = ?, spec_file_path = ?, updated_at = ?
+                    WHERE task_id = ?;
+                    """,
+                    (new_status, spec_file_path, now_str, task_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE kanban_tasks
+                    SET status = ?, updated_at = ?
+                    WHERE task_id = ?;
+                    """,
+                    (new_status, now_str, task_id),
+                )
+            return cur.rowcount > 0
+
+    def update_kanban_task_details(
+        self,
+        task_id: str,
+        title: str,
+        component_tag: str,
+        summary_pitch: str,
+        priority: int,
+        complexity: str,
+    ) -> bool:
+        """Met à jour les métadonnées descriptives d'une tâche."""
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE kanban_tasks
+                SET title = ?, component_tag = ?, summary_pitch = ?, priority = ?, complexity = ?, updated_at = ?
+                WHERE task_id = ?;
+                """,
+                (title, component_tag, summary_pitch, priority, complexity, now_str, task_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_kanban_task(self, task_id: str) -> bool:
+        """Supprime définitivement une tâche Kanban."""
+        with self.get_connection() as conn:
+            cur = conn.execute("DELETE FROM kanban_tasks WHERE task_id = ?;", (task_id,))
+            return cur.rowcount > 0
+
+    def get_kanban_tasks(
+        self, project_id: Optional[str] = None, statuses: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Récupère les tâches Kanban filtrées par projet et/ou statuts,
+        triées par priorité croissante (P1 en premier), puis par updated_at DESC.
+        """
+        clauses = []
+        params: List[Any] = []
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT * FROM kanban_tasks
+            {where_sql}
+            ORDER BY priority ASC, updated_at DESC;
+        """
+        with self.get_connection() as conn:
+            cur = conn.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_kanban_task_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Récupère une tâche Kanban par son task_id."""
+        with self.get_connection() as conn:
+            cur = conn.execute("SELECT * FROM kanban_tasks WHERE task_id = ?;", (task_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
 

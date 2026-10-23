@@ -368,6 +368,14 @@ class Settings(BaseModel):
         return self.VAULT_ROOT / "Google_Drive_Sync"
 
     @property
+    def KANBAN_SPECS_DIR(self) -> Path:
+        return self.VAULT_ROOT / "03_Kanban_Specs"
+
+    @property
+    def AGENT_QUEUE_PATH(self) -> Path:
+        return self.KANBAN_SPECS_DIR / "AGENT_QUEUE.md"
+
+    @property
     def MODEL_REASONING(self) -> str:
         """Alias pour MODEL_HEAVY_SYNTHESIS (gemma4:26b-a4b)."""
         return self.MODEL_HEAVY_SYNTHESIS
@@ -404,6 +412,7 @@ class Settings(BaseModel):
             self.TAKEOUT_STAGING_DIR,
             self.LANCEDB_DIR,
             self.GOOGLE_DRIVE_SYNC_DIR,
+            self.KANBAN_SPECS_DIR,
             self.TAKEOUT_DIR,
             self.MODELS_DIR,
         ]
