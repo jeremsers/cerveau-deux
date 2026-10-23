@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -43,9 +44,39 @@ from src.llm.prompts import (
     PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
     PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
 )
+from src.utils.markdown_io import (
+    ConceptFrontmatter,
+    ParsedConceptNote,
+    parse_concept_file,
+    parse_concept_string,
+    write_concept_file,
+)
 
 logger = logging.getLogger("Exocortex.NightConsolidator")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+BM25_STOPWORDS: Set[str] = {
+    # Mots fonctionnels français
+    "pour", "dans", "avec", "cette", "sans", "plus", "tout", "faire", "comme", "mais",
+    "nous", "vous", "leur", "elle", "ceux", "celui", "celle", "autres", "aussi", "bien",
+    "apres", "avant", "entre", "sous", "vers", "chez", "meme", "alors", "donc", "ainsi",
+    "encore", "depuis", "pendant", "tous", "toute", "toutes", "quel", "quelle", "quels",
+    "quelles", "mode", "types", "type", "base", "haut", "vaut", "sujet", "travaux",
+    "session", "sessions", "journee", "activite", "activites", "synthese", "recherche",
+    "note", "notes", "concept", "concepts", "fichier", "document", "page", "fenetre",
+    # Mots fonctionnels anglais
+    "with", "from", "that", "this", "what", "which", "when", "where", "there", "their",
+    "about", "into", "over", "after", "before", "between", "under", "through", "during",
+    # Artefacts OS et navigateurs
+    "chrome", "firefox", "edge", "google", "youtube", "visual", "studio", "code",
+    "apercu", "visuel", "http", "https", "blob", "com", "org", "net", "localhost",
+    "html", "json", "yaml", "markdown", "window",
+    # Termes techniques génériques ubiquitaires
+    "python", "script", "projet", "analyse", "optimisation", "configuration",
+    "architecture", "systeme", "test", "tests", "erreur", "serveur", "client", "donnees",
+    "creation", "developpement", "implementation", "fonction", "module", "debug",
+    "exec", "run", "log", "logs", "data", "file", "project", "analysis"
+}
 
 
 # ==============================================================================
@@ -381,50 +412,125 @@ class NightConsolidator:
 
     def _find_matching_existing_concept_cpu(self, topic_name: str, topic_items: List[str]) -> Optional[Path]:
         """
-        Recherche purement CPU (sans inférence vectorielle pour préserver l'exclusion mutuelle VRAM)
-        d'une note conceptuelle existante appartenant à topic_name et présentant un fort recouvrement
-        lexical avec les fenêtres et activités actives du jour.
+        Recherche purement CPU (0 Mo VRAM, BM25 / IDF) d'une note conceptuelle existante appartenant
+        à topic_name et présentant un fort recouvrement lexical hautement distinctif avec les fenêtres
+        et activités actives du jour.
         """
         if not topic_items or not settings.CONCEPTS_DIR.exists():
             return None
 
+        # 1. Extraction et tokenisation des termes de la journée
         raw_text = " ".join(topic_items).lower()
-        activity_words = set(re.findall(r"\b[a-zA-ZÀ-ÿ0-9_-]{4,}\b", raw_text))
-        stopwords = {
-            "chrome", "firefox", "edge", "google", "youtube", "document", "fichier",
-            "page", "fenetre", "visual", "studio", "code", "apercu", "visuel", "http",
-            "https", "pour", "dans", "avec", "cette", "sans", "plus", "tout", "faire"
-        }
-        keywords = activity_words - stopwords
-        if not keywords:
+        all_query_tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z0-9À-ÿ_-]{3,}\b", raw_text)]
+        query_kws = [t for t in all_query_tokens if t not in BM25_STOPWORDS]
+        if not query_kws:
             return None
 
+        query_kw_set = set(query_kws)
+        if len(query_kw_set) < 2:
+            return None
+
+        norm_target_topic = normalize_to_macro_topic(topic_name)
         generic_slug = re.sub(r"[\s_]+", "-", topic_name.lower()).strip("-")
-        best_match: Optional[Path] = None
-        best_score = 0
 
-        for fpath in settings.CONCEPTS_DIR.glob("*.md"):
-            if fpath.name.startswith("all-") or fpath.name.startswith("all_") or fpath.stem == generic_slug:
-                continue
+        # 2. Collecte des notes du coffre et calcul de l'IDF
+        all_concept_files = [
+            f for f in settings.CONCEPTS_DIR.glob("*.md")
+            if not f.name.startswith("all-") and not f.name.startswith("all_")
+        ]
+        if not all_concept_files:
+            return None
+
+        N = len(all_concept_files)
+        doc_freq: Dict[str, int] = {kw: 0 for kw in query_kw_set}
+        candidate_notes: List[Tuple[Path, ParsedConceptNote, Dict[str, float], float, Set[str]]] = []
+
+        for fpath in all_concept_files:
             try:
-                head = fpath.read_text(encoding="utf-8", errors="replace")[:1500].lower()
-                if f'semantic_topic: "{topic_name.lower()}"' not in head and f'semantic_topic: "{topic_name}"' not in head:
-                    m_top = re.search(r'semantic_topic:\s*["\']?([^"\'\n\r]+)["\']?', head)
-                    if not m_top or m_top.group(1).strip() != topic_name:
-                        continue
+                file_text = fpath.read_text(encoding="utf-8", errors="replace")
+                file_lower = file_text.lower()
 
-                title_slug_text = fpath.stem.replace("-", " ") + " " + head
-                matches = sum(1 for kw in keywords if kw in title_slug_text)
-                if matches > best_score:
-                    best_score = matches
-                    best_match = fpath
-            except Exception:
+                # Mise à jour document frequency pour calcul de l'IDF
+                for kw in query_kw_set:
+                    if kw in file_lower:
+                        doc_freq[kw] += 1
+
+                # Vérification éligibilité du candidat (même topic sémantique)
+                if fpath.stem == generic_slug:
+                    continue
+
+                note = parse_concept_string(file_text, file_path=fpath)
+                if note.frontmatter.semantic_topic != norm_target_topic:
+                    continue
+
+                # Extraction des tokens pondérés du candidat
+                title_slug_text = f"{note.frontmatter.title} {fpath.stem.replace('-', ' ')}".lower()
+                title_slug_tokens = [t for t in re.findall(r"\b[a-zA-Z0-9À-ÿ_-]{3,}\b", title_slug_text) if t not in BM25_STOPWORDS]
+
+                tags_text = " ".join(note.frontmatter.tags).lower()
+                tag_tokens = [t for t in re.findall(r"\b[a-zA-Z0-9À-ÿ_-]{3,}\b", tags_text) if t not in BM25_STOPWORDS]
+
+                summary_body_text = f"{note.frontmatter.summary_1_line} {note.body[:1500]}".lower()
+                summary_tokens = [t for t in re.findall(r"\b[a-zA-Z0-9À-ÿ_-]{3,}\b", summary_body_text) if t not in BM25_STOPWORDS]
+
+                # Règle stricte : au moins 2 mots-clés spécifiques dans (title + slug + tags)
+                key_tokens = set(title_slug_tokens) | set(tag_tokens)
+                matching_kws = query_kw_set.intersection(key_tokens)
+                if len(matching_kws) < 2:
+                    continue
+
+                # Calcul des fréquences pondérées : title x3, tags x2, summary x1
+                tf_weighted: Dict[str, float] = {}
+                for t in title_slug_tokens:
+                    tf_weighted[t] = tf_weighted.get(t, 0.0) + 3.0
+                for t in tag_tokens:
+                    tf_weighted[t] = tf_weighted.get(t, 0.0) + 2.0
+                for t in summary_tokens:
+                    tf_weighted[t] = tf_weighted.get(t, 0.0) + 1.0
+
+                doc_len = sum(tf_weighted.values())
+                candidate_notes.append((fpath, note, tf_weighted, doc_len, matching_kws))
+            except Exception as exc:
+                logger.debug("Erreur analyse candidat BM25 %s : %s", fpath.name, exc)
                 continue
 
-        # Seuil strict de recouvrement (au moins 3 mots-clés significatifs partagés)
-        if best_score >= 3:
-            logger.info("Correspondance conceptuelle CPU trouvée pour topic '%s' : %s (score: %d)", topic_name, best_match.name if best_match else "", best_score)
+        if not candidate_notes:
+            return None
+
+        # 3. Calcul BM25 Robertson-Spärck Jones
+        avgdl = sum(c[3] for c in candidate_notes) / max(1, len(candidate_notes))
+        k1 = 1.5
+        b = 0.75
+
+        best_match: Optional[Path] = None
+        best_score = 0.0
+
+        for fpath, note, tf_dict, doc_len, matching_kws in candidate_notes:
+            score = 0.0
+            for kw in query_kw_set:
+                tf = tf_dict.get(kw, 0.0)
+                if tf <= 0.0:
+                    continue
+                nt = doc_freq.get(kw, 0)
+                idf = math.log(1.0 + (N - nt + 0.5) / (nt + 0.5))
+                denom = tf + k1 * (1.0 - b + b * (doc_len / max(1.0, avgdl)))
+                term_score = idf * ((tf * (k1 + 1.0)) / max(1e-6, denom))
+                score += term_score
+
+            if score > best_score:
+                best_score = score
+                best_match = fpath
+
+        # Seuil strict de pertinence BM25
+        if best_match and best_score >= 2.0:
+            logger.info(
+                "Correspondance conceptuelle BM25 retenue pour topic '%s' : %s (score BM25: %.2f)",
+                topic_name,
+                best_match.name,
+                best_score,
+            )
             return best_match
+
         return None
 
     # ==========================================================================
@@ -566,20 +672,9 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
 
             if matched_file and matched_file.exists():
                 concept_file = matched_file
-                with open(concept_file, "r", encoding="utf-8") as cf:
-                    existing_text = cf.read()
+                note = parse_concept_file(concept_file)
 
-                m_updated = re.sub(r'updated_at:\s*"[^"]*"', f'updated_at: "{date_str}"', existing_text)
-                m_time = re.search(r'total_time_invested_min:\s*(\d+)', m_updated)
-                if m_time:
-                    prev_time = int(m_time.group(1))
-                    new_time = prev_time + (duration_secs // 60)
-                    m_updated = re.sub(r'total_time_invested_min:\s*\d+', f'total_time_invested_min: {new_time}', m_updated)
-
-                new_source_line = f">   - Activité écran du `{date_str}` ({duration_fmt})\n"
-                if "> - **Sources épisodiques :**\n" in m_updated:
-                    m_updated = m_updated.replace("> - **Sources épisodiques :**\n", f"> - **Sources épisodiques :**\n{new_source_line}")
-
+                enrich_text = ""
                 if llm_client.is_alive() and topic_context_str:
                     enrich_prompt = (
                         f"L'utilisateur a passé {duration_fmt} de travail supplémentaire sur le sujet '{topic_name}' le {date_str}.\n"
@@ -594,18 +689,24 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                             model=effective_model,
                             keep_alive="5m",
                         )
-                        if enrich_text.strip():
-                            if "> [!abstract]- Généalogie & Télémétrie" in m_updated:
-                                parts = m_updated.split("> [!abstract]- Généalogie & Télémétrie")
-                                m_updated = f"{parts[0].rstrip()}\n\n{enrich_text.strip()}\n\n> [!abstract]- Généalogie & Télémétrie{parts[1]}"
-                            else:
-                                m_updated = f"{m_updated.rstrip()}\n\n{enrich_text.strip()}\n"
                     except Exception as exc:
                         logger.warning("Erreur enrichissement concept %s : %s", concept_file.name, exc)
 
-                with open(concept_file, "w", encoding="utf-8") as cf:
-                    cf.write(m_updated)
-                logger.info("Fiche conceptuelle enrichie : %s (+%s)", concept_file.name, duration_fmt)
+                if not enrich_text.strip():
+                    enrich_text = (
+                        f"### Session du {date_str}\n\n"
+                        f"Poursuite des développements ({duration_fmt}) observée le {date_str}.\n"
+                        + "\n".join([f"- {it}" for it in topic_items[:6]])
+                    )
+
+                note.append_or_replace_daily_session(
+                    date_str=date_str,
+                    duration_min=duration_secs // 60,
+                    duration_fmt=duration_fmt,
+                    enrichment_markdown=enrich_text.strip(),
+                )
+                write_concept_file(note, concept_file)
+                logger.info("Fiche conceptuelle enrichie (idempotente) : %s (+%s)", concept_file.name, duration_fmt)
             else:
                 # Génération d'une nouvelle fiche conceptuelle ATOMIQUE (et non du nom de la macro-catégorie)
                 concept_id = datetime.now().strftime("%Y%m%d%H%M")
@@ -671,32 +772,34 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                     slug = f"{slug}-{datetime.now().strftime('%H%M%S')}"
                     concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
 
-                tags_json = json.dumps(tags, ensure_ascii=False)
-                new_concept = f"""---
-id: "{concept_id}"
-title: "{title}"
-type: "concept"
-origin: ["screen_telemetry"]
-semantic_topic: "{topic_name}"
-tags: {tags_json}
-created_at: "{date_str}"
-updated_at: "{date_str}"
-total_time_invested_min: {duration_secs // 60}
-summary_1_line: "{summary_1_line}"
----
-
-# {title}
-
-{synthesized_body}
-
-> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)
-> - **Temps cumulé sur ce sujet :** {duration_fmt}
-> - **Sources épisodiques :**
->   - Activité écran du `{date_str}` ({duration_fmt})
-> - **Connexions sémantiques :** {related_links_str}
-"""
-                with open(concept_file, "w", encoding="utf-8") as cf:
-                    cf.write(new_concept)
+                fm = ConceptFrontmatter(
+                    id=concept_id,
+                    title=title,
+                    type="concept",
+                    origin=["screen_telemetry"],
+                    semantic_topic=topic_name,
+                    tags=tags,
+                    created_at=date_str,
+                    updated_at=date_str,
+                    total_time_invested_min=duration_secs // 60,
+                    summary_1_line=summary_1_line,
+                )
+                telemetry_lines = [
+                    "> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)",
+                    f"> - **Temps cumulé sur ce sujet :** {duration_fmt}",
+                    "> - **Sources épisodiques :**",
+                    f">   - Activité écran du `{date_str}` ({duration_fmt})",
+                    f"> - **Connexions sémantiques :** {related_links_str}",
+                ]
+                new_note = ParsedConceptNote(
+                    frontmatter=fm,
+                    title_h1=title,
+                    body=synthesized_body,
+                    telemetry_lines=telemetry_lines,
+                    file_path=concept_file,
+                )
+                write_concept_file(new_note, concept_file)
+                logger.info("Nouvelle fiche conceptuelle atomique créée via synthèse LLM : %s", concept_file.name)
                 logger.info("Nouvelle fiche conceptuelle atomique créée via synthèse LLM : %s", concept_file.name)
 
         # Purge de la VRAM après la synthèse

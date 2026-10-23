@@ -57,11 +57,27 @@ def win32_key_up(vk: int) -> None:
     user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
 
+_last_previous_clipboard: str = ""
+
+
 def simulate_select_and_copy() -> str:
     """
-    Sécurise le relâchement de la touche Alt, puis simule Ctrl+A puis Ctrl+C
-    pour capturer le prompt en cours de frappe dans la zone active.
+    Sécurise le relâchement de la touche Alt, sauvegarde le presse-papier initial,
+    place une sentinelle vide, simule Ctrl+A puis Ctrl+C, et attend via polling (jusqu'à 350 ms).
+    Si aucun texte n'est capturé, restaure le presse-papier initial et annule.
     """
+    global _last_previous_clipboard
+    try:
+        previous_clipboard = pyperclip.paste()
+    except Exception:
+        previous_clipboard = ""
+    _last_previous_clipboard = previous_clipboard
+
+    try:
+        pyperclip.copy("")
+    except Exception:
+        pass
+
     # 1. Relâchement forcé de la touche Alt
     win32_key_up(VK_MENU)
     time.sleep(0.04)
@@ -80,18 +96,35 @@ def simulate_select_and_copy() -> str:
     time.sleep(0.02)
     win32_key_up(VK_C)
     win32_key_up(VK_CONTROL)
-    time.sleep(0.05)
 
-    try:
-        captured = pyperclip.paste()
-        return captured.strip() if captured else ""
-    except Exception as exc:
-        logger.error("Erreur lors de la lecture du presse-papier : %s", exc)
+    # 4. Polling rapide (max 350 ms par pas de 15 ms)
+    captured = ""
+    start_time = time.time()
+    while (time.time() - start_time) < 0.350:
+        time.sleep(0.015)
+        try:
+            val = pyperclip.paste()
+            if val:
+                captured = val.strip()
+                break
+        except Exception:
+            pass
+
+    if not captured:
+        # Échec de capture : restauration du presse-papier initial
+        if previous_clipboard:
+            try:
+                pyperclip.copy(previous_clipboard)
+            except Exception:
+                pass
         return ""
 
+    return captured
 
-def simulate_paste_payload(payload: str) -> None:
-    """Place le payload enrichi dans le presse-papier et simule Ctrl+V."""
+
+def simulate_paste_payload(payload: str, restore_clipboard: Optional[str] = None) -> None:
+    """Place le payload enrichi dans le presse-papier, simule Ctrl+V et restaure l'ancien presse-papier."""
+    global _last_previous_clipboard
     try:
         pyperclip.copy(payload)
         time.sleep(0.04)
@@ -102,6 +135,13 @@ def simulate_paste_payload(payload: str) -> None:
         time.sleep(0.02)
         win32_key_up(VK_V)
         win32_key_up(VK_CONTROL)
+
+        # Délai pour laisser l'application cible consommer le Ctrl+V avant de restaurer
+        time.sleep(0.120)
+
+        clip_to_restore = restore_clipboard if restore_clipboard is not None else _last_previous_clipboard
+        if clip_to_restore:
+            pyperclip.copy(clip_to_restore)
     except Exception as exc:
         logger.error("Erreur lors de l'injection du presse-papier : %s", exc)
 

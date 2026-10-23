@@ -21,7 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from pydantic import BaseModel, Field
 
-from src.config import settings
+from src.config import normalize_to_macro_topic, settings
 
 
 # ==============================================================================
@@ -128,14 +128,38 @@ class KanbanTaskRecord(BaseModel):
 class DBManager:
     """Gestionnaire de persistance SQLite thread-safe configuré en mode WAL haute performance."""
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
+    def __init__(self, db_path: Optional[Path] = None, read_only: bool = False) -> None:
         self.db_path = db_path or settings.DB_PATH
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.init_db()
+        self.read_only = read_only
+        if not self.read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.init_db()
+
+    @contextmanager
+    def get_ro_connection(self) -> Generator[sqlite3.Connection, None, None]:
+        """Fournit une connexion SQLite sécurisée en lecture seule stricte (mode=ro)."""
+        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=15.0,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=5000;")
+            yield conn
+        finally:
+            conn.close()
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
         """Fournit une connexion SQLite configurée avec WAL, timeouts et row_factory."""
+        if self.read_only:
+            with self.get_ro_connection() as conn:
+                yield conn
+            return
+
         conn = sqlite3.connect(
             str(self.db_path),
             timeout=10.0,
@@ -1031,4 +1055,316 @@ class DBManager:
             cur = conn.execute("SELECT * FROM kanban_tasks WHERE task_id = ?;", (task_id,))
             row = cur.fetchone()
             return dict(row) if row else None
+
+    # ==========================================================================
+    # MÉTHODES ANALYTIQUES CONSOLIDÉES POUR LE DASHBOARD (READ-ONLY)
+    # ==========================================================================
+
+    def fetch_macro_kpis(self) -> Dict[str, Any]:
+        """Charge l'ensemble des KPIs macro consolidés."""
+        with self.get_ro_connection() as conn:
+            # 1. Total chat sessions & turns
+            cur = conn.execute("SELECT COUNT(*), SUM(turn_count), SUM(user_char_count) FROM chat_sessions;")
+            chat_count, total_turns, total_chars = cur.fetchone()
+            chat_count = chat_count or 0
+            total_turns = total_turns or 0
+            total_chars = total_chars or 0
+
+            # Heures estimées Gemini (10 min par session en moyenne)
+            chat_hours = round((chat_count * 10) / 60.0, 1)
+
+            # 2. Total raw activity
+            cur = conn.execute(
+                """
+                SELECT 
+                    COUNT(*),
+                    COALESCE(SUM(duration_sec), 0),
+                    COALESCE(SUM(CASE WHEN active_input = 1 THEN duration_sec ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN active_input = 0 THEN duration_sec ELSE 0 END), 0)
+                FROM raw_activity;
+                """
+            )
+            raw_count, total_os_sec, active_prod_sec, passive_exp_sec = cur.fetchone()
+            total_os_sec = total_os_sec or 0
+            active_prod_sec = active_prod_sec or 0
+            passive_exp_sec = passive_exp_sec or 0
+            os_hours = round(total_os_sec / 3600.0, 1)
+
+            # 3. Daily metrics stats
+            cur = conn.execute(
+                """
+                SELECT 
+                    AVG(context_switches_per_hour),
+                    AVG(read_vs_write_ratio)
+                FROM daily_metrics;
+                """
+            )
+            row_avg = cur.fetchone()
+            avg_switch_rate = round(row_avg[0], 2) if row_avg and row_avg[0] is not None else 0.0
+            avg_read_ratio = round(row_avg[1], 2) if row_avg and row_avg[1] is not None else 0.4
+
+            cur = conn.execute(
+                """
+                SELECT max_hyperfocus_sec, max_hyperfocus_topic
+                FROM daily_metrics
+                WHERE max_hyperfocus_sec IS NOT NULL
+                ORDER BY max_hyperfocus_sec DESC
+                LIMIT 1;
+                """
+            )
+            row_hf = cur.fetchone()
+            max_hyperfocus_sec = row_hf[0] if row_hf and row_hf[0] else 0
+            max_hyperfocus_topic = row_hf[1] if row_hf and row_hf[1] else "N/A"
+
+            # 4. Footprints count
+            cur = conn.execute("SELECT COUNT(*) FROM historical_footprints;")
+            fp_count = cur.fetchone()[0] or 0
+
+        return {
+            "chat_count": chat_count,
+            "chat_hours": chat_hours,
+            "total_turns": total_turns,
+            "total_chars": total_chars,
+            "raw_count": raw_count,
+            "os_hours": os_hours,
+            "total_tracked_hours": round(chat_hours + os_hours, 1),
+            "active_prod_hours": round(active_prod_sec / 3600.0, 1),
+            "passive_exp_hours": round(passive_exp_sec / 3600.0, 1),
+            "max_hyperfocus_hours": round(max_hyperfocus_sec / 3600.0, 2),
+            "max_hyperfocus_topic": max_hyperfocus_topic,
+            "avg_switch_rate": avg_switch_rate,
+            "avg_read_ratio": avg_read_ratio,
+            "fp_count": fp_count,
+        }
+
+    def fetch_all_activity_dates(self) -> List[str]:
+        """Charge les dates distinctes disponibles dans raw_activity."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute("SELECT DISTINCT DATE(timestamp_start) as dt FROM raw_activity ORDER BY dt DESC;")
+            dates = [r["dt"] for r in cur.fetchall() if r["dt"]]
+            if not dates:
+                dates = [datetime.now().strftime("%Y-%m-%d")]
+            return dates
+
+    def fetch_timeline_for_date(self, target_date_str: str) -> List[Dict[str, Any]]:
+        """Charge la chronologie brute des fenêtres d'activité pour une date spécifique."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT 
+                    timestamp_start, timestamp_end, duration_sec, executable,
+                    window_title, active_input, input_intensity, semantic_topic, cognitive_mode
+                FROM raw_activity
+                WHERE DATE(timestamp_start) = ?
+                ORDER BY timestamp_start ASC;
+                """,
+                (target_date_str,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_treemap_data(self) -> List[Dict[str, Any]]:
+        """Charge les données agrégées pour le Treemap hiérarchique."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT 
+                    cognitive_mode, semantic_topic, executable,
+                    SUM(duration_sec) as total_sec,
+                    COUNT(*) as event_count
+                FROM raw_activity
+                GROUP BY cognitive_mode, semantic_topic, executable
+                ORDER BY total_sec DESC;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_archaeology_sessions(self) -> List[Dict[str, Any]]:
+        """Charge les sessions Gemini pour l'analyse archéologique temporelle."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT timestamp_start, extracted_topics_json, turn_count, user_char_count
+                FROM chat_sessions
+                ORDER BY timestamp_start ASC;
+                """
+            )
+            records = []
+            for r in cur.fetchall():
+                ts = r["timestamp_start"]
+                topics_raw = r["extracted_topics_json"]
+                try:
+                    topics = json.loads(topics_raw) if topics_raw else []
+                except Exception:
+                    topics = []
+                if not topics:
+                    topics = ["Dev_et_Architecture_Tech"]
+                for top in topics:
+                    records.append({
+                        "timestamp": ts,
+                        "topic": normalize_to_macro_topic(top),
+                        "turns": r["turn_count"],
+                        "chars": r["user_char_count"],
+                        "count": 1,
+                    })
+            return records
+
+    def fetch_circadian_timestamps(self) -> List[str]:
+        """Charge la liste de tous les horodatages disponibles pour l'analyse circadienne."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute("SELECT timestamp_start FROM chat_sessions;")
+            chat_ts = [r[0] for r in cur.fetchall() if r[0]]
+            cur = conn.execute("SELECT timestamp_start FROM raw_activity;")
+            os_ts = [r[0] for r in cur.fetchall() if r[0]]
+        return [str(ts) for ts in (chat_ts + os_ts)]
+
+    def search_chat_sessions(
+        self,
+        query: str = "",
+        topic_filter: Optional[str] = None,
+        status_filter: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Recherche full-text dans les sessions et messages Gemini."""
+        with self.get_ro_connection() as conn:
+            params: List[Any] = []
+            conditions = []
+
+            if query.strip():
+                q_like = f"%{query.strip()}%"
+                conditions.append(
+                    "(cs.session_id IN (SELECT session_id FROM chat_messages WHERE user_prompt LIKE ? OR ai_response LIKE ?) OR cs.summary LIKE ?)"
+                )
+                params.extend([q_like, q_like, q_like])
+
+            if topic_filter and topic_filter != "Tous les topics":
+                conditions.append("cs.extracted_topics_json LIKE ?")
+                params.append(f"%{topic_filter}%")
+
+            if status_filter and status_filter != "Tous":
+                conditions.append("cs.distillation_status = ?")
+                params.append(status_filter)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            sql = f"""
+                SELECT cs.session_id, cs.timestamp_start, cs.timestamp_end, cs.turn_count,
+                       cs.user_char_count, cs.extracted_topics_json, cs.generated_notes_json,
+                       cs.summary, cs.distillation_status
+                FROM chat_sessions cs
+                {where_clause}
+                ORDER BY cs.timestamp_start DESC
+                LIMIT {limit};
+            """
+            cur = conn.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_messages_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """Récupère l'ensemble des tours de conversation d'une session de chat."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, turn_index, timestamp, user_prompt, ai_response, user_char_count
+                FROM chat_messages
+                WHERE session_id = ?
+                ORDER BY turn_index ASC;
+                """,
+                (session_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_footprints_summary(self) -> Dict[str, Any]:
+        """Calcule les métriques globales sur la table historical_footprints."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN source = 'youtube' THEN 1 ELSE 0 END) as youtube_count,
+                    SUM(CASE WHEN source = 'google_search' THEN 1 ELSE 0 END) as search_count,
+                    SUM(CASE WHEN cluster_id IS NOT NULL AND cluster_id != '' THEN 1 ELSE 0 END) as clustered_count,
+                    SUM(CASE WHEN linked_gemini_session_id IS NOT NULL AND linked_gemini_session_id != '' THEN 1 ELSE 0 END) as linked_count
+                FROM historical_footprints;
+                """
+            )
+            r = cur.fetchone()
+            return {
+                "total": r["total"] or 0,
+                "youtube": r["youtube_count"] or 0,
+                "search": r["search_count"] or 0,
+                "clustered": r["clustered_count"] or 0,
+                "linked": r["linked_count"] or 0,
+            }
+
+    def fetch_top_channels_and_domains(self, limit: int = 15) -> List[Dict[str, Any]]:
+        """Agrège le top des chaînes YouTube et domaines consultés."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT channel_or_domain, source, COUNT(*) as footprint_count
+                FROM historical_footprints
+                WHERE channel_or_domain IS NOT NULL AND channel_or_domain != ''
+                GROUP BY channel_or_domain, source
+                ORDER BY footprint_count DESC
+                LIMIT {limit};
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_burst_clusters_summary(self, limit: int = 25) -> List[Dict[str, Any]]:
+        """Identifie les tunnels de recherche denses (Burst Clusters) d'au moins 3 événements."""
+        with self.get_ro_connection() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT 
+                    cluster_id,
+                    source,
+                    semantic_topic,
+                    COUNT(*) as event_count,
+                    MIN(timestamp) as start_time,
+                    MAX(timestamp) as end_time,
+                    GROUP_CONCAT(title_or_query, ' ➔ ') as samples
+                FROM historical_footprints
+                WHERE cluster_id IS NOT NULL AND cluster_id != ''
+                GROUP BY cluster_id, source, semantic_topic
+                HAVING event_count >= 3
+                ORDER BY event_count DESC, start_time DESC
+                LIMIT {limit};
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def search_footprints(
+        self,
+        query: str = "",
+        source_filter: str = "Toutes",
+        only_clustered: bool = False,
+        only_linked: bool = False,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Recherche dynamique d'empreintes avec filtres multiples."""
+        with self.get_ro_connection() as conn:
+            conditions = []
+            params = []
+            if query.strip():
+                conditions.append("(title_or_query LIKE ? OR channel_or_domain LIKE ?)")
+                params.extend([f"%{query.strip()}%", f"%{query.strip()}%"])
+            if source_filter and source_filter != "Toutes":
+                conditions.append("source = ?")
+                params.append(source_filter)
+            if only_clustered:
+                conditions.append("cluster_id IS NOT NULL AND cluster_id != ''")
+            if only_linked:
+                conditions.append("linked_gemini_session_id IS NOT NULL AND linked_gemini_session_id != ''")
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            cur = conn.execute(
+                f"""
+                SELECT timestamp, source, channel_or_domain, title_or_query, cluster_id, semantic_topic, linked_gemini_session_id
+                FROM historical_footprints
+                {where_clause}
+                ORDER BY timestamp DESC
+                LIMIT {limit};
+                """,
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
 

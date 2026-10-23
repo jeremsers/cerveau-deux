@@ -28,6 +28,15 @@ import psutil
 import win32gui
 import win32process
 
+# Activation du DPI Awareness sous Windows 11 pour coordonnées d'écran exactes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 from src.config import settings
 from src.database.db_manager import DBManager, RawActivityRecord
 
@@ -213,8 +222,18 @@ class TelemetryDaemon:
             if width < 100 or height < 100:
                 return None
 
-            # Capture via Pillow ImageGrab ou mss
-            img = ImageGrab.grab(bbox=(left, top, right, bottom))
+            # Capture via mss en priorité, avec fallback sur Pillow ImageGrab
+            img: Optional[Image.Image] = None
+            try:
+                import mss
+                with mss.mss() as sct:
+                    monitor = {"left": left, "top": top, "width": width, "height": height}
+                    sct_img = sct.grab(monitor)
+                    img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            except Exception as mss_exc:
+                logger.debug("Échec capture mss, fallback ImageGrab : %s", mss_exc)
+                img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+
             if not img:
                 return None
 

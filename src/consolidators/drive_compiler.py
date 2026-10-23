@@ -25,6 +25,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.config import normalize_to_macro_topic, settings
 from src.database.db_manager import DBManager
+from src.utils.markdown_io import parse_concept_file
 
 logger = logging.getLogger("Exocortex.DriveCompiler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -270,33 +271,22 @@ class DriveCompiler:
 
         if concepts_dir.exists():
             for cf in concepts_dir.glob("*.md"):
+                if cf.name.startswith("all-") or cf.name.startswith("all_"):
+                    continue
                 try:
-                    with open(cf, "r", encoding="utf-8") as f:
-                        content = f.read()
-
-                    # Parsing YAML frontmatter
-                    m_yaml = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
-                    meta: Dict[str, Any] = {}
-                    body = content
-                    if m_yaml:
-                        yaml_text = m_yaml.group(1)
-                        body = m_yaml.group(2).strip()
-                        for line in yaml_text.splitlines():
-                            if ":" in line:
-                                k, v = line.split(":", 1)
-                                meta[k.strip()] = v.strip().strip("'\"")
-
-                    updated_at_str = meta.get("updated_at") or meta.get("created_at") or "2000-01-01"
-                    time_min = int(meta.get("total_time_invested_min") or 0)
-                    title = meta.get("title") or cf.stem
+                    note = parse_concept_file(cf)
+                    fm = note.frontmatter
+                    updated_at_str = fm.updated_at or fm.created_at or "2000-01-01"
+                    time_min = fm.total_time_invested_min
+                    title = fm.title or cf.stem
 
                     parsed_concepts.append({
                         "file_name": cf.name,
                         "title": title,
                         "updated_at": updated_at_str,
                         "time_min": time_min,
-                        "semantic_topic": normalize_to_macro_topic(meta.get("semantic_topic", "Dev_et_Architecture_Tech")),
-                        "full_content": content.strip(),
+                        "semantic_topic": fm.semantic_topic,
+                        "full_content": cf.read_text(encoding="utf-8").strip(),
                     })
                 except Exception as exc:
                     logger.warning("Erreur parsing fiche concept %s : %s", cf.name, exc)
@@ -350,24 +340,16 @@ class DriveCompiler:
 
         if concepts_dir.exists():
             for cf in concepts_dir.glob("*.md"):
+                if cf.name.startswith("all-") or cf.name.startswith("all_"):
+                    continue
                 try:
-                    with open(cf, "r", encoding="utf-8") as f:
-                        content = f.read()
-
-                    m_yaml = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
-                    meta: Dict[str, Any] = {}
-                    if m_yaml:
-                        for line in m_yaml.group(1).splitlines():
-                            if ":" in line:
-                                k, v = line.split(":", 1)
-                                meta[k.strip()] = v.strip().strip("'\"")
-
-                    raw_topic = meta.get("semantic_topic") or "Dev_et_Architecture_Tech"
-                    topic = normalize_to_macro_topic(raw_topic)
-                    title = meta.get("title") or cf.stem.replace("-", " ").title()
-                    time_min = int(meta.get("total_time_invested_min") or 0)
-                    updated_at = meta.get("updated_at") or meta.get("created_at") or "Inconnu"
-                    summary = meta.get("summary_1_line") or "Fiche conceptuelle."
+                    note = parse_concept_file(cf)
+                    fm = note.frontmatter
+                    topic = fm.semantic_topic
+                    title = fm.title or cf.stem.replace("-", " ").title()
+                    time_min = fm.total_time_invested_min
+                    updated_at = fm.updated_at or fm.created_at or "Inconnu"
+                    summary = fm.summary_1_line or "Fiche conceptuelle."
 
                     duration_fmt = (
                         f"{time_min // 60}h{time_min % 60:02d}"

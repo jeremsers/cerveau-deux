@@ -6,6 +6,7 @@ avec exclusion mutuelle stricte en VRAM (keep_alive=0).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
@@ -22,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from src.config import settings
 from src.llm.ollama_client import llm_client
+from src.utils.markdown_io import parse_concept_file
 
 logger = logging.getLogger("Exocortex.VectorStore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -109,32 +111,20 @@ class VectorStore:
             return False
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                raw_text = f.read()
+            note = parse_concept_file(file_path)
+            fm = note.frontmatter
+            body_content = note.body
 
-            # Extraction YAML simple
-            m_yaml = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", raw_text, re.DOTALL)
-            frontmatter: Dict[str, Any] = {}
-            body_content = raw_text
-
-            if m_yaml:
-                yaml_block = m_yaml.group(1)
-                body_content = m_yaml.group(2).strip()
-                for line in yaml_block.splitlines():
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        frontmatter[k.strip()] = v.strip().strip("'\"")
-
-            raw_id = frontmatter.get("id")
+            raw_id = fm.id
             if raw_id and raw_id != file_path.stem:
                 doc_id = f"{raw_id}_{file_path.stem[:32]}"
             else:
                 doc_id = file_path.stem
 
-            title = frontmatter.get("title") or file_path.stem.replace("-", " ").title()
-            topic = frontmatter.get("semantic_topic") or "General"
-            created_at = frontmatter.get("created_at") or ""
-            tags = frontmatter.get("tags") or "[]"
+            title = fm.title or file_path.stem.replace("-", " ").title()
+            topic = fm.semantic_topic or "General"
+            created_at = fm.created_at or ""
+            tags = json.dumps(fm.tags, ensure_ascii=False) if isinstance(fm.tags, list) else str(fm.tags)
 
             # Texte à vectoriser : Titre + Sujet + Résumé / Contenu
             text_to_embed = f"Titre: {title}\nSujet: {topic}\nContenu:\n{body_content[:1500]}"
