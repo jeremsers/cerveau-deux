@@ -273,6 +273,14 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.getenv("DHASH_MAX_HAMMING_DISTANCE", "5"))
     )
 
+    # --- Détection Anti-Dérive / Rabbit Hole (v0.3.0 - Module 8) ---
+    DRIFT_MAX_SWITCHES_30MIN: int = Field(
+        default_factory=lambda: int(os.getenv("DRIFT_MAX_SWITCHES_30MIN", "25"))
+    )
+    DRIFT_MAX_PASSIVE_MIN: int = Field(
+        default_factory=lambda: int(os.getenv("DRIFT_MAX_PASSIVE_MIN", "90"))
+    )
+
     # --- Listes Noires de Confidentialité (Win32 Daemon) ---
     TITLE_BLACKLIST: List[str] = Field(
         default_factory=lambda: [
@@ -374,6 +382,14 @@ class Settings(BaseModel):
     @property
     def AGENT_QUEUE_PATH(self) -> Path:
         return self.KANBAN_SPECS_DIR / "AGENT_QUEUE.md"
+
+    @property
+    def BOOTLOADER_PATH(self) -> Path:
+        return self.META_DIR / "00_BOOTLOADER_DEMAIN.md"
+
+    @property
+    def DRIFT_STATE_PATH(self) -> Path:
+        return self.SYSTEM_BUFFER_DIR / "drift_state.json"
 
     @property
     def MODEL_REASONING(self) -> str:

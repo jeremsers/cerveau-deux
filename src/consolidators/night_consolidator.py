@@ -102,6 +102,30 @@ class NightConceptSynthesisSchema(BaseModel):
     related_concepts: List[str] = Field(default_factory=list, description="2 à 3 titres de concepts connexes.")
 
 
+class OpenLoopItem(BaseModel):
+    """Intention, bug ou piste de travail non résolue détectée pour injection Kanban."""
+    title: str = Field(description="Titre concis de l'intention ou du sujet non résolu")
+    component_tag: str = Field(default="general", description="Sous-module ou tag technique")
+    summary_pitch: str = Field(default="", description="Description courte du problème ou de la piste")
+    priority: int = Field(default=2, description="Priorité estimée (1 = urgent, 2 = normal, 3 = basse)")
+    complexity: str = Field(default="M", description="Complexité estimée (XS, S, M, L, XL)")
+
+
+class ExecutiveBootloaderSchema(BaseModel):
+    """Schéma Pydantic du Context Bootloader pour la reprise rapide au réveil."""
+    last_active_state: str = Field(description="Où l'utilisateur s'est arrêté (heure, exécutable, fichier/sujet exact)")
+    immediate_next_steps: List[str] = Field(description="3 à 5 actions concrètes et atomiques pour reprendre en < 2 minutes")
+    detected_open_loops: List[OpenLoopItem] = Field(default_factory=list, description="Intentions, bugs ou pistes en suspens détectés")
+
+
+PROMPT_BOOTLOADER_SYSTEM = """Tu es l'Ingénieur Système et Stratège Cognitif de l'Exocortex.
+Ta mission est d'éliminer totalement la friction d'amorçage mental de l'utilisateur pour sa prochaine session de travail.
+En analysant les dernières activités de la journée, les notes conceptuelles créées/enrichies et les tâches Kanban en cours :
+1. Identifie avec précision où l'utilisateur s'est arrêté (fichier, outil, ligne ou problème exact).
+2. Fournis 3 à 5 actions immédiatement exécutables (< 2 minutes) pour reprendre sans hésitation.
+3. Détecte les intentions en suspens (Open Loops) : bugs constatés, idées émises non traitées, pistes de refactoring."""
+
+
 # ==============================================================================
 # CHARGEMENT ET PARSING DE LA TAXONOMIE FERMÉE
 # ==============================================================================
@@ -800,11 +824,169 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                 )
                 write_concept_file(new_note, concept_file)
                 logger.info("Nouvelle fiche conceptuelle atomique créée via synthèse LLM : %s", concept_file.name)
-                logger.info("Nouvelle fiche conceptuelle atomique créée via synthèse LLM : %s", concept_file.name)
+
+        # Génération du Context Bootloader et extraction des Open Loops (Module 8 - v0.3.0)
+        try:
+            self.generate_executive_bootloader(target_date, metric, effective_model)
+        except Exception as exc:
+            logger.warning("Erreur lors de la génération du Context Bootloader : %s", exc)
 
         # Purge de la VRAM après la synthèse
         llm_client.unload_model(effective_model)
         logger.info("--- FIN PASSE 2 : VRAM PURGÉE ---")
+
+    def generate_executive_bootloader(
+        self,
+        target_date: date,
+        metric: DailyMetricRecord,
+        effective_model: str,
+    ) -> Path:
+        """
+        Génère Vault_Data/00_Meta/00_BOOTLOADER_DEMAIN.md pour supprimer l'inertie d'amorçage matinale
+        et injecte de manière idempotente les Open Loops détectés dans le Kanban (statut 'radar').
+        """
+        date_str = target_date.strftime("%Y-%m-%d")
+        logger.info("--- Génération du Context Bootloader & Extraction des Open Loops (%s) ---", date_str)
+
+        activities = self.db.get_activities_for_date(target_date)
+        recent_activities = activities[-15:] if activities else []
+
+        # Fiches conceptuelles créées ou mises à jour aujourd'hui
+        active_concepts: List[str] = []
+        for cf in settings.CONCEPTS_DIR.glob("*.md"):
+            if cf.name.startswith("all-") or cf.name.startswith("."):
+                continue
+            try:
+                note = parse_concept_file(cf)
+                if note.frontmatter.updated_at == date_str or note.frontmatter.created_at == date_str:
+                    c_title = note.frontmatter.title or cf.stem
+                    active_concepts.append(f"[[{c_title}]]")
+            except Exception:
+                pass
+
+        # Tâches Kanban en cours
+        from src.consolidators.kanban_engine import KanbanEngine
+        kanban = KanbanEngine(db_manager=self.db)
+        kanban_tasks = kanban.db.get_kanban_tasks(project_id="exocortex", statuses=["in_progress", "ready_for_agent"])
+        in_prog_tasks = [t for t in kanban_tasks if t.get("status") == "in_progress"]
+        ready_tasks = [t for t in kanban_tasks if t.get("status") == "ready_for_agent"]
+
+        recent_act_text_lines = []
+        for act in recent_activities:
+            exe = act.get("executable") or ""
+            title = act.get("window_title") or ""
+            dur = act.get("duration_sec", 0)
+            recent_act_text_lines.append(f"- [{exe}] {title} ({dur}s)")
+        recent_act_str = "\n".join(recent_act_text_lines) if recent_act_text_lines else "(Aucune activité détaillée enregistrée)"
+
+        bootloader_data: Optional[ExecutiveBootloaderSchema] = None
+        if llm_client.is_alive() and (recent_activities or in_prog_tasks or active_concepts):
+            bootloader_prompt = (
+                f"Données de fin de journée pour le {date_str} :\n"
+                f"- Temps d'écran total : {metric.total_screen_sec / 3600.0:.2f} h (Prod: {metric.active_production_sec / 3600.0:.2f} h)\n"
+                f"- Hyperfocus max : {metric.max_hyperfocus_topic or 'N/A'}\n"
+                f"- Dernières activités enregistrées (parcours terminal) :\n{recent_act_str}\n\n"
+                f"- Fiches actives du jour : {', '.join(active_concepts) if active_concepts else 'Aucune'}\n"
+                f"- Tâches Kanban en cours : {', '.join([t['title'] for t in in_prog_tasks]) if in_prog_tasks else 'Aucune'}\n\n"
+                "Remplis le schéma structuré ExecutiveBootloaderSchema :\n"
+                "1. Où l'utilisateur s'est arrêté exactement.\n"
+                "2. 3 à 5 prochaines étapes concrètes et atomiques pour démarrer demain en < 2 min.\n"
+                "3. Détecte les Open Loops (questions non résolues, bugs vus dans les logs/titres, refactorings indispensables)."
+            )
+            try:
+                bootloader_data = llm_client.generate_structured(
+                    prompt=bootloader_prompt,
+                    response_model=ExecutiveBootloaderSchema,
+                    system=PROMPT_BOOTLOADER_SYSTEM,
+                    model=effective_model,
+                    keep_alive="5m",
+                )
+            except Exception as exc:
+                logger.warning("Erreur lors de la génération LLM du Bootloader : %s", exc)
+
+        # Repli déterministe si Ollama indisponible ou échec
+        if not bootloader_data or not bootloader_data.last_active_state:
+            last_act = recent_activities[-1] if recent_activities else {}
+            last_exe = last_act.get("executable", "Environnement de dev")
+            last_title = last_act.get("window_title", "Session de travail")
+            fallback_state = f"Arrêt de session sur [{last_exe}] '{last_title}'."
+
+            fallback_steps = []
+            if in_prog_tasks:
+                for t in in_prog_tasks[:3]:
+                    fallback_steps.append(f"Reprendre la tâche en cours [{t['task_id']}] : {t['title']}")
+            if len(fallback_steps) < 3 and ready_tasks:
+                for t in ready_tasks[: 3 - len(fallback_steps)]:
+                    fallback_steps.append(f"Amorcer la tâche prête [{t['task_id']}] : {t['title']}")
+            while len(fallback_steps) < 3:
+                fallback_steps.append("Vérifier les tests de non-régression et consulter le tableau de bord.")
+
+            bootloader_data = ExecutiveBootloaderSchema(
+                last_active_state=fallback_state,
+                immediate_next_steps=fallback_steps[:5],
+                detected_open_loops=[],
+            )
+
+        # Écriture du fichier 00_BOOTLOADER_DEMAIN.md
+        bootloader_file = settings.BOOTLOADER_PATH
+        bootloader_file.parent.mkdir(parents=True, exist_ok=True)
+
+        steps_checklist = "\n".join([f"- [ ] {step.strip()}" for step in bootloader_data.immediate_next_steps])
+        concepts_block = "\n".join([f"- {c}" for c in active_concepts]) if active_concepts else "- Aucune fiche conceptuelle modifiée aujourd'hui."
+
+        kanban_lines = []
+        for t in in_prog_tasks:
+            kanban_lines.append(f"- ⚙️ **[{t['task_id']}]** {t['title']} (P{t.get('priority', 2)} | {t.get('complexity', 'M')})")
+        for t in ready_tasks[:3]:
+            kanban_lines.append(f"- 🎯 **[{t['task_id']}]** {t['title']} (P{t.get('priority', 2)} | {t.get('complexity', 'M')})")
+        kanban_block = "\n".join(kanban_lines) if kanban_lines else "- Aucune tâche en cours ou prête dans le Kanban."
+
+        content = f"""# 🚀 Context Bootloader — Reprise Rapide & État Mental
+
+> **Date de consolidation :** `{date_str}`
+> **Bilan d'Attention :** {metric.total_screen_sec / 3600.0:.2f} h écran ({metric.active_production_sec / 3600.0:.2f} h prod) | Hyperfocus : `{metric.max_hyperfocus_topic or 'N/A'}`
+
+## 1. Dernier Point d'Arrêt
+{bootloader_data.last_active_state.strip()}
+
+## 2. Checklist de Redémarrage Immédiat (< 2 min)
+{steps_checklist}
+
+## 3. Fiches Conceptuelles Actives
+{concepts_block}
+
+## 4. Tâches Kanban Prioritaires
+{kanban_block}
+"""
+        bootloader_file.write_text(content, encoding="utf-8")
+        logger.info("Context Bootloader généré avec succès : %s", bootloader_file.name)
+
+        # Injection dédupliquée des Open Loops dans le Kanban (statut 'radar')
+        if bootloader_data.detected_open_loops:
+            existing_tasks = kanban.db.get_kanban_tasks(project_id="exocortex")
+            existing_titles = {t["title"].strip().lower() for t in existing_tasks if t.get("title")}
+
+            created_loops = 0
+            for loop in bootloader_data.detected_open_loops:
+                loop_title_norm = loop.title.strip().lower()
+                if loop_title_norm in existing_titles:
+                    continue
+                kanban.create_task(
+                    project_id="exocortex",
+                    title=loop.title.strip(),
+                    component_tag=loop.component_tag.strip() or "open-loop",
+                    summary_pitch=loop.summary_pitch.strip() or "Intention en suspens détectée lors de la consolidation nocturne.",
+                    priority=loop.priority,
+                    complexity=loop.complexity,
+                    initial_status="radar",
+                )
+                existing_titles.add(loop_title_norm)
+                created_loops += 1
+
+            if created_loops > 0:
+                logger.info("%d Open Loop(s) injecté(s) dans le Kanban en statut 'radar'.", created_loops)
+
+        return bootloader_file
 
     # ==========================================================================
     # PASSE 3 : INDEXATION VECTORIELLE LANCEDB (BGE-M3)

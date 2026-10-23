@@ -30,6 +30,7 @@ from pynput import keyboard
 
 from src.config import settings
 from src.database.db_manager import DBManager
+from src.database.graph_rag import HybridGraphRAG
 from src.database.vector_store import vector_store
 from src.llm.ollama_client import llm_client
 
@@ -169,29 +170,37 @@ def clean_markdown_excerpt(content: str, max_chars: int = 700) -> str:
 class HippocampusInjector:
     """Gestionnaire de l'injection sémantique et télémétrique de l'exocortex."""
 
-    def __init__(self, db_manager: Optional[DBManager] = None) -> None:
+    def __init__(
+        self,
+        db_manager: Optional[DBManager] = None,
+        graph_rag: Optional[HybridGraphRAG] = None,
+    ) -> None:
         self.db = db_manager or DBManager()
+        self.graph_rag = graph_rag or HybridGraphRAG(db_manager=self.db)
         self.is_processing = False
 
     def build_enriched_payload(self, user_prompt: str, top_k: int = 5) -> str:
         """
-        Construit le payload hybride : Prompt utilisateur + bloc <contexte_hippocampe_local>.
+        Construit le payload hybride : Prompt utilisateur + bloc <contexte_hippocampe_local>
+        enrichi par GraphRAG (Hop 0 k-NN + Hop 1 Wikilinks de graphe).
         """
         if not user_prompt or len(user_prompt.strip()) < 3:
             return user_prompt
 
         logger.info("Requête Hippocampe sur : '%s...'", user_prompt[:60].replace("\n", " "))
 
-        # 1. Recherche vectorielle LanceDB k-NN
-        vector_results = vector_store.search(user_prompt, top_k=top_k)
+        # 1. Recherche hybride GraphRAG (Hop 0 Vectoriel + Hop 1 Wikilinks)
+        rag_result = self.graph_rag.search_hybrid(user_prompt, top_k=top_k, neighbor_k=3)
+        primary_nodes = rag_result.get("primary_nodes", [])
+        linked_neighbors = rag_result.get("linked_neighbors", [])
 
-        if not vector_results:
-            logger.info("Aucune note conceptuelle trouvée dans LanceDB pour cette requête.")
+        if not primary_nodes and not linked_neighbors:
+            logger.info("Aucune note conceptuelle trouvée pour cette requête.")
             return user_prompt
 
         # 2. Identification des topics uniques et interrogation SQLite
         found_topics: Set[str] = set()
-        for r in vector_results:
+        for r in (primary_nodes + linked_neighbors):
             topic = r.get("semantic_topic")
             if topic and topic.strip() and topic != "Non_Classe":
                 found_topics.add(topic.strip())
@@ -213,11 +222,11 @@ class HippocampusInjector:
             )
             telemetry_summaries.append(summary_item)
 
-        # 3. Formatage des extraits de notes (déduplication par slug/titre)
+        # 3. Formatage des extraits de notes primaires (Hop 0)
         formatted_notes: List[str] = []
         seen_notes: Set[str] = set()
         note_idx = 1
-        for r in vector_results:
+        for r in primary_nodes:
             title = r.get("title") or r.get("slug") or f"Note_{note_idx}"
             slug = r.get("slug") or title
             if slug in seen_notes:
@@ -225,14 +234,12 @@ class HippocampusInjector:
             seen_notes.add(slug)
 
             topic = r.get("semantic_topic") or "Non_Classe"
-            dist = r.get("score", 1.0)
-            # Distance cosinus approximée en score de proximité
-            similarity_pct = max(0, min(100, int((1.0 - (dist / 2.0)) * 100))) if dist <= 2.0 else 50
-            raw_content = r.get("content", "")
+            sim_pct = r.get("similarity_pct", 50)
+            raw_content = r.get("excerpt", "")
             excerpt = clean_markdown_excerpt(raw_content)
 
             note_block = (
-                f"#### [{note_idx}] [[{title}]] (Topic: #{topic} | Match: ~{similarity_pct}%)\n"
+                f"#### [{note_idx}] [[{title}]] (Topic: #{topic} | Match: ~{sim_pct}%)\n"
                 f"{excerpt}"
             )
             formatted_notes.append(note_block)
@@ -240,9 +247,23 @@ class HippocampusInjector:
             if len(formatted_notes) >= 5:
                 break
 
-        # 4. Assemblage du bloc XML / Markdown
+        # 4. Formatage des voisins liés par wikilinks (Hop 1)
+        formatted_neighbors: List[str] = []
+        for nb in linked_neighbors:
+            nb_title = nb.get("title") or nb.get("slug")
+            nb_topic = nb.get("semantic_topic") or "General"
+            nb_excerpt = clean_markdown_excerpt(nb.get("excerpt", ""))
+            formatted_neighbors.append(
+                f"- **[[{nb_title}]]** (Topic: #{nb_topic}) : {nb_excerpt[:200]}"
+            )
+
+        # 5. Assemblage du bloc XML / Markdown
         telemetry_block = "\n".join(telemetry_summaries) if telemetry_summaries else "- Aucune télémétrie spécifique enregistrée."
-        notes_block = "\n\n---\n\n".join(formatted_notes)
+        notes_block = "\n\n---\n\n".join(formatted_notes) if formatted_notes else "- Aucun extrait direct."
+
+        graph_section = ""
+        if formatted_neighbors:
+            graph_section = f"\n\n### Connexions de Graphe (1-Hop Wikilinks) :\n" + "\n".join(formatted_neighbors)
 
         enriched_context = (
             f"\n\n<contexte_hippocampe_local>\n"
@@ -252,7 +273,8 @@ class HippocampusInjector:
             f"> **Historique & Investissement Temporel :**\n"
             f"{telemetry_block}\n\n"
             f"### Extraits Conceptuels Locaux Pertinents (k-NN LanceDB) :\n"
-            f"{notes_block}\n"
+            f"{notes_block}"
+            f"{graph_section}\n"
             f"</contexte_hippocampe_local>"
         )
 

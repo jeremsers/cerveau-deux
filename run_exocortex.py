@@ -264,6 +264,20 @@ def run_complete_task(task_id: str) -> None:
     print(f"✅ Tâche '{task_id}' ({task['title']}) marquée comme terminée avec succès !")
 
 
+def run_mcp_server() -> None:
+    """Lance le serveur MCP (Model Context Protocol) local sur stdio."""
+    # Redirection stricte de tous les handlers de logging vers stderr pour préserver stdout
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.root.addHandler(stderr_handler)
+    logging.root.setLevel(logging.INFO)
+
+    from src.mcp.exocortex_mcp_server import run_mcp_stdio_server
+    run_mcp_stdio_server()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exocortex & Télémétrie Cognitive — Orchestrateur Principal",
@@ -292,6 +306,7 @@ Exemples d'utilisation :
     group.add_argument("--hotkey", action="store_true", help="Lance le démon de raccourci global Alt+Espace.")
     group.add_argument("--dashboard", action="store_true", help="Lance le dashboard analytique Streamlit.")
     group.add_argument("--all", action="store_true", help="Lance tous les démons d'arrière-plan et le dashboard.")
+    group.add_argument("--mcp-server", action="store_true", help="Lance le serveur MCP local conforme stdio.")
     group.add_argument("--kanban-status", action="store_true", help="Affiche l'état des tickets du Kanban et actualise AGENT_QUEUE.md.")
     group.add_argument("--next-task", action="store_true", help="Dépile et affiche la tâche la plus prioritaire prête pour l'agent codeur.")
     group.add_argument("--complete-task", type=str, metavar="TASK_ID", help="Marque une tâche comme terminée.")
@@ -321,6 +336,8 @@ Exemples d'utilisation :
         run_dashboard()
     elif args.all:
         run_all()
+    elif args.mcp_server:
+        run_mcp_server()
     elif args.kanban_status:
         run_kanban_status(args.project)
     elif args.next_task:

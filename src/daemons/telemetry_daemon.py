@@ -10,12 +10,14 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import wintypes
+import json
 import logging
 import os
 import signal
 import sys
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -141,6 +143,142 @@ class WindowSessionState:
 
 
 # ==============================================================================
+# GARDE-FOU TEMPS RÉEL ANTI-DÉRIVE ATTENTIONNELLE (DRIFTGUARD)
+# ==============================================================================
+
+class DriftGuard:
+    """
+    Analyseur statistique temps réel en mémoire (0 Mo VRAM, 0 requête LLM).
+    Surveille la fragmentation attentionnelle (zapping) et la dérive vers des médias non planifiés.
+    """
+
+    def __init__(
+        self,
+        state_path: Optional[Path] = None,
+        max_switches_30min: Optional[int] = None,
+        max_passive_min: Optional[int] = None,
+        cooldown_min: int = 60,
+    ) -> None:
+        self.state_path = state_path or settings.DRIFT_STATE_PATH
+        self.max_switches = max_switches_30min if max_switches_30min is not None else settings.DRIFT_MAX_SWITCHES_30MIN
+        self.max_passive_min = max_passive_min if max_passive_min is not None else settings.DRIFT_MAX_PASSIVE_MIN
+        self.cooldown_min = cooldown_min
+        self.history: deque = deque(maxlen=600)
+        self.last_alert_time: Optional[datetime] = None
+
+    def record_switch(
+        self,
+        timestamp: datetime,
+        executable: str,
+        window_title: str,
+        duration_sec: int,
+        input_intensity: float,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Enregistre une transition de fenêtre et évalue les conditions de dérive.
+        Retourne le dictionnaire d'alerte si une nouvelle alerte est déclenchée, sinon None.
+        """
+        exe_low = (executable or "").lower()
+        title_low = (window_title or "").lower()
+
+        is_media = any(
+            k in exe_low or k in title_low
+            for k in [
+                "youtube", "netflix", "twitch", "vlc", "mpv", "spotify", "reddit",
+                "twitter", "x.com", "instagram", "tiktok", "discord", "steam",
+                "webtoon", "crunchyroll", "prime video", "disney", "primevideo"
+            ]
+        )
+
+        event = {
+            "timestamp": timestamp,
+            "executable": executable,
+            "window_title": window_title,
+            "duration_sec": max(1, duration_sec),
+            "input_intensity": input_intensity,
+            "is_media": is_media,
+        }
+        self.history.append(event)
+
+        # Nettoyage de l'historique au-delà de 90 minutes
+        cutoff_90m = timestamp - timedelta(minutes=90)
+        while self.history and self.history[0]["timestamp"] < cutoff_90m:
+            self.history.popleft()
+
+        # 1. Détection hyper_fragmentation (Zapping sur 30 min)
+        cutoff_30m = timestamp - timedelta(minutes=30)
+        recent_30m = [e for e in self.history if e["timestamp"] >= cutoff_30m]
+        switch_count_30m = len(recent_30m)
+        avg_dur_30m = (sum(e["duration_sec"] for e in recent_30m) / max(1, switch_count_30m)) if switch_count_30m > 0 else 0.0
+
+        is_hyper_fragmented = (switch_count_30m >= self.max_switches and avg_dur_30m < 45.0)
+
+        # 2. Détection unplanned_media_hole (Dérive passive > seuil)
+        passive_media_sec = sum(
+            e["duration_sec"] for e in self.history if e["is_media"] and e["input_intensity"] < 0.15
+        )
+        passive_media_min = passive_media_sec / 60.0
+        is_media_hole = (passive_media_min >= self.max_passive_min)
+
+        drift_type = None
+        diagnostic = ""
+
+        if is_hyper_fragmented:
+            drift_type = "hyper_fragmentation"
+            diagnostic = f"{switch_count_30m} changements de contexte en 30 min (durée moyenne : {int(avg_dur_30m)}s). Dispersion attentionnelle détectée."
+        elif is_media_hole:
+            drift_type = "unplanned_media_hole"
+            diagnostic = f"{int(passive_media_min)} min d'exploration passive/média cumulée sans saisie active après un tunnel de travail."
+
+        if not drift_type:
+            return None
+
+        # Vérification du cooldown (60 minutes entre alertes)
+        if self.last_alert_time is not None:
+            elapsed_sec = (timestamp - self.last_alert_time).total_seconds()
+            if elapsed_sec < (self.cooldown_min * 60):
+                logger.debug("Alerte %s détectée mais ignorée (cooldown actif, reste %d min).", drift_type, int((self.cooldown_min * 60 - elapsed_sec) / 60))
+                return None
+
+        # Déclenchement de l'alerte
+        self.last_alert_time = timestamp
+        cooldown_until = timestamp + timedelta(minutes=self.cooldown_min)
+
+        alert_data = {
+            "active_alert": True,
+            "drift_type": drift_type,
+            "severity": "warning",
+            "detected_at": timestamp.isoformat(),
+            "cooldown_until": cooldown_until.isoformat(),
+            "diagnostic": diagnostic,
+            "metrics": {
+                "switches_30min": switch_count_30m,
+                "avg_duration_sec": round(avg_dur_30m, 1),
+                "passive_media_min": round(passive_media_min, 1),
+            },
+        }
+
+        # Écriture dans settings.DRIFT_STATE_PATH
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps(alert_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info("Alerte DriftGuard enregistrée : %s", diagnostic)
+        except Exception as exc:
+            logger.warning("Erreur écriture drift_state.json : %s", exc)
+
+        # Signal sonore discret (double bip 600 Hz, 120 ms)
+        try:
+            import winsound
+            winsound.Beep(600, 120)
+            time.sleep(0.08)
+            winsound.Beep(600, 120)
+        except Exception:
+            pass
+
+        return alert_data
+
+
+# ==============================================================================
 # DÉMON PRINCIPAL DE TÉLÉMÉTRIE
 # ==============================================================================
 
@@ -155,6 +293,7 @@ class TelemetryDaemon:
         settings.ensure_directories()
         self.current_state: Optional[WindowSessionState] = None
         self.context_switches_count: int = 0
+        self.drift_guard = DriftGuard()
         self.running: bool = False
         self._setup_signals()
 
@@ -271,6 +410,19 @@ class TelemetryDaemon:
         self.current_state = None
 
         duration = state.duration_sec
+
+        # Surveillance attentionnelle via DriftGuard (0 Mo VRAM)
+        try:
+            self.drift_guard.record_switch(
+                timestamp=state.timestamp_last_seen,
+                executable=state.executable,
+                window_title=state.window_title,
+                duration_sec=duration,
+                input_intensity=state.input_intensity,
+            )
+        except Exception as d_exc:
+            logger.debug("Erreur DriftGuard : %s", d_exc)
+
         # Filtre de Dwell Time : ignorer si durée < 20 secondes (bruit de zapping)
         if duration < settings.DWELL_TIME_THRESHOLD_SEC:
             self.context_switches_count += 1

@@ -293,6 +293,34 @@ def render_dashboard() -> None:
 
     st.markdown("---")
 
+    # Alerte de Dérive Attentionnelle (Drift Guard - Module 8)
+    if settings.DRIFT_STATE_PATH.exists():
+        try:
+            drift_info = json.loads(settings.DRIFT_STATE_PATH.read_text(encoding="utf-8"))
+            if drift_info.get("active_alert"):
+                det_str = drift_info.get("detected_at")
+                is_recent = False
+                if det_str:
+                    det_dt = datetime.fromisoformat(det_str)
+                    if (datetime.now() - det_dt).total_seconds() < 3600:
+                        is_recent = True
+                if is_recent:
+                    drift_type = drift_info.get("drift_type", "Attention Drift")
+                    diagnostic = drift_info.get("diagnostic", "Dérive attentionnelle constatée.")
+                    st.warning(f"⚠️ **Garde-Fou Attentionnel [{drift_type}]** : {diagnostic}")
+        except Exception:
+            pass
+
+    # Context Bootloader — Reprise Rapide & État Mental
+    if settings.BOOTLOADER_PATH.exists():
+        try:
+            bootloader_text = settings.BOOTLOADER_PATH.read_text(encoding="utf-8")
+            expand_bootloader = bool(kpis.get("active_prod_hours", 0.0) == 0.0)
+            with st.expander("🚀 Context Bootloader — Reprise Rapide & État Mental", expanded=expand_bootloader):
+                st.markdown(bootloader_text)
+        except Exception:
+            pass
+
     # ==============================================================================
     # NAVIGATION PAR ONGLETS
     # ==============================================================================
