@@ -101,6 +101,7 @@ venv.bak/
 .coverage
 htmlcov/
 tech_specs/*/log*
+tech specs/*/log*
 
 # --- IDEs & Éditeurs ---
 .vscode/

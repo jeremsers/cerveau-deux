@@ -1,6 +1,6 @@
 # 🤖 MANIFESTE D'EXÉCUTION AGENT CODEUR (AGENT_QUEUE.md)
 *Généré automatiquement par le Module 7 (Kanban Exécutif & Studio SOTA)*  
-*Dernière synchronisation : 2026-10-24 01:07:23*
+*Dernière synchronisation : 2026-10-24 01:11:01*
 
 > [!NOTE] Invariants d'Exécution
 > - Consommation VRAM Kanban : **0 Mo** (moteur passif SQLite).
