@@ -1,6 +1,7 @@
 """
-Module 5 : Injecteur Pré-Prompt Hippocampe Local (Pont A - Alt + Espace).
-Démon ultra-léger (0 Mo VRAM, 0% CPU au repos) écoutant le raccourci global Alt+Espace :
+Module 5 : Injecteur Pré-Prompt Hippocampe Local (Pont A).
+Démon ultra-léger (0 Mo VRAM, 0% CPU au repos) écoutant le raccourci global HIPPOCAMPUS_HOTKEY
+(Ctrl+Alt+Espace par défaut depuis v0.5.6 ; Alt+Espace entrait en conflit avec le menu système) :
 1. Capture le texte saisi dans l'invite de commande ou la zone active (Ctrl+A -> Ctrl+C).
 2. Interroge vector_store.py (k-NN top_k=5) via LanceDB et décharge immédiatement bge-m3.
 3. Récupère la télémétrie SQLite cumulée sur les semantic_topics identifiés.
@@ -16,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import winsound
 from pathlib import Path
@@ -33,6 +35,7 @@ from src.database.db_manager import DBManager
 from src.database.graph_rag import HybridGraphRAG
 from src.database.vector_store import vector_store
 from src.llm.ollama_client import llm_client
+from src.utils.lifecycle import clear_stop_flag, stop_requested
 
 logger = logging.getLogger("Exocortex.HippocampusHotkey")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -177,7 +180,12 @@ class HippocampusInjector:
     ) -> None:
         self.db = db_manager or DBManager()
         self.graph_rag = graph_rag or HybridGraphRAG(db_manager=self.db)
-        self.is_processing = False
+        # Verrou non bloquant : une seule injection à la fois, sans jamais attendre dans le hook
+        self._busy = threading.Lock()
+
+    @property
+    def is_processing(self) -> bool:
+        return self._busy.locked()
 
     def build_enriched_payload(self, user_prompt: str, top_k: int = 5) -> str:
         """
@@ -281,15 +289,24 @@ class HippocampusInjector:
         final_payload = user_prompt + enriched_context
         return final_payload
 
-    def on_hotkey_triggered(self) -> None:
-        """Point d'entrée lors de la frappe du raccourci global Alt+Espace."""
-        if self.is_processing:
+    def on_hotkey_triggered(self) -> Optional[threading.Thread]:
+        """
+        Callback du raccourci global (v0.5.6, E2). Il s'exécute sur le thread du hook clavier
+        bas niveau de Windows : un hook trop lent est retiré silencieusement par le système
+        (LowLevelHooksTimeout). Le callback ne fait donc que déléguer le travail (copie, GraphRAG,
+        embedding, collage) à un thread dédié, et rend la main immédiatement.
+        """
+        if not self._busy.acquire(blocking=False):
             logger.info("Requête précédente en cours, activation ignorée.")
-            return
+            return None
+        worker = threading.Thread(target=self._process_hotkey, name="Hippocampus-Inject", daemon=True)
+        worker.start()
+        return worker
 
-        self.is_processing = True
+    def _process_hotkey(self) -> None:
+        """Copie, enrichissement et réinjection, hors du thread du hook clavier."""
         try:
-            logger.info("=== Raccourci Alt+Espace détecté ===")
+            logger.info("=== Raccourci %s détecté ===", settings.HIPPOCAMPUS_HOTKEY)
             prompt = simulate_select_and_copy()
 
             if not prompt or len(prompt) < 3:
@@ -309,21 +326,29 @@ class HippocampusInjector:
                 winsound.MessageBeep(winsound.MB_OK)
 
         except Exception as exc:
-            logger.error("Erreur critique lors de l'injection Alt+Espace : %s", exc, exc_info=True)
+            logger.error("Erreur critique lors de l'injection Hippocampe : %s", exc, exc_info=True)
             winsound.MessageBeep(winsound.MB_ICONHAND)
         finally:
-            self.is_processing = False
+            self._busy.release()
 
     def run_daemon(self) -> None:
         """Démarre le listener d'écoute globale en arrière-plan."""
-        logger.info("Démarrage de l'injecteur Hippocampe (Écoute globale Alt+Espace)...")
+        # Raccourci configurable (E1) : Alt+Espace ouvre le menu système de la fenêtre sous
+        # Windows et est souvent capté par PowerToys Run ; défaut Ctrl+Alt+Espace.
+        hotkey_str = settings.HIPPOCAMPUS_HOTKEY
+        logger.info("Démarrage de l'injecteur Hippocampe (écoute globale %s)...", hotkey_str)
         logger.info("Empreinte VRAM : 0 Mo | CPU au repos : 0 %%")
 
-        hotkey_str = "<alt>+<space>"
+        clear_stop_flag()
         with keyboard.GlobalHotKeys({hotkey_str: self.on_hotkey_triggered}) as h:
             try:
-                h.join()
+                # Attente active légère pour réagir au signal d'arrêt propre (E4)
+                while h.is_alive() and not stop_requested():
+                    h.join(timeout=1.0)
             except KeyboardInterrupt:
+                pass
+            finally:
+                h.stop()
                 logger.info("Arrêt gracieux de l'injecteur Hippocampe.")
 
 

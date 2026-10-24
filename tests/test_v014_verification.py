@@ -74,7 +74,7 @@ def test_lot1_config_parameters():
     )
 
 
-def test_lot2_slug_anti_collision_takeout():
+def test_lot2_slug_anti_collision_takeout(exo_env):
     """Vérifie que deux sessions distinctes avec le même slug ne s'écrasent jamais."""
     created_files: List[Path] = []
     test_slug = "test-collision-v014-concept"
@@ -110,7 +110,7 @@ def test_lot2_slug_anti_collision_takeout():
             related_concepts=[],
         )
 
-        db = DBManager()
+        db = exo_env.db
         ok_a, status_a = save_distilled_concept_note(sess_a, schema_a, db)
         assert ok_a is True
         assert status_a == "success"
@@ -190,7 +190,7 @@ def test_lot2_lancedb_vector_store_slug_key():
     )
 
 
-def test_lot3_night_consolidator_schema_and_purity():
+def test_lot3_night_consolidator_schema_and_purity(exo_env):
     """Vérifie la Passe 2 du NightConsolidator (Schéma Pydantic & Absence d'import déprécié)."""
     # 1. Vérification de l'absence d'import circulaire / déprécié
     night_code = (_ROOT / "src" / "consolidators" / "night_consolidator.py").read_text(encoding="utf-8")
@@ -212,121 +212,93 @@ def test_lot3_night_consolidator_schema_and_purity():
     assert len(schema_instance.tags) == 3
 
     # 3. Vérification de la méthode CPU-only
-    consolidator = NightConsolidator()
+    consolidator = NightConsolidator(db_manager=exo_env.db)
     assert hasattr(consolidator, "_find_matching_existing_concept_cpu"), (
         "Méthode _find_matching_existing_concept_cpu manquante sur NightConsolidator"
     )
 
 
-def test_lot4_dashboard_macro_kpis_sqlite():
-    """Vérifie que load_macro_kpis() s'exécute sans erreur SQL et retourne des valeurs cohérentes."""
+@pytest.fixture
+def seeded_dashboard(exo_env):
+    """Base temporaire semée (v0.5.6, F1) : invariants relatifs au lieu des volumes personnels."""
+    import streamlit as st
+    from src.database.db_manager import ChatMessageRecord, ChatSessionRecord, HistoricalFootprintRecord
+
+    db = exo_env.db
+    sessions = [
+        ChatSessionRecord(session_id=f"s{i}", timestamp_start=datetime(2026, 1, 1 + i, 10),
+                          timestamp_end=datetime(2026, 1, 1 + i, 11), turn_count=4, user_char_count=900,
+                          extracted_topics_json='["IA_et_LLM_Local"]', summary=f"Session Python {i}",
+                          distillation_status="success")
+        for i in range(3)
+    ]
+    db.insert_chat_sessions_batch(sessions)
+    db.insert_chat_messages_batch([
+        ChatMessageRecord(session_id=s.session_id, turn_index=t, timestamp=s.timestamp_start,
+                          user_prompt=f"Question Python {t}", ai_response="R", user_char_count=225)
+        for s in sessions for t in range(4)
+    ])
+    db.insert_historical_footprints_batch(
+        [HistoricalFootprintRecord(source="youtube", timestamp=datetime(2026, 1, 1, 20, i), title_or_query=f"Vidéo {i}",
+                                   channel_or_domain="Chaîne A", cluster_id="cluster_a") for i in range(4)]
+        + [HistoricalFootprintRecord(source="google_search", timestamp=datetime(2026, 1, 2, 9, i), title_or_query=f"requête {i}",
+                                     channel_or_domain="google.com") for i in range(3)]
+    )
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    yield db
+    st.cache_data.clear()
+    st.cache_resource.clear()
+
+
+def test_lot4_dashboard_macro_kpis_sqlite(seeded_dashboard):
+    """Vérifie que load_macro_kpis() s'exécute sans erreur SQL et reflète la base."""
     kpis = load_macro_kpis()
-    assert isinstance(kpis, dict)
     required_keys = [
-        "chat_count",
-        "chat_hours",
-        "total_turns",
-        "total_chars",
-        "raw_count",
-        "os_hours",
-        "total_tracked_hours",
-        "active_prod_hours",
-        "passive_exp_hours",
-        "max_hyperfocus_hours",
-        "max_hyperfocus_topic",
-        "avg_switch_rate",
-        "avg_read_ratio",
-        "fp_count",
+        "chat_count", "chat_hours", "total_turns", "total_chars", "raw_count", "os_hours",
+        "total_tracked_hours", "active_prod_hours", "passive_exp_hours", "max_hyperfocus_hours",
+        "max_hyperfocus_topic", "avg_switch_rate", "avg_read_ratio", "fp_count",
     ]
     for rk in required_keys:
         assert rk in kpis, f"Clé manquante dans load_macro_kpis() : {rk}"
-
-    assert kpis["chat_count"] >= 480, f"Attendu au moins 480 sessions chat, obtenu : {kpis['chat_count']}"
-    assert kpis["fp_count"] in (73153, 73154), f"Attendu ~73 154 empreintes, obtenu : {kpis['fp_count']}"
+    assert kpis["chat_count"] == 3 and kpis["total_turns"] == 12
+    assert kpis["fp_count"] == 7
     assert kpis["max_hyperfocus_hours"] >= 0.0
     assert isinstance(kpis["max_hyperfocus_topic"], str)
 
 
-def test_lot4_dashboard_tab5_chat_search():
+def test_lot4_dashboard_tab5_chat_search(seeded_dashboard):
     """Vérifie le moteur de recherche full-text du Volet A (chat_messages & chat_sessions)."""
-    # 1. Recherche globale sans filtre (50 sessions max)
     all_res = load_chat_search_results(limit=10)
-    assert len(all_res) > 0, "Aucune session retournée par load_chat_search_results()"
+    assert len(all_res) == 3
     sess = all_res[0]
-    assert "session_id" in sess
-    assert "summary" in sess
-    assert "distillation_status" in sess
-
-    # 2. Récupération des messages de la session
-    msgs = load_messages_for_session(sess["session_id"])
-    assert isinstance(msgs, list)
-
-    # 3. Recherche filtrée par topic sémantique
-    topic_res = load_chat_search_results(topic_filter="IA_et_LLM_Local", limit=10)
-    assert isinstance(topic_res, list)
-
-    # 4. Recherche par mot-clé textuel
-    kw_res = load_chat_search_results(query="Python", limit=10)
-    assert isinstance(kw_res, list)
+    assert {"session_id", "summary", "distillation_status"} <= set(sess)
+    assert len(load_messages_for_session(sess["session_id"])) == 4
+    assert len(load_chat_search_results(topic_filter="IA_et_LLM_Local", limit=10)) == 3
+    assert len(load_chat_search_results(query="Python", limit=10)) == 3
+    assert load_chat_search_results(query="introuvable-xyz", limit=10) == []
 
 
-def test_lot4_dashboard_tab5_footprints():
+def test_lot4_dashboard_tab5_footprints(seeded_dashboard):
     """Vérifie les requêtes d'agrégation et de recherche du Volet B (historical_footprints)."""
-    # 1. Résumé global des empreintes
     fp_summary = load_footprints_summary()
-    assert fp_summary["total"] in (73153, 73154)
-    assert fp_summary["youtube"] > 0
-    assert fp_summary["search"] > 0
+    assert fp_summary["youtube"] == 4 and fp_summary["search"] == 3
     assert fp_summary["youtube"] + fp_summary["search"] == fp_summary["total"]
 
-    # 2. Top 15 des chaînes et domaines
     df_top = load_top_channels_and_domains(limit=15)
-    assert not df_top.empty
-    assert "channel_or_domain" in df_top.columns
-    assert "footprint_count" in df_top.columns
-    assert len(df_top) <= 15
+    assert {"channel_or_domain", "footprint_count"} <= set(df_top.columns)
+    assert df_top.iloc[0]["channel_or_domain"] == "Chaîne A" and len(df_top) <= 15
 
-    # 3. Burst clusters
     df_clusters = load_burst_clusters_summary(limit=10)
-    assert isinstance(df_clusters, object)
-    if not df_clusters.empty:
-        assert "cluster_id" in df_clusters.columns
-        assert "event_count" in df_clusters.columns
+    assert list(df_clusters["cluster_id"]) == ["cluster_a"]
 
-    # 4. Recherche tabulaire
     df_search = search_historical_footprints(source_filter="youtube", limit=20)
-    assert not df_search.empty
-    assert (df_search["source"] == "youtube").all()
+    assert len(df_search) == 4 and (df_search["source"] == "youtube").all()
 
 
 def run_checks():
-    """Exécute l'intégralité des vérifications v0.1.4 en mode autonome."""
-    print("=" * 70)
-    print("VÉRIFICATION TECHNIQUE DE L'INTÉGRALITÉ DU PATCH v0.1.4")
-    print("=" * 70)
-
-    print("\n[Lot 1] Vérification de l'alignement paramétrique...")
-    test_lot1_config_parameters()
-    print("[OK] Lot 1 validé : INACTIVITY_SESSION_THRESHOLD_MIN=45 et PROLONGED_SESSION_THRESHOLD_SEC=180.")
-
-    print("\n[Lot 2] Vérification anti-collision slugs & LanceDB...")
-    test_lot2_slug_anti_collision_takeout()
-    test_lot2_lancedb_vector_store_slug_key()
-    print("[OK] Lot 2 validé : Clés primaires LanceDB et slugs Takeout étanches à 100%.")
-
-    print("\n[Lot 3] Vérification Passe 2 NightConsolidator & VRAM...")
-    test_lot3_night_consolidator_schema_and_purity()
-    print("[OK] Lot 3 validé : NightConceptSynthesisSchema opérationnel, CPU-only matcher actif.")
-
-    print("\n[Lot 4] Vérification Dashboard & Requêtes SQLite...")
-    test_lot4_dashboard_macro_kpis_sqlite()
-    test_lot4_dashboard_tab5_chat_search()
-    test_lot4_dashboard_tab5_footprints()
-    print("[OK] Lot 4 validé : Dashboard 100% fonctionnel (KPIS décorrélés, Volets A et B).")
-
-    print("\n" + "=" * 70)
-    print("TOUS LES LOTS v0.1.4 SONT STRICTEMENT VALIDES ET CONFORMES !")
-    print("=" * 70)
+    """Exécute la suite v0.1.4 via pytest (les tests reposent désormais sur des fixtures hermétiques)."""
+    raise SystemExit(pytest.main([__file__, "-q"]))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ Fournit également l'utilitaire sanitize_url pour l'épuration des paramètres d
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -15,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import psutil
 
@@ -33,6 +34,34 @@ IDE_TERMINAL_EXECUTABLES = {
     "cursor.exe",
     "windsurf.exe",
 }
+
+# Terminaux : leur répertoire courant est un indice fiable du dépôt (contrairement aux IDE)
+TERMINAL_EXECUTABLES = {"windowsterminal.exe", "powershell.exe", "pwsh.exe", "cmd.exe", "wezterm-gui.exe"}
+# Suffixes de titre de la famille VS Code : « fichier - workspace - Visual Studio Code »
+VSCODE_TITLE_SUFFIXES = ("Visual Studio Code", "Cursor", "Windsurf", "VSCodium", "Code - OSS")
+
+
+def extract_ide_workspace(window_title: str) -> Optional[str]:
+    """Nom du workspace/projet ouvert, lu dans le titre d'un IDE (VS Code, Cursor, Windsurf, JetBrains)."""
+    title = re.sub(r"^[●•*]\s*", "", (window_title or "").strip())
+    parts = [p.strip() for p in title.split(" - ") if p.strip()]
+    if len(parts) >= 2 and any(parts[-1].endswith(sfx) for sfx in VSCODE_TITLE_SUFFIXES):
+        workspace = re.sub(r"\s*\((?:Workspace|Espace de travail|WSL[^)]*|SSH[^)]*)\)$", "", parts[-2])
+        return workspace or None
+    if " – " in title:  # JetBrains : « projet – fichier »
+        return title.split(" – ", 1)[0].strip() or None
+    return None
+
+
+def _git_root(start: Path) -> Optional[Path]:
+    """Remonte depuis start jusqu'au dossier contenant .git."""
+    curr: Optional[Path] = start
+    while curr and curr != curr.parent:
+        if (curr / ".git").exists():
+            return curr
+        curr = curr.parent
+    return None
+
 
 # Paramètres de tracking URL à épurer
 TRACKING_QUERY_PARAMS = {
@@ -96,6 +125,8 @@ class GitIDEProbe:
         self.cache_ttl = cache_ttl
         # Cache : repo_path_str -> (timestamp, formatted_info)
         self._cache: Dict[str, Tuple[float, str]] = {}
+        self._workspace_index: Optional[Dict[str, List[Path]]] = None
+        self._workspace_index_ts: float = 0.0
 
     def is_ide_or_terminal(self, executable: str) -> bool:
         """Vérifie si l'exécutable correspond à un éditeur de code ou terminal."""
@@ -121,7 +152,7 @@ class GitIDEProbe:
         if not self.is_ide_or_terminal(executable):
             return None
 
-        target_repo = self._resolve_repo_path(pid, window_title, known_projects or [])
+        target_repo = self._resolve_repo_path(pid, window_title, known_projects or [], executable)
         if not target_repo:
             return None
 
@@ -147,41 +178,71 @@ class GitIDEProbe:
         pid: int,
         window_title: str,
         known_projects: List[Dict[str, Any]],
+        executable: str = "",
     ) -> Optional[Path]:
-        """Tente de résoudre le répertoire racine du dépôt Git actif."""
-        title_low = window_title.lower()
+        """
+        Résout le dépôt Git actif (v0.5.6, E5), du plus fiable au moins fiable :
+        1. nom du workspace lu dans le titre d'IDE, comparé EXACTEMENT aux dépôts/projets connus ;
+        2. même nom recherché dans l'index des workspaces VS Code / Cursor / Windsurf ;
+        3. terminaux uniquement : répertoire courant du processus (le cwd de code.exe n'est
+           presque jamais le dépôt ouvert) ;
+        4. dépôt de l'Exocortex lui-même si le workspace porte son nom.
+        Plus aucune correspondance par sous-chaîne du titre.
+        """
+        workspace = extract_ide_workspace(window_title)
+        ws_low = workspace.lower() if workspace else None
 
-        # 1. Correspondance avec la liste des projets connus (base SQLite)
-        for proj in known_projects:
-            rpath_str = proj.get("repo_path")
-            if not rpath_str:
-                continue
-            rpath = Path(rpath_str)
-            pname = proj.get("name", "")
-            if rpath.name.lower() in title_low or (pname and pname.lower() in title_low):
-                if (rpath / ".git").exists():
+        if ws_low:
+            for proj in known_projects:
+                rpath_str = proj.get("repo_path")
+                if not rpath_str:
+                    continue
+                rpath = Path(rpath_str)
+                names = {rpath.name.lower(), str(proj.get("name") or "").lower(), str(proj.get("project_id") or "").lower()}
+                if ws_low in names and (rpath / ".git").exists():
                     return rpath
 
-        # 2. Inspection du CWD du processus Win32 via psutil
-        if pid > 0 and psutil.pid_exists(pid):
+            for candidate in self._ide_workspace_index().get(ws_low, []):
+                repo = _git_root(candidate)
+                if repo:
+                    return repo
+
+        if executable.lower() in TERMINAL_EXECUTABLES and pid > 0 and psutil.pid_exists(pid):
             try:
-                proc = psutil.Process(pid)
-                cwd = Path(proc.cwd())
-                curr: Optional[Path] = cwd
-                while curr and curr != curr.parent:
-                    if (curr / ".git").exists():
-                        return curr
-                    curr = curr.parent
+                repo = _git_root(Path(psutil.Process(pid).cwd()))
+                if repo:
+                    return repo
             except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                 pass
 
-        # 3. Correspondance avec le projet local de travail courant (_PROJECT_ROOT)
-        if (_PROJECT_ROOT / ".git").exists():
-            root_name = _PROJECT_ROOT.name.lower()
-            if root_name in title_low:
-                return _PROJECT_ROOT
-
+        if ws_low and ws_low == _PROJECT_ROOT.name.lower() and (_PROJECT_ROOT / ".git").exists():
+            return _PROJECT_ROOT
         return None
+
+    def _ide_workspace_index(self) -> Dict[str, List[Path]]:
+        """Nom de dossier -> chemins, lus dans workspaceStorage des IDE de la famille VS Code (cache 5 min)."""
+        now = time.time()
+        if self._workspace_index is not None and (now - self._workspace_index_ts) < 300:
+            return self._workspace_index
+        index: Dict[str, List[Path]] = {}
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            for product in ("Code", "Cursor", "Windsurf", "VSCodium"):
+                storage = Path(appdata) / product / "User" / "workspaceStorage"
+                if not storage.is_dir():
+                    continue
+                for ws_json in storage.glob("*/workspace.json"):
+                    try:
+                        uri = json.loads(ws_json.read_text(encoding="utf-8")).get("folder") or ""
+                        if not uri.startswith("file:///"):
+                            continue
+                        folder = Path(unquote(uri[len("file:///"):]))
+                        index.setdefault(folder.name.lower(), []).append(folder)
+                    except Exception:
+                        continue
+        self._workspace_index = index
+        self._workspace_index_ts = now
+        return index
 
     def _query_git_state(self, repo_dir: Path) -> Optional[str]:
         """Interroge git rev-parse et git diff --shortstat sans fenêtre console."""

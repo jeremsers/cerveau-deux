@@ -21,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.config import settings
 from src.database.db_manager import DBManager, KanbanTaskRecord, ProjectRecord
+from src.utils.atomic_io import atomic_write_text
 from src.utils.path_safety import is_under_any, resolve_within, safe_slug
 
 PROJECT_PREFIX_PATTERN = re.compile(r"^[A-Z0-9]{1,8}$")
@@ -398,8 +399,7 @@ status: "ready_for_agent"
         task_id_part = task["task_id"] if TASK_ID_PATTERN.match(task["task_id"]) else safe_slug(task["task_id"])
         dest_dir = resolve_within(settings.KANBAN_SPECS_DIR, safe_slug(project_id, fallback="projet"))
         spec_path = resolve_within(dest_dir, f"{task_id_part}_{slug}.md")
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        spec_path.write_text(raw, encoding="utf-8")
+        atomic_write_text(spec_path, raw)
 
         # Mise à jour en base SQLite
         self.db.update_kanban_task_status(
@@ -516,8 +516,7 @@ status: "ready_for_agent"
             lines.append("")
 
         manifest_path = settings.AGENT_QUEUE_PATH
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(manifest_path, "\n".join(lines))
         return manifest_path
 
 

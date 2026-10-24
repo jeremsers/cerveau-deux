@@ -1,15 +1,32 @@
 """
 Fixtures partagées des suites de vérification (v0.5.1+).
-`exo_env` isole complètement un test : coffre, base SQLite et LanceDB sous tmp_path,
-singletons (kanban_engine, vector_store) redirigés, Ollama considéré hors ligne.
+
+Barrière d'hermétisme (v0.5.6, F1) : AVANT tout import de `src`, le coffre, le dossier Takeout,
+Ollama et la clé Gemini sont redirigés vers des valeurs de test. `src.config` lisant ces variables
+à l'import (et le fichier .env ne remplaçant jamais une variable déjà définie), aucun test ne
+peut plus lire ni modifier le vrai coffre, la vraie base, ni appeler un modèle réel — y compris
+les singletons créés à l'import (kanban_engine, vector_store).
+
+`exo_env` isole en plus chaque test dans son propre coffre sous tmp_path.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import unittest.mock as mock
 from dataclasses import dataclass
 from pathlib import Path
+
+_SESSION_SANDBOX = Path(tempfile.mkdtemp(prefix="exocortex-tests-"))
+os.environ["VAULT_ROOT"] = str(_SESSION_SANDBOX / "Vault_Data")
+os.environ["TAKEOUT_DIR"] = str(_SESSION_SANDBOX / "takeout_raw")
+os.environ["MODELS_DIR"] = str(_SESSION_SANDBOX / "models")
+os.environ["OLLAMA_BASE_URL"] = os.environ.get("EXOCORTEX_TEST_OLLAMA_URL", "http://127.0.0.1:9")
+os.environ["LLM_BACKEND"] = "ollama"
+os.environ["GEMINI_API_KEY"] = ""
+os.environ["TAKEOUT_MODE"] = "web_manual"
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -19,6 +36,17 @@ import pytest
 
 from src.config import settings
 from src.database.db_manager import DBManager
+
+
+_REAL_VAULT = (_ROOT / "Vault_Data").resolve()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Garde-fou : refuse de lancer la suite si la configuration pointe vers le vrai coffre."""
+    from src.config import settings
+
+    if settings.VAULT_ROOT.resolve() == _REAL_VAULT or settings.DB_PATH.resolve().is_relative_to(_REAL_VAULT):
+        pytest.exit("Suite de tests pointée vers le vrai coffre Vault_Data : arrêt (F1).", returncode=2)
 
 
 @dataclass

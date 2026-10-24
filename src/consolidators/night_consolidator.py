@@ -44,7 +44,9 @@ from src.llm.prompts import (
     PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
     PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
 )
+from src.utils.atomic_io import atomic_write_text
 from src.utils.cognitive_metrics import compute_focus_tunnels
+from src.utils.episodic_journal import SECTION_TELEMETRY, journal_has_section, write_journal_section
 from src.utils.markdown_io import (
     ConceptFrontmatter,
     ParsedConceptNote,
@@ -699,35 +701,36 @@ class NightConsolidator:
                 f"avec un hyperfocus continu de {hyperfocus_fmt} et {metric.context_switches_per_hour} changements de contexte par heure."
             )
 
-        episodic_file = settings.EPISODIC_DIR / f"{date_str}.md"
-        episodic_content = f"""---
-date: "{date_str}"
-total_screen_hours: {metric.total_screen_sec / 3600.0:.2f}
-active_production_hours: {metric.active_production_sec / 3600.0:.2f}
-passive_exploration_hours: {metric.passive_exploration_sec / 3600.0:.2f}
-max_hyperfocus_min: {metric.max_hyperfocus_sec // 60}
-max_hyperfocus_topic: "{metric.max_hyperfocus_topic or 'None'}"
-context_switches_per_hour: {metric.context_switches_per_hour}
-read_vs_write_ratio: {metric.read_vs_write_ratio}
----
-
-# Journal Épisodique & Télémétrie Cognitive : {date_str}
-
-## 1. Métriques Clés d'Attention & Focus
+        # Section « télémétrie » du journal unique (A10) : la section des sessions IA écrite par
+        # le Takeout pour la même date est conservée, et un journal cold start ne bloque plus
+        # la consolidation de son jour.
+        telemetry_section = f"""## Télémétrie & Focus (activité écran)
 - **Temps d'écran actif total :** {metric.total_screen_sec / 3600.0:.2f} heures
 - **Production active :** {metric.active_production_sec / 3600.0:.2f} h vs **Exploration passive :** {metric.passive_exploration_sec / 3600.0:.2f} h
 - **Tunnel d'hyperfocus maximal :** {hyperfocus_fmt} sur `{metric.max_hyperfocus_topic or 'Non défini'}`
 - **Fragmentation de l'attention :** {metric.context_switches_per_hour} changements de contexte / heure
 - **Ratio Exploration / Production :** {metric.read_vs_write_ratio}
 
-## 2. Répartition du Temps par Sujet
+### Répartition du Temps par Sujet
 {topics_table}
 
-## 3. Synthèse des Tunnels de Concentration
-{section_3_content.strip()}
-"""
-        with open(episodic_file, "w", encoding="utf-8") as f:
-            f.write(episodic_content)
+### Synthèse des Tunnels de Concentration
+{section_3_content.strip()}"""
+        episodic_file = write_journal_section(
+            date_str,
+            SECTION_TELEMETRY,
+            telemetry_section,
+            frontmatter_updates={
+                "total_screen_hours": round(metric.total_screen_sec / 3600.0, 2),
+                "active_production_hours": round(metric.active_production_sec / 3600.0, 2),
+                "passive_exploration_hours": round(metric.passive_exploration_sec / 3600.0, 2),
+                "max_hyperfocus_min": metric.max_hyperfocus_sec // 60,
+                "max_hyperfocus_topic": metric.max_hyperfocus_topic or "None",
+                "context_switches_per_hour": metric.context_switches_per_hour,
+                "read_vs_write_ratio": metric.read_vs_write_ratio,
+            },
+            source="screen_telemetry",
+        )
         logger.info("Journal épisodique généré : %s", episodic_file.name)
 
         # 3. Distillation ou enrichissement des fiches conceptuelles atomiques (seuil >= 45 min = 2700s)
@@ -1015,7 +1018,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
 ## 4. Tâches Kanban Prioritaires
 {kanban_block}
 """
-        bootloader_file.write_text(content, encoding="utf-8")
+        atomic_write_text(bootloader_file, content)
         logger.info("Context Bootloader généré avec succès : %s", bootloader_file.name)
 
         # Injection dédupliquée des Open Loops dans le Kanban (statut 'radar')
@@ -1102,7 +1105,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                 dates_to_process = sorted(
                     {
                         d for d in all_dates
-                        if not (settings.EPISODIC_DIR / f"{d.isoformat()}.md").exists() or d == max_date
+                        if not journal_has_section(d.isoformat(), SECTION_TELEMETRY) or d == max_date
                     }
                     | (set(getattr(self, "last_classified_dates", set())) & known)
                     | (pending_llm_dates & known if not self.cpu_only and llm_client.is_alive() else set())

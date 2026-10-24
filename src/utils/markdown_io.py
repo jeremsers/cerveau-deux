@@ -20,6 +20,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.config import normalize_to_macro_topic
+from src.utils.atomic_io import atomic_write_text
 
 logger = logging.getLogger("Exocortex.MarkdownIO")
 
@@ -473,8 +474,7 @@ def write_concept_file(note: ParsedConceptNote, target_path: Optional[Path] = No
     if dest is None:
         raise ValueError("Aucun chemin de fichier spécifié pour l'écriture de la note.")
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    content = serialize_concept_note(note)
-    dest.write_text(content, encoding="utf-8")
+    # Écriture réellement atomique (G6) : fichier temporaire puis os.replace
+    atomic_write_text(dest, serialize_concept_note(note))
     note.file_path = dest
     return dest

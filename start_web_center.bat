@@ -12,7 +12,7 @@ if %errorlevel% neq 0 (
 )
 
 echo ============================================================
-echo === EXOCORTEX // COGNITIVE COMMAND CENTER (v0.5.5 SOTA) ===
+echo === EXOCORTEX // COGNITIVE COMMAND CENTER (v0.5.6 SOTA) ===
 echo ===       Serveur Web FastAPI & Interface Web Moderne    ===
 echo ============================================================
 echo.

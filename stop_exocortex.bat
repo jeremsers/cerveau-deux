@@ -1,20 +1,18 @@
 @echo off
-title Arret des Demons Exocortex
+title Arret de l'Exocortex
 echo ============================================================
-echo ===         ARRET DES DEMONS EXOCORTEX EN COURS          ===
+echo ===            ARRET DE L'EXOCORTEX EN COURS             ===
 echo ============================================================
 echo.
 
-echo Recherche et arret des processus telemetry_daemon et hippocampus_hotkey...
+cd /d "%~dp0"
 
-wmic process where "commandline like '%%src.daemons.telemetry_daemon%%' and name like 'python%%'" call terminate >nul 2>nul
-wmic process where "commandline like '%%src.daemons.hippocampus_hotkey%%' and name like 'python%%'" call terminate >nul 2>nul
-
-powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*src.daemons.telemetry_daemon*' -or $_.CommandLine -like '*src.daemons.hippocampus_hotkey*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>nul
+:: v0.5.6 (E4) : arret propre. Les demons recoivent un signal (fichier stop_daemons.flag),
+:: sauvegardent la fenetre en cours puis s'arretent ; le serveur web et Streamlit sont
+:: ensuite arretes. Plus de dependance a wmic (absent de Windows 11 recents).
+python run_exocortex.py --stop
 
 echo.
-echo [OK] Tous les demons d'arriere-plan Exocortex ont ete arretes avec succes.
-echo Empreinte memoire et CPU liberees.
+echo [OK] Demons, serveur web et dashboard Exocortex arretes.
 echo.
 pause
-

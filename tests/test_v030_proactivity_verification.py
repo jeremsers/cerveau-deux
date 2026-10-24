@@ -307,6 +307,14 @@ def test_drift_guard_zapping_and_passive_detection(tmp_path: Path):
     )
 
     media_alert = None
+    # Spec v0.3.0 (rétablie en v0.5.6, audit E3) : la dérive média suit un tunnel de production
+    media_guard.record_switch(
+        timestamp=now - timedelta(minutes=1),
+        executable="code.exe",
+        window_title="night_consolidator.py - Visual Studio Code",
+        duration_sec=45 * 60,
+        input_intensity=0.8,
+    )
     # 10 blocs de 10 minutes sur YouTube avec input_intensity = 0.05 (< 0.15)
     for i in range(10):
         t = now + timedelta(minutes=i * 10)

@@ -235,6 +235,11 @@ class VaultDoctor:
                         # Suppression de callout abstract résiduel dans le corps
                         clean_body = re.sub(r'>\s*\[!abstract\]-[^\n]*\n(?:>[^\n]*\n)*', '', clean_body).strip()
                         note.body = clean_body
+                        # Les empreintes corrélées se trouvent aussi dans le bloc de télémétrie (v0.5.6)
+                        note.telemetry_lines = [
+                            line for line in note.telemetry_lines
+                            if not re.search(r"Requêtes et vidéos corrélées|\[youtube\]|\[google_search\]", line)
+                        ]
 
                         write_concept_file(note, fpath)
                         upgraded_notes += 1

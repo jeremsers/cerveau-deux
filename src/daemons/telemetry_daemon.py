@@ -43,6 +43,7 @@ from src.config import settings
 from src.daemons.git_ide_probe import GitIDEProbe
 from src.daemons.browser_telemetry_receiver import BrowserTelemetryServer
 from src.database.db_manager import DBManager, RawActivityRecord
+from src.utils.lifecycle import clear_stop_flag, stop_requested
 from src.utils.privacy import is_browser_executable, is_sensitive_window
 
 logger = logging.getLogger("Exocortex.TelemetryDaemon")
@@ -182,7 +183,10 @@ class DriftGuard:
         self.max_switches = max_switches_30min if max_switches_30min is not None else settings.DRIFT_MAX_SWITCHES_30MIN
         self.max_passive_min = max_passive_min if max_passive_min is not None else settings.DRIFT_MAX_PASSIVE_MIN
         self.cooldown_min = cooldown_min
-        self.history: deque = deque(maxlen=600)
+        self.min_production_tunnel_min = settings.DRIFT_MIN_PRODUCTION_TUNNEL_MIN
+        # Historique assez long pour voir le tunnel de production qui PRÉCÈDE la dérive média (E3)
+        self.retention_min = max(90, self.max_passive_min + settings.DRIFT_PRODUCTION_LOOKBACK_MIN)
+        self.history: deque = deque(maxlen=1200)
         self.last_alert_time: Optional[datetime] = None
 
     def record_switch(
@@ -209,9 +213,9 @@ class DriftGuard:
         }
         self.history.append(event)
 
-        # Nettoyage de l'historique au-delà de 90 minutes
-        cutoff_90m = timestamp - timedelta(minutes=90)
-        while self.history and self.history[0]["timestamp"] < cutoff_90m:
+        # Nettoyage de l'historique au-delà de la fenêtre de rétention
+        cutoff = timestamp - timedelta(minutes=self.retention_min)
+        while self.history and self.history[0]["timestamp"] < cutoff:
             self.history.popleft()
 
         # 1. Détection hyper_fragmentation (Zapping sur 30 min)
@@ -222,12 +226,19 @@ class DriftGuard:
 
         is_hyper_fragmented = (switch_count_30m >= self.max_switches and avg_dur_30m < 45.0)
 
-        # 2. Détection unplanned_media_hole (Dérive passive > seuil)
-        passive_media_sec = sum(
-            e["duration_sec"] for e in self.history if e["is_media"] and e["input_intensity"] < 0.15
-        )
+        # 2. Détection unplanned_media_hole : temps passif/média cumulé au-delà du seuil, mais
+        #    seulement s'il fait suite à un tunnel de production (E3). Une soirée film sans
+        #    travail préalable n'est pas une « dérive ».
+        passive_events = [e for e in self.history if e["is_media"] and e["input_intensity"] < 0.15]
+        passive_media_sec = sum(e["duration_sec"] for e in passive_events)
         passive_media_min = passive_media_sec / 60.0
-        is_media_hole = (passive_media_min >= self.max_passive_min)
+        first_passive_ts = min((e["timestamp"] for e in passive_events), default=timestamp)
+        production_before_sec = sum(
+            e["duration_sec"] for e in self.history
+            if not e["is_media"] and e["input_intensity"] >= 0.25 and e["timestamp"] <= first_passive_ts
+        )
+        has_prior_tunnel = production_before_sec >= self.min_production_tunnel_min * 60
+        is_media_hole = passive_media_min >= self.max_passive_min and has_prior_tunnel
 
         drift_type = None
         diagnostic = ""
@@ -601,6 +612,7 @@ class TelemetryDaemon:
         """Boucle de polling principale du démon."""
         polling_interval = interval_sec or settings.POLLING_INTERVAL_SEC
         self.running = True
+        clear_stop_flag()  # un signal d'arrêt resté d'une session précédente ne doit pas couper celle-ci
 
         if enable_browser_receiver:
             try:
@@ -613,6 +625,11 @@ class TelemetryDaemon:
         cycles = 0
         try:
             while self.running:
+                if stop_requested():
+                    # Arrêt propre demandé par stop_exocortex.bat (E4) : la fenêtre en cours est
+                    # sauvegardée par le bloc finally, ce que TerminateProcess ne permettrait pas
+                    logger.info("Signal d'arrêt propre reçu : sauvegarde de la fenêtre en cours.")
+                    break
                 self.step()
                 cycles += 1
                 if max_cycles and cycles >= max_cycles:

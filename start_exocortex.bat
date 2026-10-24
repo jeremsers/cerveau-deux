@@ -38,18 +38,18 @@ echo.
 echo [1/3] Demarrage silencieux du Demon de Telemetrie Temps Reel (Module 2)...
 start "" %PYTHONW_EXE% -m src.daemons.telemetry_daemon
 
-echo [2/3] Demarrage silencieux de l'Injecteur Hippocampe Alt+Espace (Module 5)...
+echo [2/3] Demarrage silencieux de l'Injecteur Hippocampe (Ctrl+Alt+Espace, Module 5)...
 start "" %PYTHONW_EXE% -m src.daemons.hippocampus_hotkey
 
-echo [3/3] Lancement du Dashboard Analytique Streamlit "Bandeur de Stats" (Module 6)...
+echo [3/3] Lancement du Command Center Web (interface principale depuis v0.5.0)...
 echo.
 echo Les demons d'arriere-plan tournent silencieusement (0 Mo VRAM, 0%% CPU au repos).
-echo Pour stopper les demons d'arriere-plan, executez 'stop_exocortex.bat'.
+echo Pour tout arreter proprement, executez 'stop_exocortex.bat'.
+echo Le dashboard Streamlit historique reste disponible : python run_exocortex.py --dashboard
 echo.
-echo Ouverture du tableau de bord dans votre navigateur...
+echo Ouverture du Command Center dans votre navigateur (http://127.0.0.1:8500)...
 echo ============================================================
 
-python -m streamlit run src/dashboard/app.py --server.headless=false --theme.base=dark
+python run_exocortex.py --web
 
 pause
-

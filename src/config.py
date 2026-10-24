@@ -351,12 +351,24 @@ class Settings(BaseModel):
         )
     )
 
+    # --- Injecteur Hippocampe (v0.5.6, E1) : syntaxe pynput GlobalHotKeys ---
+    HIPPOCAMPUS_HOTKEY: str = Field(
+        default_factory=lambda: os.getenv("HIPPOCAMPUS_HOTKEY", "<ctrl>+<alt>+<space>")
+    )
+
     # --- Détection Anti-Dérive / Rabbit Hole (v0.3.0 - Module 8) ---
     DRIFT_MAX_SWITCHES_30MIN: int = Field(
         default_factory=lambda: int(os.getenv("DRIFT_MAX_SWITCHES_30MIN", "25"))
     )
     DRIFT_MAX_PASSIVE_MIN: int = Field(
         default_factory=lambda: int(os.getenv("DRIFT_MAX_PASSIVE_MIN", "90"))
+    )
+    # Dérive média = temps passif APRÈS un tunnel de production (spec v0.3.0, audit E3)
+    DRIFT_MIN_PRODUCTION_TUNNEL_MIN: int = Field(
+        default_factory=lambda: int(os.getenv("DRIFT_MIN_PRODUCTION_TUNNEL_MIN", "30"))
+    )
+    DRIFT_PRODUCTION_LOOKBACK_MIN: int = Field(
+        default_factory=lambda: int(os.getenv("DRIFT_PRODUCTION_LOOKBACK_MIN", "60"))
     )
 
     # --- Listes Noires de Confidentialité (v0.5.2, D7) ---
@@ -503,6 +515,11 @@ class Settings(BaseModel):
     @property
     def BOOTLOADER_PATH(self) -> Path:
         return self.META_DIR / "00_BOOTLOADER_DEMAIN.md"
+
+    @property
+    def STOP_FLAG_PATH(self) -> Path:
+        """Fichier-signal d'arrêt propre des démons (v0.5.6, E4)."""
+        return self.SYSTEM_BUFFER_DIR / "stop_daemons.flag"
 
     @property
     def DRIFT_STATE_PATH(self) -> Path:

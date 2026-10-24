@@ -104,6 +104,7 @@ from src.consolidators.vault_doctor import (
     register_new_taxonomy_tag,
     scan_and_upgrade_existing_concepts,
 )
+from src.utils.episodic_journal import SECTION_AI_SESSIONS, write_journal_section
 from src.utils.markdown_io import (
     ConceptFrontmatter,
     ParsedConceptNote,
@@ -606,61 +607,38 @@ def generate_cold_start_episodic_journals(sessions: List[ReconstructedSession], 
                     )
                 )
 
-            # Génération de la note 01_Episodique/YYYY-MM-DD.md
-            episodic_file = settings.EPISODIC_DIR / f"{d_str}.md"
-            should_write = True
-            if episodic_file.exists():
-                try:
-                    f_content = episodic_file.read_text(encoding="utf-8")
-                    if 'origin: "takeout_cold_start"' not in f_content and 'origin: takeout_cold_start' not in f_content:
-                        should_write = False
-                except Exception:
-                    should_write = True
+            # Section « sessions IA » du journal unique (A10) : la section télémétrie écrite par la
+            # consolidation nocturne pour la même date est conservée, et inversement.
+            total_duration_fmt = f"{total_duration_min // 60}h{total_duration_min % 60:02d}" if total_duration_min >= 60 else f"{total_duration_min} min"
+            max_hf_fmt = f"{max_hf_min // 60}h{max_hf_min % 60:02d}" if max_hf_min >= 60 else f"{max_hf_min} min"
 
-            if should_write:
-                total_duration_fmt = f"{total_duration_min // 60}h{total_duration_min % 60:02d}" if total_duration_min >= 60 else f"{total_duration_min} min"
-                max_hf_fmt = f"{max_hf_min // 60}h{max_hf_min % 60:02d}" if max_hf_min >= 60 else f"{max_hf_min} min"
+            table_rows = []
+            for top_name, top_sec in sorted_topics:
+                cnt = topic_session_counts.get(top_name, 1)
+                t_min = top_sec // 60
+                table_rows.append(f"| `{top_name}` | {cnt} | {t_min} min |")
+            table_md = "\n".join(table_rows) if table_rows else "| `General` | 1 | 0 min |"
 
-                table_rows = []
-                for top_name, top_sec in sorted_topics:
-                    cnt = topic_session_counts.get(top_name, 1)
-                    t_min = top_sec // 60
-                    table_rows.append(f"| `{top_name}` | {cnt} | {t_min} min |")
-                table_md = "\n".join(table_rows) if table_rows else "| `General` | 1 | 0 min |"
+            sessions_md_lines = []
+            for s in day_sessions:
+                s_hm = s.timestamp_start.strftime("%H:%M")
+                e_hm = s.timestamp_end.strftime("%H:%M")
+                s_dur = compute_realistic_session_duration_min(s.turns)
+                s_meta = session_meta_map.get(s.session_id, {})
+                s_notes = s_meta.get("notes") or []
+                s_summary = s_meta.get("summary") or s.summary
 
-                sessions_md_lines = []
-                for s in day_sessions:
-                    s_hm = s.timestamp_start.strftime("%H:%M")
-                    e_hm = s.timestamp_end.strftime("%H:%M")
-                    s_dur = compute_realistic_session_duration_min(s.turns)
-                    s_meta = session_meta_map.get(s.session_id, {})
-                    s_notes = s_meta.get("notes") or []
-                    s_summary = s_meta.get("summary") or s.summary
+                if s_notes:
+                    note_slug = s_notes[0]
+                    link_target = f"[[{note_slug}]]"
+                    sessions_md_lines.append(f"- **{s_hm} - {e_hm}** ({s.turn_count} tours, {s_dur} min) — {link_target} : *{s_summary}*")
+                else:
+                    sessions_md_lines.append(f"- **{s_hm} - {e_hm}** ({s.turn_count} tours, {s_dur} min) — `{s.session_id}` : *{s_summary}*")
 
-                    if s_notes:
-                        note_slug = s_notes[0]
-                        link_target = f"[[{note_slug}]]"
-                        sessions_md_lines.append(f"- **{s_hm} - {e_hm}** ({s.turn_count} tours, {s_dur} min) — {link_target} : *{s_summary}*")
-                    else:
-                        sessions_md_lines.append(f"- **{s_hm} - {e_hm}** ({s.turn_count} tours, {s_dur} min) — `{s.session_id}` : *{s_summary}*")
+            sessions_md = "\n".join(sessions_md_lines)
 
-                sessions_md = "\n".join(sessions_md_lines)
-                topics_header_json = json.dumps([t[0] for t in sorted_topics], ensure_ascii=False)
-
-                ep_content = f"""---
-id: "{d_str.replace('-', '')}"
-date: "{d_str}"
-type: "episodic_journal"
-origin: "takeout_cold_start"
-total_reflection_min: {total_duration_min}
-sessions_count: {len(day_sessions)}
-top_topics: {topics_header_json}
----
-
-# Journal Épisodique — {d_str}
-
-## 1. Vue d'Ensemble & Télémétrie
-- **Temps total de réflexion / dialogue IA :** {total_duration_fmt}
+            ai_section = f"""## Sessions IA (Gemini)
+- **Temps total de réflexion / dialogue IA (estimé) :** {total_duration_fmt}
 - **Nombre de sessions cognitives :** {len(day_sessions)}
 - **Session d'hyperfocus maximale :** {max_hf_fmt} (`{max_topic}`)
 
@@ -669,11 +647,20 @@ top_topics: {topics_header_json}
 |---|---|---|
 {table_md}
 
-## 2. Sessions Cognitives Réalisées
-{sessions_md}
-"""
-                episodic_file.write_text(ep_content, encoding="utf-8")
-                generated_count += 1
+### Sessions Cognitives Réalisées
+{sessions_md}"""
+            write_journal_section(
+                d_str,
+                SECTION_AI_SESSIONS,
+                ai_section,
+                frontmatter_updates={
+                    "total_reflection_min": total_duration_min,
+                    "sessions_count": len(day_sessions),
+                    "top_topics": [t[0] for t in sorted_topics],
+                },
+                source="takeout_cold_start",
+            )
+            generated_count += 1
 
             pbar.update(1)
 

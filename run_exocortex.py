@@ -94,8 +94,8 @@ def run_compile_drive() -> None:
 
 
 def run_hotkey() -> None:
-    """Lance le listener global Alt+Espace (Injecteur Hippocampe)."""
-    logger.info("=== Lancement de l'Injecteur Hippocampe (Alt+Espace) ===")
+    """Lance l'injecteur Hippocampe (raccourci global configurable)."""
+    logger.info("=== Lancement de l'Injecteur Hippocampe (%s) ===", settings.HIPPOCAMPUS_HOTKEY)
     from src.daemons.hippocampus_hotkey import HippocampusInjector
 
     injector = HippocampusInjector()
@@ -125,9 +125,10 @@ def run_all() -> None:
     """
     Lance l'ensemble de l'écosystème Exocortex :
     1. Démon de télémétrie (processus séparé)
-    2. Démon de hotkey Alt+Espace (processus séparé)
-    3. Dashboard Streamlit (au premier plan)
-    Gère l'arrêt propre de tous les processus fils lors d'un Ctrl+C.
+    2. Injecteur Hippocampe (processus séparé)
+    3. Command Center Web (au premier plan) — interface principale depuis v0.5.0 ; le dashboard
+       Streamlit reste disponible via --dashboard (v0.5.6, G3)
+    Gère l'arrêt propre des démons (sauvegarde de la fenêtre en cours) lors d'un Ctrl+C.
     """
     logger.info("============================================================")
     logger.info("=== DÉMARRAGE DE LA SUITE COMPLÈTE EXOCORTEX & TÉLÉMÉTRIE ===")
@@ -145,32 +146,23 @@ def run_all() -> None:
     hotkey_cmd = [sys.executable, "-m", "src.daemons.hippocampus_hotkey"]
     p_hotkey = subprocess.Popen(hotkey_cmd, cwd=str(_PROJECT_ROOT))
     processes.append(p_hotkey)
-    logger.info("Injecteur Alt+Espace démarré (PID %d).", p_hotkey.pid)
+    logger.info("Injecteur Hippocampe démarré (PID %d, raccourci %s).", p_hotkey.pid, settings.HIPPOCAMPUS_HOTKEY)
 
-    # 3. Dashboard Streamlit (premier plan)
-    dashboard_script = _PROJECT_ROOT / "src" / "dashboard" / "app.py"
-    dashboard_cmd = [
-        sys.executable,
-        "-m",
-        "streamlit",
-        "run",
-        str(dashboard_script),
-        "--server.headless=false",
-        "--theme.base=dark",
-    ]
-
+    # 3. Command Center Web (premier plan)
     try:
-        logger.info("Lancement du Dashboard Streamlit...")
-        subprocess.run(dashboard_cmd, cwd=str(_PROJECT_ROOT))
+        run_web()
     except KeyboardInterrupt:
         logger.info("Interruption détectée, arrêt propre des démons...")
     finally:
+        from src.utils.lifecycle import clear_stop_flag, request_stop
+
+        request_stop()  # les démons sauvegardent leur fenêtre en cours puis sortent (E4)
         for p in processes:
             try:
-                p.terminate()
-                p.wait(timeout=3)
+                p.wait(timeout=10)
             except Exception:
                 p.kill()
+        clear_stop_flag()
         logger.info("Tous les démons Exocortex ont été arrêtés.")
 
 
@@ -328,6 +320,14 @@ def run_web(port: Optional[int] = None, host: Optional[str] = None) -> None:
     uvicorn.run("src.api.server:app", host=effective_host, port=effective_port, log_level="info")
 
 
+def run_stop() -> None:
+    """Arrête proprement les démons puis les interfaces de l'Exocortex (v0.5.6, E4)."""
+    from src.utils.lifecycle import stop_all
+
+    forced = stop_all()
+    logger.info("Exocortex arrêté (%d processus arrêté(s) de force après l'arrêt propre).", forced)
+
+
 def run_import_profile(reply_path: str) -> None:
     """Importe le profil cognitif produit par Gemini Web (livrable du mode web_manual, v0.5.3)."""
     from src.ingestors.takeout_ingestor import import_cognitive_profile
@@ -355,10 +355,11 @@ Exemples d'utilisation :
   python run_exocortex.py --daemon            # Démarre le démon de capture d'activité temps réel
   python run_exocortex.py --consolidate       # Exécute la consolidation nocturne bi-modèle
   python run_exocortex.py --compile-drive     # Met à jour les 4 méga-fichiers Google Drive Sync
-  python run_exocortex.py --hotkey            # Démarre l'écoute du raccourci global Alt+Espace
+  python run_exocortex.py --hotkey            # Démarre l'injecteur Hippocampe (Ctrl+Alt+Espace par défaut)
   python run_exocortex.py --dashboard         # Ouvre le dashboard Streamlit 'Bandeur de Stats'
   python run_exocortex.py --web               # Ouvre le Command Center Web moderne (FastAPI/Uvicorn)
-  python run_exocortex.py --all               # Lance démons de fond + dashboard au premier plan
+  python run_exocortex.py --all               # Lance démons de fond + Command Center Web au premier plan
+  python run_exocortex.py --stop              # Arrête proprement démons, serveur web et dashboard
   python run_exocortex.py --kanban-status     # Affiche l'état du Kanban et actualise AGENT_QUEUE.md
   python run_exocortex.py --next-task         # Dépile la tâche prête la plus prioritaire
   python run_exocortex.py --complete-task EXO-005  # Marque la tâche EXO-005 comme terminée
@@ -371,16 +372,17 @@ Exemples d'utilisation :
     group.add_argument("--daemon", action="store_true", help="Lance le démon de télémétrie temps réel Win32.")
     group.add_argument("--consolidate", action="store_true", help="Lance la consolidation nocturne bi-modèle.")
     group.add_argument("--compile-drive", action="store_true", help="Compile les 4 méga-documents Google Drive.")
-    group.add_argument("--hotkey", action="store_true", help="Lance le démon de raccourci global Alt+Espace.")
+    group.add_argument("--hotkey", action="store_true", help="Lance l'injecteur Hippocampe (raccourci HIPPOCAMPUS_HOTKEY).")
     group.add_argument("--dashboard", action="store_true", help="Lance le dashboard analytique Streamlit.")
     group.add_argument("--web", action="store_true", help="Lance le Web Command Center moderne (FastAPI/Uvicorn).")
-    group.add_argument("--all", action="store_true", help="Lance tous les démons d'arrière-plan et le dashboard.")
+    group.add_argument("--all", action="store_true", help="Lance les démons d'arrière-plan et le Command Center Web.")
     group.add_argument("--mcp-server", action="store_true", help="Lance le serveur MCP local conforme stdio.")
     group.add_argument("--kanban-status", action="store_true", help="Affiche l'état des tickets du Kanban et actualise AGENT_QUEUE.md.")
     group.add_argument("--next-task", action="store_true", help="Dépile et affiche la tâche la plus prioritaire prête pour l'agent codeur.")
     group.add_argument("--complete-task", type=str, metavar="TASK_ID", help="Marque une tâche comme terminée.")
     group.add_argument("--ingest-voice", action="store_true", help="Ingère et distille les mémos vocaux de voice_inbox/.")
     group.add_argument("--defrag-graph", action="store_true", help="Exécute le Sommeil Profond pour défragmenter les fiches redondantes.")
+    group.add_argument("--stop", action="store_true", help="Arrête proprement démons, serveur web et dashboard.")
     group.add_argument(
         "--import-profile",
         type=str,
@@ -429,6 +431,8 @@ Exemples d'utilisation :
         run_ingest_voice()
     elif args.defrag_graph:
         run_defrag_graph()
+    elif args.stop:
+        run_stop()
     elif args.import_profile:
         run_import_profile(args.import_profile)
 
