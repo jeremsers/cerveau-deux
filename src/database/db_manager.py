@@ -57,6 +57,9 @@ class DailyMetricRecord(BaseModel):
     context_switches_per_hour: float
     read_vs_write_ratio: float
     top_topics_json: str  # Dict serialisé en JSON : {"topic": secondes}
+    # Vrai si les valeurs sont des estimations (cold start Takeout : ratios fixes), et non des
+    # mesures de télémétrie (v0.5.5, A9)
+    is_estimated: bool = False
 
 
 class ChatSessionRecord(BaseModel):
@@ -94,6 +97,9 @@ class HistoricalFootprintRecord(BaseModel):
     cluster_id: Optional[str] = None
     semantic_topic: Optional[str] = None
     linked_gemini_session_id: Optional[str] = None
+    # Horodatage tel qu'il était stocké avant la conversion UTC -> heure locale (v0.5.5, A12) :
+    # la ligne correspondante est migrée au lieu d'être dupliquée lors d'une réingestion.
+    legacy_timestamp: Optional[datetime] = None
 
 
 class ProjectRecord(BaseModel):
@@ -124,6 +130,9 @@ class KanbanTaskRecord(BaseModel):
 # ==============================================================================
 # GESTIONNAIRE DE BASE DE DONNÉES SQLITE
 # ==============================================================================
+
+# Durée forfaitaire d'une session de chat quand aucune mesure n'existe (estimation, A9)
+ESTIMATED_MIN_PER_CHAT_SESSION = 10
 
 class DBManager:
     """Gestionnaire de persistance SQLite thread-safe configuré en mode WAL haute performance."""
@@ -394,6 +403,21 @@ class DBManager:
             )
             conn.execute("PRAGMA user_version = 2;")
 
+        if version < 3:
+            # Distinction mesures / estimations dans daily_metrics (A9). Les lignes du cold start
+            # Takeout (ratio lecture/écriture figé à 0,4, aucun signal OS) sont marquées estimées.
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(daily_metrics);").fetchall()]
+            if "is_estimated" not in columns:
+                conn.execute("ALTER TABLE daily_metrics ADD COLUMN is_estimated INTEGER NOT NULL DEFAULT 0;")
+            conn.execute(
+                """
+                UPDATE daily_metrics SET is_estimated = 1
+                WHERE read_vs_write_ratio = 0.4
+                  AND date NOT IN (SELECT DISTINCT DATE(timestamp_start) FROM raw_activity);
+                """
+            )
+            conn.execute("PRAGMA user_version = 3;")
+
     # ==========================================================================
     # INSERTIONS PAR LOTS (BATCH OPERATIONS)
     # ==========================================================================
@@ -507,16 +531,18 @@ class DBManager:
         user_prompt: str,
         ai_response: str,
         timestamp: Optional[datetime] = None,
+        turn_index: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Insère ou met à jour de façon idempotente un tour de conversation capturé en direct
         par le récepteur d'extension navigateur (v0.3.5 / EXO-011).
 
-        Déduplique sur le couple (session_id, user_prompt) :
-        - Si un message avec le même user_prompt existe déjà dans la session, met à jour
-          la réponse IA si elle a évolué, sans incrémenter turn_count.
-        - Sinon, ajoute le nouveau tour (turn_index = len(messages)) et incrémente turn_count
-          dans chat_sessions.
+        Déduplication (v0.5.5, A14) :
+        - turn_index fourni (rang du tour dans la conversation, envoyé par l'extension 0.5.5+) :
+          le tour est identifié par (session_id, turn_index). Deux prompts identiques à des rangs
+          différents (deux « continue ») sont deux tours distincts.
+        - turn_index absent (extension antérieure) : repli sur la déduplication par texte de prompt.
+        Le nombre de tours et de caractères de la session est recalculé depuis chat_messages.
         """
         now_dt = timestamp or datetime.now()
         ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -526,96 +552,83 @@ class DBManager:
         u_chars = len(clean_prompt)
 
         with self.get_connection() as conn:
-            # 1. Vérifier si la session existe
-            cur_sess = conn.execute(
-                "SELECT session_id, turn_count, user_char_count FROM chat_sessions WHERE session_id = ?;",
-                (session_id,),
-            )
-            sess_row = cur_sess.fetchone()
-
-            # 2. Récupérer les messages existants pour cette session
-            cur_msgs = conn.execute(
+            sess_row = conn.execute(
+                "SELECT session_id FROM chat_sessions WHERE session_id = ?;", (session_id,)
+            ).fetchone()
+            existing_msgs = conn.execute(
                 """
                 SELECT turn_index, user_prompt, ai_response, timestamp, user_char_count
                 FROM chat_messages WHERE session_id = ? ORDER BY turn_index ASC;
                 """,
                 (session_id,),
-            )
-            existing_msgs = cur_msgs.fetchall()
+            ).fetchall()
 
-            # 3. Déduplication par prompt
-            for row in existing_msgs:
-                t_idx, existing_prompt, existing_ai = row[0], row[1], row[2]
-                if existing_prompt.strip() == clean_prompt:
-                    if existing_ai.strip() != clean_response and clean_response:
-                        conn.execute(
-                            "UPDATE chat_messages SET ai_response = ? WHERE session_id = ? AND turn_index = ?;",
-                            (clean_response, session_id, t_idx),
-                        )
-                        conn.execute(
-                            "UPDATE chat_sessions SET timestamp_end = ? WHERE session_id = ?;",
-                            (ts_str, session_id),
-                        )
-                        return {
-                            "session_id": session_id,
-                            "turn_index": t_idx,
-                            "status": "updated",
-                            "is_new": False,
-                        }
-                    return {
-                        "session_id": session_id,
-                        "turn_index": t_idx,
-                        "status": "duplicate",
-                        "is_new": False,
-                    }
+            # 1. Recherche du tour déjà connu : par rang si fourni, sinon par texte de prompt
+            if turn_index is not None:
+                match = next((r for r in existing_msgs if r[0] == turn_index), None)
+            else:
+                match = next((r for r in existing_msgs if r[1].strip() == clean_prompt), None)
 
-            # 4. Nouveau tour de conversation
-            new_turn_index = len(existing_msgs)
-            conn.execute(
-                """
-                INSERT INTO chat_messages (
-                    session_id, turn_index, timestamp, user_prompt, ai_response, user_char_count
-                ) VALUES (?, ?, ?, ?, ?, ?);
-                """,
-                (session_id, new_turn_index, ts_str, clean_prompt, clean_response, u_chars),
-            )
+            if match is not None:
+                t_idx, existing_prompt, existing_ai = match[0], match[1], match[2]
+                changed_prompt = existing_prompt.strip() != clean_prompt
+                changed_ai = bool(clean_response) and existing_ai.strip() != clean_response
+                if not (changed_prompt or changed_ai):
+                    return {"session_id": session_id, "turn_index": t_idx, "status": "duplicate", "is_new": False}
+                conn.execute(
+                    """
+                    UPDATE chat_messages SET user_prompt = ?, ai_response = ?, user_char_count = ?
+                    WHERE session_id = ? AND turn_index = ?;
+                    """,
+                    (clean_prompt, clean_response or existing_ai, u_chars, session_id, t_idx),
+                )
+                status, is_new, result_index = "updated", False, t_idx
+            else:
+                # 2. Nouveau tour : rang fourni, sinon à la suite des tours existants
+                result_index = turn_index if turn_index is not None else (
+                    max((r[0] for r in existing_msgs), default=-1) + 1
+                )
+                conn.execute(
+                    """
+                    INSERT INTO chat_messages (
+                        session_id, turn_index, timestamp, user_prompt, ai_response, user_char_count
+                    ) VALUES (?, ?, ?, ?, ?, ?);
+                    """,
+                    (session_id, result_index, ts_str, clean_prompt, clean_response, u_chars),
+                )
+                status, is_new = "created", True
 
-            # 5. Création ou mise à jour de la session parent
+            # 3. Session parente : créée si absente (y compris messages orphelins d'avant v0.5.1),
+            #    compteurs toujours recalculés depuis chat_messages
             if not sess_row:
-                # Si des messages orphelins existent (session effacée avant v0.5.1), la session
-                # est reconstruite à partir d'eux au lieu de repartir à 1 tour.
-                prior_turns = len(existing_msgs)
-                prior_chars = sum(int(r[4] or 0) for r in existing_msgs)
-                start_ts = str(existing_msgs[0][3]) if existing_msgs else ts_str
-                initial_summary = (existing_msgs[0][1].strip() if existing_msgs else clean_prompt)[:140]
+                first = existing_msgs[0] if existing_msgs else None
                 conn.execute(
                     """
                     INSERT INTO chat_sessions (
                         session_id, timestamp_start, timestamp_end, turn_count,
                         user_char_count, extracted_topics_json, generated_notes_json,
                         summary, distillation_status
-                    ) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, 'pending');
+                    ) VALUES (?, ?, ?, 0, 0, '[]', '[]', ?, 'pending');
                     """,
-                    (session_id, start_ts, ts_str, prior_turns + 1, prior_chars + u_chars, initial_summary),
+                    (
+                        session_id,
+                        str(first[3]) if first else ts_str,
+                        ts_str,
+                        (first[1].strip() if first else clean_prompt)[:140],
+                    ),
                 )
-            else:
-                conn.execute(
-                    """
-                    UPDATE chat_sessions
-                    SET timestamp_end = ?,
-                        turn_count = turn_count + 1,
-                        user_char_count = user_char_count + ?
-                    WHERE session_id = ?;
-                    """,
-                    (ts_str, u_chars, session_id),
-                )
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET timestamp_end = ?,
+                    turn_count = (SELECT COUNT(*) FROM chat_messages WHERE session_id = ?),
+                    user_char_count = (SELECT COALESCE(SUM(user_char_count), 0) FROM chat_messages WHERE session_id = ?)
+                WHERE session_id = ?;
+                """,
+                (ts_str, session_id, session_id, session_id),
+            )
 
-        return {
-            "session_id": session_id,
-            "turn_index": new_turn_index,
-            "status": "created",
-            "is_new": True,
-        }
+        return {"session_id": session_id, "turn_index": result_index, "status": status, "is_new": is_new}
 
     def get_completed_session_ids_from_db(self) -> Set[str]:
         """Retourne l'ensemble des session_id déjà traitées avec succès ou bruit consolidé."""
@@ -651,7 +664,29 @@ class DBManager:
             )
             for f in footprints
         ]
+        # Lignes stockées avant v0.5.5 avec l'heure UTC brute : migrées vers l'heure locale en
+        # conservant id, cluster, topic et rattachement ; un doublon éventuel est supprimé (A12)
+        legacy = [
+            (
+                f.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                f.source,
+                f.legacy_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                f.title_or_query,
+            )
+            for f in footprints
+            if f.legacy_timestamp and f.legacy_timestamp != f.timestamp
+        ]
         with self.get_connection() as conn:
+            if legacy:
+                conn.executemany(
+                    "UPDATE OR IGNORE historical_footprints SET timestamp = ? "
+                    "WHERE source = ? AND timestamp = ? AND title_or_query = ?;",
+                    legacy,
+                )
+                conn.executemany(
+                    "DELETE FROM historical_footprints WHERE source = ? AND timestamp = ? AND title_or_query = ?;",
+                    [(src, old_ts, title) for _, src, old_ts, title in legacy],
+                )
             conn.executemany(sql, payload)
         return len(footprints)
 
@@ -694,8 +729,8 @@ class DBManager:
             INSERT OR REPLACE INTO daily_metrics (
                 date, total_screen_sec, active_production_sec, passive_exploration_sec,
                 max_hyperfocus_sec, max_hyperfocus_topic, context_switches_per_hour,
-                read_vs_write_ratio, top_topics_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                read_vs_write_ratio, top_topics_json, is_estimated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         with self.get_connection() as conn:
             conn.execute(
@@ -710,6 +745,7 @@ class DBManager:
                     metric.context_switches_per_hour,
                     metric.read_vs_write_ratio,
                     metric.top_topics_json,
+                    1 if metric.is_estimated else 0,
                 ),
             )
 
@@ -1286,8 +1322,8 @@ class DBManager:
             total_turns = total_turns or 0
             total_chars = total_chars or 0
 
-            # Heures estimées Gemini (10 min par session en moyenne)
-            chat_hours = round((chat_count * 10) / 60.0, 1)
+            # Heures Gemini : ESTIMATION forfaitaire (10 min par session), signalée comme telle (A9)
+            chat_hours = round((chat_count * ESTIMATED_MIN_PER_CHAT_SESSION) / 60.0, 1)
 
             # 2. Total raw activity
             cur = conn.execute(
@@ -1317,7 +1353,7 @@ class DBManager:
             )
             row_avg = cur.fetchone()
             avg_switch_rate = round(row_avg[0], 2) if row_avg and row_avg[0] is not None else 0.0
-            avg_read_ratio = round(row_avg[1], 2) if row_avg and row_avg[1] is not None else 0.4
+            avg_read_ratio = round(row_avg[1], 2) if row_avg and row_avg[1] is not None else None
 
             cur = conn.execute(
                 """
@@ -1339,6 +1375,7 @@ class DBManager:
         return {
             "chat_count": chat_count,
             "chat_hours": chat_hours,
+            "chat_hours_is_estimated": True,
             "total_turns": total_turns,
             "total_chars": total_chars,
             "raw_count": raw_count,
@@ -1413,7 +1450,8 @@ class DBManager:
                 except Exception:
                     topics = []
                 if not topics:
-                    topics = ["Dev_et_Architecture_Tech"]
+                    # Session sans topic distillé : comptée « Non_Classe », pas « Dev » (A9)
+                    topics = ["Non_Classe"]
                 for top in topics:
                     records.append({
                         "timestamp": ts,

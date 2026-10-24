@@ -9,9 +9,10 @@ import html
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,9 @@ class ParsedTurn(BaseModel):
     ai_response: str = ""
     user_char_count: int = 0
     url: Optional[str] = None
+    # Heure telle qu'écrite dans l'export (UTC pour le JSON) : base des identifiants synthétiques,
+    # pour qu'ils restent identiques avant et après la conversion de fuseau de v0.5.5 (A12)
+    source_timestamp: Optional[datetime] = None
 
 
 class ReconstructedSession(BaseModel):
@@ -110,39 +114,81 @@ FRENCH_MONTH_MAP = {
     "sept": "Sep", "oct": "Oct", "nov": "Nov", "déc": "Dec", "dec": "Dec",
 }
 
-def parse_date_flexible(raw_date: str) -> Optional[datetime]:
-    """Parse de manière robuste une date Takeout (français, anglais, ISO 8601)."""
+# Abréviations de fuseau signifiant UTC ; toute autre abréviation (CET, CEST…) ou son absence
+# désigne l'heure locale, celle des exports HTML de Takeout (v0.5.5, A12).
+_UTC_ABBREVIATIONS = {"UTC", "GMT", "Z"}
+
+
+def _local_tz() -> tzinfo:
+    try:
+        return ZoneInfo(settings.LOCAL_TIMEZONE)
+    except Exception:
+        return datetime.now().astimezone().tzinfo  # fuseau du système en repli
+
+
+def to_local_naive(dt: datetime) -> datetime:
+    """Convertit une date (aware) en heure locale naïve ; une date naïve est supposée déjà locale."""
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(_local_tz()).replace(tzinfo=None)
+
+
+def parse_date_pair(raw_date: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Parse une date Takeout (français, anglais, ISO 8601) et retourne (heure_locale, heure_littérale) :
+    - heure_locale : date naïve en LOCAL_TIMEZONE, celle qui est stockée en base ;
+    - heure_littérale : date naïve telle qu'écrite dans l'export (UTC pour les JSON), qui sert à
+      dériver des identifiants stables et à retrouver les lignes stockées avant v0.5.5.
+    """
     if not raw_date:
-        return None
+        return None, None
     s = raw_date.strip()
 
     # Remplacement des mois français
     for fr, en in FRENCH_MONTH_MAP.items():
         s = re.sub(rf"\b{fr}\.?", en, s, flags=re.IGNORECASE)
 
-    # Nettoyage des suffixes de fuseau horaire textuels (CEST, CET, UTC, etc.)
-    s_cleaned = re.sub(r"\s+[A-Z]{3,4}$", "", s).strip()
+    # Suffixe de fuseau textuel (CEST, CET, UTC, GMT…)
+    m_abbr = re.search(r"\s+([A-Z]{3,4})$", s)
+    abbr = m_abbr.group(1) if m_abbr else None
+    s_cleaned = s[: m_abbr.start()].strip() if m_abbr else s
 
-    formats = [
-        "%d %b %Y, %H:%M:%S",
-        "%d %b %Y %H:%M:%S",
-        "%d %B %Y, %H:%M:%S",
-        "%b %d, %Y, %I:%M:%S %p",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    for fmt in formats:
+    literal: Optional[datetime] = None
+    is_utc = abbr in _UTC_ABBREVIATIONS
+    for fmt, utc_fmt in [
+        ("%d %b %Y, %H:%M:%S", False),
+        ("%d %b %Y %H:%M:%S", False),
+        ("%d %B %Y, %H:%M:%S", False),
+        ("%b %d, %Y, %I:%M:%S %p", False),
+        ("%Y-%m-%dT%H:%M:%S.%fZ", True),
+        ("%Y-%m-%dT%H:%M:%SZ", True),
+        ("%Y-%m-%d %H:%M:%S", False),
+    ]:
         try:
-            return datetime.strptime(s_cleaned, fmt)
+            literal = datetime.strptime(s_cleaned, fmt)
+            is_utc = is_utc or utc_fmt
+            break
         except ValueError:
             pass
 
-    try:
-        from dateutil import parser
-        return parser.parse(s)
-    except Exception:
-        return None
+    if literal is None:
+        try:
+            from dateutil import parser
+            parsed = parser.parse(s)
+        except Exception:
+            return None, None
+        literal = parsed.replace(tzinfo=None)
+        if parsed.tzinfo is not None:
+            return to_local_naive(parsed), literal
+
+    if is_utc:
+        return to_local_naive(literal.replace(tzinfo=timezone.utc)), literal
+    return literal, literal
+
+
+def parse_date_flexible(raw_date: str) -> Optional[datetime]:
+    """Parse une date Takeout et la retourne en heure locale naïve (UTC converti, v0.5.5)."""
+    return parse_date_pair(raw_date)[0]
 
 
 # ==============================================================================
@@ -186,7 +232,7 @@ def parse_gemini_html(file_path: Path) -> List[ParsedTurn]:
         rest = body_html[m_prompt.end():]
         m_date = re.search(r"^(.*?)(?:<br\s*/?>)", rest.strip(), re.DOTALL)
         date_str = m_date.group(1).strip() if m_date else ""
-        parsed_dt = parse_date_flexible(date_str)
+        parsed_dt, source_dt = parse_date_pair(date_str)
         if not parsed_dt:
             if last_valid_dt:
                 parsed_dt = last_valid_dt
@@ -212,6 +258,7 @@ def parse_gemini_html(file_path: Path) -> List[ParsedTurn]:
                 ai_response=response_text,
                 user_char_count=len(user_prompt),
                 url=url,
+                source_timestamp=source_dt or parsed_dt,
             )
         )
 
@@ -242,7 +289,7 @@ def parse_gemini_json(file_path: Path) -> List[ParsedTurn]:
             continue
 
         time_str = item.get("time", "")
-        parsed_dt = parse_date_flexible(time_str)
+        parsed_dt, source_dt = parse_date_pair(time_str)
         if not parsed_dt:
             if last_valid_dt:
                 parsed_dt = last_valid_dt
@@ -265,6 +312,7 @@ def parse_gemini_json(file_path: Path) -> List[ParsedTurn]:
                 ai_response=item.get("response", ""),
                 user_char_count=len(user_prompt),
                 url=url,
+                source_timestamp=source_dt or parsed_dt,
             )
         )
 
@@ -291,7 +339,7 @@ def parse_youtube_export(file_path: Path) -> List[HistoricalFootprintRecord]:
             title_clean = re.sub(r"^A regardé\s+", "", title).strip()
             url = item.get("titleUrl")
             time_str = item.get("time", "")
-            dt = parse_date_flexible(time_str)
+            dt, source_dt = parse_date_pair(time_str)
             if not dt:
                 if last_valid_dt:
                     dt = last_valid_dt
@@ -309,6 +357,7 @@ def parse_youtube_export(file_path: Path) -> List[HistoricalFootprintRecord]:
                     title_or_query=title_clean,
                     url=url,
                     channel_or_domain=channel,
+                    legacy_timestamp=source_dt if source_dt and source_dt != dt else None,
                 )
             )
     else:
@@ -365,7 +414,7 @@ def parse_google_search_export(file_path: Path) -> List[HistoricalFootprintRecor
                 continue
             url = item.get("titleUrl")
             time_str = item.get("time", "")
-            dt = parse_date_flexible(time_str)
+            dt, source_dt = parse_date_pair(time_str)
             if not dt:
                 if last_valid_dt:
                     dt = last_valid_dt
@@ -378,6 +427,7 @@ def parse_google_search_export(file_path: Path) -> List[HistoricalFootprintRecor
                     timestamp=dt,
                     title_or_query=query,
                     url=url,
+                    legacy_timestamp=source_dt if source_dt and source_dt != dt else None,
                 )
             )
     else:
@@ -447,7 +497,8 @@ def sessionize_gemini_turns(
                 or current_synth_thread is None
                 or (turn.timestamp - last_global_ts).total_seconds() > inactivity_threshold_min * 60
             ):
-                current_synth_thread = f"synth_{turn.timestamp.strftime('%Y%m%d_%H%M%S')}"
+                id_ts = turn.source_timestamp or turn.timestamp
+                current_synth_thread = f"synth_{id_ts.strftime('%Y%m%d_%H%M%S')}"
             threads_map.setdefault(current_synth_thread, []).append(turn)
             last_global_ts = turn.timestamp
 
@@ -482,7 +533,8 @@ def sessionize_gemini_turns(
             if len(sub_sessions) == 1:
                 final_sid = thread_key
             else:
-                final_sid = f"{thread_key}_s{sub_idx:02d}_{start_time.strftime('%Y%m%d')}"
+                id_start = sub_turns[0].source_timestamp or start_time
+                final_sid = f"{thread_key}_s{sub_idx:02d}_{id_start.strftime('%Y%m%d')}"
 
             sess_obj = ReconstructedSession(
                 session_id=final_sid,

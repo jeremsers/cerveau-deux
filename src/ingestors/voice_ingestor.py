@@ -245,11 +245,13 @@ class VoiceIngestor:
             updated_at=date_str,
             total_time_invested_min=15,
             summary_1_line=summary_1_line,
+            # Forfait de 15 min par mémo, pas une mesure (A9)
+            time_is_estimated=True,
         )
 
         telemetry_lines = [
             "> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)",
-            "> - **Temps estimé sur ce sujet :** 15m",
+            "> - **Temps estimé sur ce sujet :** 15m (forfait mémo vocal, non mesuré)",
             "> - **Sources épisodiques :**",
             f">   - Mémo vocal `{audio_path.name}` ({dt.strftime('%Y-%m-%d %H:%M')})",
             "> - **Connexions sémantiques :**",

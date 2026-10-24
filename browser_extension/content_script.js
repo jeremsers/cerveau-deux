@@ -118,8 +118,8 @@
       }
     }
 
-    for (const turn of turns) {
-      const key = `${sessionId}_${simpleHash(turn.user_prompt)}_${simpleHash(turn.ai_response)}`;
+    turns.forEach((turn, turnIndex) => {
+      const key = `${sessionId}_${turnIndex}_${simpleHash(turn.user_prompt)}_${simpleHash(turn.ai_response)}`;
       if (!sentTurnHashes.has(key)) {
         sentTurnHashes.add(key);
         chrome.runtime.sendMessage({
@@ -127,13 +127,15 @@
           payload: {
             platform: platform,
             session_id: sessionId,
+            // Rang du tour dans la conversation : deux prompts identiques restent deux tours (v0.5.5)
+            turn_index: turnIndex,
             user_prompt: turn.user_prompt,
             ai_response: turn.ai_response,
             url: window.location.href,
           },
         });
       }
-    }
+    });
   }
 
   // MutationObserver debouncé pour suivre l'arrivée de nouveaux messages

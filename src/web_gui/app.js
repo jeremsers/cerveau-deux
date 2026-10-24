@@ -349,7 +349,8 @@ async function loadTimelineForDate(dateStr) {
     const totalSec = metric.total_active_sec || 0;
     const hrs = Math.floor(totalSec / 3600);
     const mins = Math.floor((totalSec % 3600) / 60);
-    document.getElementById("kpi-total-time").innerText = `${hrs}h ${mins}m`;
+    // Journée issue du cold start Takeout : valeurs estimées, signalées comme telles (A9)
+    document.getElementById("kpi-total-time").innerText = `${hrs}h ${mins}m${metric.is_estimated ? " (estimé)" : ""}`;
     document.getElementById("kpi-tunnels-count").innerText = metric.hyperfocus_tunnel_count || 0;
     document.getElementById("kpi-gemini-turns").innerText = metric.total_chat_turns || 0;
 

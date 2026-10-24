@@ -260,7 +260,10 @@ def render_dashboard() -> None:
         st.metric(
             label="Temps Total Traqué",
             value=f"{kpis['total_tracked_hours']} h",
-            help="Cumul de l'activité OS locale et des sessions de réflexion Gemini.",
+            help=(
+                "Cumul de l'activité OS mesurée et du temps de chat ESTIMÉ "
+                f"({kpis['chat_hours']} h, forfait de 10 min par session)."
+            ),
         )
     with col2:
         st.metric(

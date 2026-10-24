@@ -6,6 +6,8 @@ Définit les chemins d'accès, seuils matériels VRAM, paramètres d'inférence 
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -63,6 +65,54 @@ def normalize_cognitive_mode(mode: Optional[str]) -> str:
     """Ramène un mode inconnu ou NULL à 'non_classe' (jamais à un mode arbitraire)."""
     return mode if mode in COGNITIVE_MODES else UNCLASSIFIED_MODE
 
+
+
+# Règles ordonnées de normalisation (première catégorie gagnante). Un mot-clé correspond à un
+# mot entier du tag ; une racine d'au moins 5 lettres correspond aussi en préfixe (« psycho » ->
+# « psychotherapie ») ; un mot-clé à plusieurs mots est cherché comme expression.
+_TOPIC_KEYWORD_RULES = [
+    ("Musique_MAO_et_Culture_Pop", ["suno", "mao", "musique", "ableton", "kpop", "k pop", "anime", "manga", "webtoon", "popculture", "cinema", "serie", "culture"]),
+    ("HomeLab_et_Hardware", ["homelab", "docker", "riven", "plex", "debrid", "hardware", "nas", "pc", "handheld", "console", "routeur", "dns"]),
+    ("IA_et_LLM_Local", ["rag", "llm", "gguf", "vram", "ollama", "agent", "prompt", "fine tuning", "embedding", "gpt", "gemini", "claude"]),
+    ("Dev_et_Architecture_Tech", ["astro", "react", "typescript", "python", "backend", "frontend", "api", "sqlite", "lancedb", "css", "tailwind", "devops", "git", "web", "cloud"]),
+    ("Marketing_et_Acquisition", ["ads", "marketing", "ga4", "gtm", "seo", "sea", "copywriting", "cro", "stripe", "brevo", "make", "tunnel", "acquisition"]),
+    ("Freelance_et_Carriere", ["freelance", "tarification", "client", "commercial", "carriere", "openclassrooms", "france travail", "emploi", "cv", "stage", "prospection"]),
+    ("Admin_Finance_et_Droit", ["mdph", "aah", "rsdae", "droit", "juridique", "fiscal", "impot", "immobilier", "patrimoine", "finance", "litige", "suisse", "caf", "banque"]),
+    ("Introspection_et_Neuroatypie", ["neuro", "hpi", "tsa", "tdah", "audhd", "autis", "masking", "monotropism", "ados", "cra", "psycho", "metacognit", "introspection", "atypie"]),
+    ("Sante_et_Pharmacologie", ["sante", "medical", "dentaire", "sommeil", "apnee", "pharmaco", "vapo", "vaporis", "cannab", "weed", "cbd", "thc", "ordonnance", "therap"]),
+    ("Nutrition_et_Cuisine", ["nutrition", "cuisine", "volume eating", "eating", "calorie", "repas", "cuiseur", "riz", "creami", "glycem", "recette", "aliment", "gastronomie"]),
+    ("Philo_et_Epistemologie", ["philo", "spinoza", "camus", "absurd", "epistemol", "ethique", "logique", "metaphys", "physique", "morale"]),
+    ("Sociologie_et_Geopolitique", ["sociol", "geopolit", "politique", "economie", "demograph", "ideolog", "societe", "histoire"]),
+    ("MMORPG_et_Esport", ["mmorpg", "warcraft", "wow", "mythic", "raid", "guilde", "guild wars", "tft", "league of legends", "esport", "theorycraft"]),
+    ("Gaming_et_GameDesign", ["gaming", "game", "modding", "emulat", "rpg", "jdr", "steam", "switch", "jeu", "jeux"]),
+    ("Chefferie_Projet_et_Produit", ["projet", "produit", "product", "mvp", "ux", "ui", "soutenance", "agile", "scrum", "cadrage"]),
+]
+# Mots-clés de 5 lettres ou plus qui ne doivent PAS correspondre en préfixe (ambigus)
+_EXACT_ONLY_KEYWORDS = {"switch"}
+
+
+def _fold(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in norm if not unicodedata.combining(c)).lower()
+
+
+def _topic_tokens(tag: str) -> List[str]:
+    """Mots d'un tag : découpage sur _ - . / espaces et sur les frontières CamelCase."""
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", tag)
+    words = [w for w in re.split(r"[_\-\s/.,]+", _fold(tag)) if w]
+    camel_words = [w for w in re.split(r"[_\-\s/.,]+", _fold(camel_split)) if w]
+    # Mots du tag puis sous-mots CamelCase (« HomeLab » donne « homelab », « home » et « lab »)
+    return words + [w for w in camel_words if w not in words]
+
+
+def _keyword_matches(keyword: str, tokens: List[str]) -> bool:
+    parts = _fold(keyword).split()
+    if len(parts) > 1:
+        return f" {' '.join(parts)} " in f" {' '.join(tokens)} "
+    kw = parts[0]
+    if len(kw) >= 5 and kw not in _EXACT_ONLY_KEYWORDS:
+        return any(t == kw or t.startswith(kw) for t in tokens)
+    return kw in tokens
 
 def normalize_to_macro_topic(raw_topic: str) -> str:
     """
@@ -123,53 +173,12 @@ def normalize_to_macro_topic(raw_topic: str) -> str:
     if clean in EXACT_MAPPINGS:
         return EXACT_MAPPINGS[clean]
 
-    # Analyse par préfixes et motifs réguliers
-    low = clean.lower()
-
-    if any(k in low for k in ["suno", "mao", "musique", "ableton", "kpop", "k-pop", "anime", "manga", "webtoon", "popculture", "cinema", "serie", "culture"]):
-        return "Musique_MAO_et_Culture_Pop"
-
-    if any(k in low for k in ["homelab", "docker", "riven", "plex", "debrid", "hardware", "nas", "pc", "handheld", "console", "routeur", "dns"]):
-        return "HomeLab_et_Hardware"
-
-    if any(k in low for k in ["rag", "llm", "gguf", "vram", "ollama", "agent", "prompt", "fine-tuning", "embedding", "gpt", "gemini", "claude"]):
-        return "IA_et_LLM_Local"
-
-    if any(k in low for k in ["astro", "react", "typescript", "python", "backend", "frontend", "api", "sqlite", "lancedb", "css", "tailwind", "devops", "git", "web", "cloud"]):
-        return "Dev_et_Architecture_Tech"
-
-    if any(k in low for k in ["ads", "marketing", "ga4", "gtm", "seo", "sea", "copywriting", "cro", "stripe", "brevo", "make", "tunnel", "acquisition"]):
-        return "Marketing_et_Acquisition"
-
-    if any(k in low for k in ["freelance", "tarification", "client", "commercial", "carriere", "openclassrooms", "france travail", "emploi", "cv", "stage", "prospection"]):
-        return "Freelance_et_Carriere"
-
-    if any(k in low for k in ["mdph", "aah", "rsdae", "droit", "juridique", "fiscal", "impot", "immobilier", "patrimoine", "finance", "litige", "suisse", "caf", "banque"]):
-        return "Admin_Finance_et_Droit"
-
-    if any(k in low for k in ["neuro", "hpi", "tsa", "tdah", "audhd", "autis", "masking", "monotropism", "ados", "cra", "psycho", "metacognit", "introspection", "atypie"]):
-        return "Introspection_et_Neuroatypie"
-
-    if any(k in low for k in ["sante", "santé", "medical", "dentaire", "sommeil", "apnee", "apnée", "pharmaco", "vapo", "cannab", "weed", "cbd", "thc", "ordonnance"]):
-        return "Sante_et_Pharmacologie"
-
-    if any(k in low for k in ["nutrition", "cuisine", "volume", "eating", "calorie", "repas", "cuiseur", "riz", "creami", "glycem", "recette", "aliment", "gastronomie"]):
-        return "Nutrition_et_Cuisine"
-
-    if any(k in low for k in ["philo", "spinoza", "camus", "absurd", "epistemol", "ethique", "logique", "metaphys", "physique", "morale"]):
-        return "Philo_et_Epistemologie"
-
-    if any(k in low for k in ["sociol", "geopolit", "politique", "economie", "demograph", "ideolog", "societe", "société", "histoire"]):
-        return "Sociologie_et_Geopolitique"
-
-    if any(k in low for k in ["mmorpg", "warcraft", "wow", "mythic", "raid", "guilde", "guild wars", "tft", "league of legends", "esport", "theorycraft"]):
-        return "MMORPG_et_Esport"
-
-    if any(k in low for k in ["gaming", "game", "modding", "emulat", "rpg", "jdr", "steam", "switch", "jeu"]):
-        return "Gaming_et_GameDesign"
-
-    if any(k in low for k in ["projet", "produit", "product", "mvp", "ux", "ui", "soutenance", "agile", "scrum", "cadrage"]):
-        return "Chefferie_Projet_et_Produit"
+    # Analyse par MOTS ENTIERS (v0.5.5, B17) : « Psychotherapie » ne tombe plus dans Dev à cause
+    # de « api », ni « Enjeux_Climatiques » dans Gaming à cause de « jeu ».
+    tokens = _topic_tokens(clean)
+    for topic, keywords in _TOPIC_KEYWORD_RULES:
+        if any(_keyword_matches(kw, tokens) for kw in keywords):
+            return topic
 
     return "A_Trier"
 
@@ -398,6 +407,21 @@ class Settings(BaseModel):
 
     PROLONGED_SESSION_THRESHOLD_SEC: int = Field(
         default_factory=lambda: int(os.getenv("PROLONGED_SESSION_THRESHOLD_SEC", "180"))
+    )
+    # Inactivité au-delà de laquelle la fenêtre en cours est close (v0.5.5, A5) : le temps sans
+    # saisie n'est plus compté comme de l'activité. Seuil plus long pour les fenêtres média
+    # (lecture vidéo sans souris ni clavier).
+    IDLE_SPLIT_THRESHOLD_SEC: int = Field(
+        default_factory=lambda: int(os.getenv("IDLE_SPLIT_THRESHOLD_SEC", "300"))
+    )
+    IDLE_SPLIT_MEDIA_THRESHOLD_SEC: int = Field(
+        default_factory=lambda: int(os.getenv("IDLE_SPLIT_MEDIA_THRESHOLD_SEC", "3600"))
+    )
+
+    # Fuseau des horodatages stockés (v0.5.5, A12) : toutes les dates en base sont en heure
+    # locale naïve, comme celles du démon ; les exports Takeout en UTC sont convertis.
+    LOCAL_TIMEZONE: str = Field(
+        default_factory=lambda: os.getenv("LOCAL_TIMEZONE", "Europe/Paris")
     )
 
     # --- Kanban : dépôts autorisés pour le context-pack (v0.5.1, D3) ---

@@ -14,7 +14,7 @@ Ton unique rôle est d'extraire, synthétiser et structurer la substance intelle
 RÈGLES ÉPISTÉMIQUES NON NÉGOCIABLES :
 1. ZÉRO REMPLISSAGE ENCYCLOPÉDIQUE TYPE WIKIPÉDIA : Il est strictement interdit d'ajouter des introductions généralistes, des définitions basiques ("Python est un langage...", "Docker sert à conteneuriser...") ou des banalités.
 2. SUBSTANCE PURE : Ne conserve que ce que l'utilisateur a exploré, décidé, validé, contesté ou conçu.
-3. ISOLATION DE LA TÉLÉMÉTRIE : Toutes les métadonnées techniques, sources d'archives, sessions corrélées et liens de maillage doivent être STRICTEMENT isolés dans le bloc Obsidian '> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)'.
+3. ISOLATION DE LA TÉLÉMÉTRIE : N'écris JAMAIS de métadonnées techniques, de sources d'archives ni de bloc '> [!abstract]' dans le corps : le bloc de télémétrie est ajouté automatiquement par l'Exocortex.
 4. STYLE CONCIS ET DIRECT : Phrases denses, schémas textuels, tableaux comparatifs si pertinents, bullet points techniques percutants.
 5. CONCISION & COMPLÉTUDE : Le champ synthesized_markdown_body doit être dense, structuré et faire entre 200 et 450 mots maximum. Ne laisse JAMAIS une phrase inachevée.
 """

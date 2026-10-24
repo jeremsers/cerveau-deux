@@ -186,6 +186,10 @@ class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        # Rang du tour dans la conversation (extension 0.5.5+) : clé de déduplication (A14)
+        raw_index = data.get("turn_index")
+        turn_index = raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) and raw_index >= 0 else None
+
         # Persistance idempotente dans SQLite
         db = self.server.db
         try:
@@ -194,6 +198,7 @@ class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
                 session_id=session_id,
                 user_prompt=user_prompt,
                 ai_response=ai_response,
+                turn_index=turn_index,
             )
             logger.info(
                 "Tour de chat capturé en direct [%s] session '%s' (turn=%s, status=%s)",

@@ -57,7 +57,7 @@ class ConceptFrontmatter(BaseModel):
     title: str
     type: str = "concept"
     origin: List[str] = Field(default_factory=lambda: ["gemini_takeout"])
-    semantic_topic: str = "Dev_et_Architecture_Tech"
+    semantic_topic: str = "A_Trier"
     tags: List[str] = Field(default_factory=list)
     session_id: Optional[str] = None
     distillation_status: str = "success"
@@ -71,7 +71,8 @@ class ConceptFrontmatter(BaseModel):
     def _normalize_topic(cls, v: Any) -> str:
         if v:
             return normalize_to_macro_topic(str(v).strip())
-        return "Dev_et_Architecture_Tech"
+        # Topic absent : à classer, et non plus « Dev » d'office (v0.5.5, A9)
+        return "A_Trier"
 
     @field_validator("id", "title", "created_at", "updated_at", "summary_1_line", mode="before")
     @classmethod
@@ -138,57 +139,42 @@ class ParsedConceptNote(BaseModel):
         related_links: Optional[List[str]] = None,
     ) -> bool:
         """
-        Enrichissement strictement idempotent de la note par une session d'activité :
-        - Si une trace pour `date_str` existe déjà dans `telemetry_lines` ou `body`, remplace
-          la section `### Session du {date_str}` sans cumuler à nouveau le temps investi.
-        - Sinon, incrémente `total_time_invested_min`, insère la source dans la télémétrie,
-          et ajoute la nouvelle section `### Session du {date_str}`.
-        - Met à jour systématiquement le temps cumulé et updated_at.
+        Enrichissement idempotent de la note par une session d'activité (v0.5.5, A13) :
+        - les minutes de chaque date sont tenues dans le frontmatter (`screen_time_by_date`) et le
+          total est recalculé : relancer une date dont la durée a changé réajuste le total au lieu
+          de le figer ;
+        - la section de la date est délimitée par des marqueurs HTML invisibles et remplacée en
+          bloc : un sous-titre ### produit par le LLM n'est plus dupliqué à chaque relance ;
+        - les callouts écrits par le LLM sont retirés de l'enrichissement.
         """
         date_pattern_source = f"Activité écran du `{date_str}`"
-        has_in_telemetry = any(date_pattern_source in line for line in self.telemetry_lines)
-        has_in_body = bool(re.search(rf"(?m)^###\s+Session\s+du\s+{re.escape(date_str)}\b", self.body))
-        already_exists = has_in_telemetry or has_in_body
-
-        clean_enrichment = enrichment_markdown.strip()
-        if clean_enrichment.startswith(f"### Session du {date_str}"):
-            session_block = clean_enrichment
-        else:
-            session_block = f"### Session du {date_str}\n\n{clean_enrichment}"
-
-        if already_exists:
-            # 1. Remplacement in-place dans le corps
-            session_regex = re.compile(
-                rf"(?m)^###\s+Session\s+du\s+{re.escape(date_str)}\b.*?(?=(\n###\s+|\Z))",
-                re.DOTALL,
+        screen_by_date = _screen_time_by_date(self.frontmatter)
+        previous_min = screen_by_date.get(date_str)
+        if previous_min is None:
+            # Note antérieure à v0.5.5 : durée relue dans la ligne de télémétrie de cette date
+            previous_min = next(
+                (_parse_duration_fmt(line) for line in self.telemetry_lines if date_pattern_source in line),
+                None,
             )
-            if session_regex.search(self.body):
-                self.body = session_regex.sub(session_block, self.body).strip()
-            else:
-                self.body = f"{self.body.rstrip()}\n\n{session_block}".strip()
 
-            # 2. Remplacement ou mise à jour dans telemetry_lines
-            new_source_line = f">   - Activité écran du `{date_str}` ({duration_fmt})"
-            updated_source = False
-            for i, line in enumerate(self.telemetry_lines):
-                if date_pattern_source in line:
-                    self.telemetry_lines[i] = new_source_line
-                    updated_source = True
-                    break
-            if not updated_source:
-                _insert_source_line(self.telemetry_lines, new_source_line)
+        session_block = _build_session_block(date_str, enrichment_markdown)
+        self.body = _replace_session_block(self.body, date_str, session_block)
 
-            self.frontmatter.updated_at = date_str
+        # Temps : total = temps hors activité écran datée + somme des minutes par date
+        base_min = self.frontmatter.total_time_invested_min - sum(screen_by_date.values())
+        if previous_min is not None and date_str not in screen_by_date:
+            base_min -= previous_min
+        screen_by_date[date_str] = max(0, duration_min)
+        self.frontmatter.total_time_invested_min = max(0, base_min) + sum(screen_by_date.values())
+        setattr(self.frontmatter, "screen_time_by_date", dict(sorted(screen_by_date.items())))
+        self.frontmatter.updated_at = max(self.frontmatter.updated_at or date_str, date_str)
+
+        new_source_line = f">   - Activité écran du `{date_str}` ({duration_fmt})"
+        for i, line in enumerate(self.telemetry_lines):
+            if date_pattern_source in line:
+                self.telemetry_lines[i] = new_source_line
+                break
         else:
-            # 1. Incrémentation déterministe du temps et mise à jour de date
-            self.frontmatter.total_time_invested_min += max(0, duration_min)
-            self.frontmatter.updated_at = date_str
-
-            # 2. Ajout de la session à la fin du corps
-            self.body = f"{self.body.rstrip()}\n\n{session_block}".strip()
-
-            # 3. Insertion de la nouvelle source d'activité écran
-            new_source_line = f">   - Activité écran du `{date_str}` ({duration_fmt})"
             _insert_source_line(self.telemetry_lines, new_source_line)
 
         # Mise à jour de la ligne de temps cumulé
@@ -222,6 +208,67 @@ class ParsedConceptNote(BaseModel):
                 self.telemetry_lines.append(conn_line)
 
         return True
+
+
+_ABSTRACT_CALLOUT_RE = re.compile(r"(?m)^>\s*\[!abstract\][^\n]*\n?(?:>[^\n]*\n?)*")
+
+
+def strip_llm_callouts(markdown: str) -> str:
+    """Retire les callouts [!abstract] qu'un LLM aurait écrits dans un corps (réservés à la télémétrie)."""
+    return _ABSTRACT_CALLOUT_RE.sub("", markdown or "").strip()
+
+
+def _session_markers(date_str: str) -> tuple:
+    return f"<!-- exo:session {date_str} -->", f"<!-- /exo:session {date_str} -->"
+
+
+def _build_session_block(date_str: str, enrichment_markdown: str) -> str:
+    """
+    Normalise l'enrichissement LLM d'une date : callouts retirés, titre « Session du » unique,
+    sous-titres ### rétrogradés en #### pour rester à l'intérieur de la section, le tout balisé.
+    """
+    text = strip_llm_callouts(enrichment_markdown)
+    text = re.sub(rf"(?m)^#+\s*Session\s+du\s+{re.escape(date_str)}\b[^\n]*\n?", "", text).strip()
+    text = re.sub(r"(?m)^###\s+", "#### ", text)
+    start, end = _session_markers(date_str)
+    return f"{start}\n### Session du {date_str}\n\n{text}\n{end}"
+
+
+def _replace_session_block(body: str, date_str: str, session_block: str) -> str:
+    """Remplace la section balisée de la date, à défaut une section héritée, sinon l'ajoute en fin de corps."""
+    start, end = _session_markers(date_str)
+    marked = re.compile(rf"{re.escape(start)}.*?{re.escape(end)}", re.DOTALL)
+    if marked.search(body):
+        return marked.sub(lambda _: session_block, body).strip()
+    # Section héritée (sans marqueurs) : jusqu'à la prochaine section « Session du » ou la fin
+    legacy = re.compile(
+        rf"(?m)^###\s+Session\s+du\s+{re.escape(date_str)}\b.*?(?=^###\s+Session\s+du\s|\Z)",
+        re.DOTALL,
+    )
+    if legacy.search(body):
+        return legacy.sub(lambda _: session_block + "\n\n", body).strip()
+    return f"{body.rstrip()}\n\n{session_block}".strip()
+
+
+def _parse_duration_fmt(text: str) -> Optional[int]:
+    """Minutes d'une durée affichée « 2h05 », « 45 min » ou « 45m » (dernier motif trouvé)."""
+    m = re.search(r"(\d+)h(\d{2})\b", text)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.search(r"(\d+)\s*m(?:in)?\b", text)
+    return int(m.group(1)) if m else None
+
+
+def _screen_time_by_date(fm: "ConceptFrontmatter") -> Dict[str, int]:
+    raw = (fm.model_extra or {}).get("screen_time_by_date") or {}
+    out: Dict[str, int] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
 def _insert_source_line(telemetry_lines: List[str], new_source_line: str) -> None:
@@ -282,8 +329,13 @@ def parse_concept_string(raw_text: str, file_path: Optional[Path] = None) -> Par
         title_h1 = str(yaml_data.get("title") or (file_path.stem if file_path else "Sans Titre")).strip()
         content_after_h1 = remainder
 
-    # Extraction du callout de télémétrie final
-    callout_match = re.search(r"(?m)^(>\s*\[!abstract\]-?[^\n]*)", content_after_h1)
+    # Extraction du callout de télémétrie de l'Exocortex : repéré par son en-tête « Généalogie »
+    # (un callout [!abstract] écrit par un LLM dans le corps ne capture plus la suite, A13),
+    # à défaut le DERNIER callout [!abstract] de la note
+    callout_match = re.search(r"(?m)^(>\s*\[!abstract\]-?\s*Généalogie[^\n]*)", content_after_h1)
+    if not callout_match:
+        all_callouts = list(re.finditer(r"(?m)^(>\s*\[!abstract\]-?[^\n]*)", content_after_h1))
+        callout_match = all_callouts[-1] if all_callouts else None
     if callout_match:
         body = content_after_h1[:callout_match.start()].strip()
         callout_raw = content_after_h1[callout_match.start():]
@@ -354,6 +406,14 @@ def serialize_concept_note(note: ParsedConceptNote) -> str:
     4. Callout final de télémétrie et de généalogie.
     """
     fm_dict = note.frontmatter.model_dump(exclude_none=True)
+    # Alias du titre (v0.5.5, B18) : les fichiers sont nommés par slug, mais de nombreux liens
+    # [[Titre]] (fusions, connexions suggérées) visent le titre ; Obsidian les résout via aliases.
+    title_alias = (note.frontmatter.title or "").strip()
+    aliases = [str(a) for a in (fm_dict.get("aliases") or []) if str(a).strip()]
+    if title_alias and not re.search(r"[\[\]|#^]", title_alias) and title_alias not in aliases:
+        aliases.append(title_alias)
+    if aliases:
+        fm_dict["aliases"] = aliases
     processed_dict: Dict[str, Any] = {}
     for k, v in fm_dict.items():
         if isinstance(v, str):
@@ -389,7 +449,7 @@ def serialize_concept_note(note: ParsedConceptNote) -> str:
             "> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)",
             f"> - **Temps estimé sur ce sujet :** {tot_fmt}",
             "> - **Sources épisodiques :**",
-            "> - **Connexions sémantiques suggérées :** [[Exocortex]]",
+            "> - **Connexions sémantiques suggérées :** —",
         ]
     elif not has_header:
         clean_telemetry_lines.insert(0, "> [!abstract]- Généalogie & Télémétrie (Généré par l'Exocortex)")

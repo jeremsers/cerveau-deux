@@ -50,6 +50,7 @@ from src.utils.markdown_io import (
     ParsedConceptNote,
     parse_concept_file,
     parse_concept_string,
+    strip_llm_callouts,
     write_concept_file,
 )
 
@@ -823,9 +824,9 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                     if "screen_telemetry" not in tags:
                         tags.append("screen_telemetry")
                     summary_1_line = distilled.summary_1_line.strip()
-                    synthesized_body = distilled.synthesized_markdown_body.strip()
+                    synthesized_body = strip_llm_callouts(distilled.synthesized_markdown_body)
                     related_links = [f"[[{rc.strip()}]]" for rc in (distilled.related_concepts or []) if rc.strip()]
-                    related_links_str = ", ".join(related_links) if related_links else f"[[{topic_name}]]"
+                    related_links_str = ", ".join(related_links) if related_links else f"#{topic_name}"
                 else:
                     title = f"{topic_name.replace('_', ' ')} - Travaux du {date_str}"
                     slug = f"{generic_slug}-{date_str.replace('-', '')}"
@@ -838,7 +839,8 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                         + "\n".join([f"- {it}" for it in topic_items[:8]])
                     )
                     related_tags = [t for t in self.allowed_tags if t != topic_name][:2]
-                    related_links_str = ", ".join([f"[[{t}]]" for t in related_tags]) if related_tags else f"[[{topic_name}]]"
+                    # Catégories : ce ne sont pas des fichiers, donc des tags et non des wikilinks (B18)
+                    related_links_str = ", ".join([f"#{t}" for t in related_tags]) if related_tags else f"#{topic_name}"
 
                 # Sécurisation anti-collision sur le slug
                 concept_file = settings.CONCEPTS_DIR / f"{slug}.md"

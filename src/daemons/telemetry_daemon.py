@@ -151,6 +151,20 @@ class WindowSessionState:
 # GARDE-FOU TEMPS RÉEL ANTI-DÉRIVE ATTENTIONNELLE (DRIFTGUARD)
 # ==============================================================================
 
+MEDIA_KEYWORDS = [
+    "youtube", "netflix", "twitch", "vlc", "mpv", "spotify", "reddit",
+    "twitter", "x.com", "instagram", "tiktok", "discord", "steam",
+    "webtoon", "crunchyroll", "prime video", "disney", "primevideo",
+]
+
+
+def is_media_window(executable: Optional[str], window_title: Optional[str]) -> bool:
+    """Fenêtre de consommation média (lecture passive sans saisie attendue)."""
+    exe_low = (executable or "").lower()
+    title_low = (window_title or "").lower()
+    return any(k in exe_low or k in title_low for k in MEDIA_KEYWORDS)
+
+
 class DriftGuard:
     """
     Analyseur statistique temps réel en mémoire (0 Mo VRAM, 0 requête LLM).
@@ -183,17 +197,7 @@ class DriftGuard:
         Enregistre une transition de fenêtre et évalue les conditions de dérive.
         Retourne le dictionnaire d'alerte si une nouvelle alerte est déclenchée, sinon None.
         """
-        exe_low = (executable or "").lower()
-        title_low = (window_title or "").lower()
-
-        is_media = any(
-            k in exe_low or k in title_low
-            for k in [
-                "youtube", "netflix", "twitch", "vlc", "mpv", "spotify", "reddit",
-                "twitter", "x.com", "instagram", "tiktok", "discord", "steam",
-                "webtoon", "crunchyroll", "prime video", "disney", "primevideo"
-            ]
-        )
+        is_media = is_media_window(executable, window_title)
 
         event = {
             "timestamp": timestamp,
@@ -504,6 +508,12 @@ class TelemetryDaemon:
         """Exécute un cycle de surveillance élémentaire (polling 2s)."""
         hwnd, executable, title = self.get_foreground_window_info()
 
+        # Écran verrouillé ou aucune fenêtre au premier plan : aucune activité « Idle » fictive (A5)
+        if not hwnd:
+            if self.current_state:
+                self.flush_current_window()
+            return
+
         # Filtrage de confidentialité
         if self.is_blacklisted(executable, title):
             logger.debug("Fenêtre blacklistée détectée : [%s] '%s'. Cycle ignoré.", executable, title)
@@ -514,6 +524,20 @@ class TelemetryDaemon:
         # Mesure d'activité physique (souris/clavier) sans keylogging
         idle_seconds = get_user_idle_seconds()
         is_physically_active = (idle_seconds < 10.0)
+
+        # Inactivité prolongée (A5) : la fenêtre est close à l'instant de la dernière saisie ; le
+        # temps sans saisie n'est plus compté comme de l'activité ni comme un tunnel d'hyperfocus.
+        idle_limit = (
+            settings.IDLE_SPLIT_MEDIA_THRESHOLD_SEC if is_media_window(executable, title)
+            else settings.IDLE_SPLIT_THRESHOLD_SEC
+        )
+        if idle_seconds >= idle_limit:
+            if self.current_state:
+                last_input = datetime.now() - timedelta(seconds=idle_seconds)
+                state = self.current_state
+                state.timestamp_last_seen = max(state.timestamp_start, min(state.timestamp_last_seen, last_input))
+                self.flush_current_window()
+            return
 
         # Vérification si la fenêtre active a changé
         window_key_changed = (

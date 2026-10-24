@@ -601,6 +601,8 @@ def generate_cold_start_episodic_journals(sessions: List[ReconstructedSession], 
                         context_switches_per_hour=round(len(day_sessions) / max(1.0, total_duration_sec / 3600.0), 2),
                         read_vs_write_ratio=0.4,
                         top_topics_json=json.dumps(top_topics_clean, ensure_ascii=False),
+                        # Ratios production/exploration et lecture/écriture fixés : estimation (A9)
+                        is_estimated=True,
                     )
                 )
 
@@ -765,7 +767,7 @@ def save_distilled_concept_note(
             logger.warning("Erreur vérification collision slug pour %s : %s", concept_file.name, exc)
 
     concept_id = sess.timestamp_start.strftime("%Y%m%d%H%M")
-    related_md = ", ".join([f"[[{rc}]]" for rc in related_list]) if related_list else "[[Exocortex]]"
+    related_md = ", ".join([f"[[{rc}]]" for rc in related_list]) if related_list else "—"
 
     fm = ConceptFrontmatter(
         id=concept_id,

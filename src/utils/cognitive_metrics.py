@@ -46,13 +46,15 @@ def compute_focus_tunnels(
     tolerance_sec: int = MICRO_INTERRUPTION_TOLERANCE_SEC,
 ) -> List[FocusTunnel]:
     """
-    Fusionne les activités consécutives d'un même topic en tunnels. Une interruption de moins de
-    tolerance_sec sur un autre topic est absorbée si l'activité suivante revient au topic du tunnel.
+    Fusionne les activités consécutives d'un même topic en tunnels (v0.5.5, A5) :
+    - les interruptions sur d'autres topics sont absorbées tant que leur durée CUMULÉE (trous
+      compris) reste sous tolerance_sec et que l'activité revient ensuite au topic du tunnel
+      (Slack 1 min puis Mail 1 min ne cassent plus un tunnel… mais 3 min d'interruptions, si) ;
+    - un trou de plus de tolerance_sec entre deux activités (pause, veille, nuit) rompt toujours
+      le tunnel : deux sessions espacées de 10 h ne forment plus un seul tunnel.
     """
     sorted_acts = sorted(activities, key=lambda a: _as_datetime(a["timestamp_start"]))
     tunnels: List[FocusTunnel] = []
-    current: Optional[Dict[str, Any]] = None
-    pending_interruption = 0
 
     def close(t: Dict[str, Any]) -> None:
         exe = max(t["exe_secs"].items(), key=lambda kv: kv[1])[0] if t["exe_secs"] else ""
@@ -78,36 +80,46 @@ def compute_focus_tunnels(
             "count": 1,
         }
 
-    for idx, act in enumerate(sorted_acts):
-        topic = act.get("semantic_topic") or UNCLASSIFIED_TOPIC
-        dur = int(act.get("duration_sec") or 0)
+    def topic_of(act: Dict[str, Any]) -> str:
+        return act.get("semantic_topic") or UNCLASSIFIED_TOPIC
 
-        if current is None:
-            current = start(act, topic)
-            continue
+    def gap_sec(prev: Dict[str, Any], nxt: Dict[str, Any]) -> float:
+        return max(0.0, (_as_datetime(nxt["timestamp_start"]) - _as_datetime(prev["timestamp_end"])).total_seconds())
 
-        if topic == current["topic"]:
-            current["duration"] += dur + pending_interruption
-            pending_interruption = 0
-            current["end"] = _as_datetime(act["timestamp_end"])
-            exe = act.get("executable") or ""
-            current["exe_secs"][exe] = current["exe_secs"].get(exe, 0) + dur
-            if dur > current["top_title"][0]:
-                current["top_title"] = (dur, act.get("window_title") or "")
-            current["count"] += 1
-            continue
-
-        next_topic = (sorted_acts[idx + 1].get("semantic_topic") or UNCLASSIFIED_TOPIC) if idx + 1 < len(sorted_acts) else None
-        if dur < tolerance_sec and next_topic == current["topic"]:
-            pending_interruption += dur
-            continue
-
+    i = 0
+    n = len(sorted_acts)
+    while i < n:
+        current = start(sorted_acts[i], topic_of(sorted_acts[i]))
+        last_member = i
+        pending_sec = 0.0
+        pending_dur = 0
+        j = i + 1
+        while j < n:
+            act = sorted_acts[j]
+            gap = gap_sec(sorted_acts[j - 1], act)
+            if gap > tolerance_sec:
+                break
+            dur = int(act.get("duration_sec") or 0)
+            if topic_of(act) == current["topic"]:
+                # Retour au topic : les interruptions en attente sont absorbées dans le tunnel
+                current["duration"] += dur + pending_dur
+                current["end"] = _as_datetime(act["timestamp_end"])
+                exe = act.get("executable") or ""
+                current["exe_secs"][exe] = current["exe_secs"].get(exe, 0) + dur
+                if dur > current["top_title"][0]:
+                    current["top_title"] = (dur, act.get("window_title") or "")
+                current["count"] += 1
+                last_member = j
+                pending_sec, pending_dur = 0.0, 0
+            else:
+                pending_sec += gap + dur
+                pending_dur += dur
+                if pending_sec > tolerance_sec:
+                    break
+            j += 1
         close(current)
-        current = start(act, topic)
-        pending_interruption = 0
-
-    if current is not None:
-        close(current)
+        # Les interruptions non absorbées ouvrent le tunnel suivant
+        i = last_member + 1
     return tunnels
 
 
@@ -119,6 +131,7 @@ class DailyKpis(BaseModel):
     """Contrat unique des KPIs du jour renvoyés par /api/telemetry/timeline."""
     date: str
     is_consolidated: bool = Field(description="Vrai si une ligne daily_metrics existe pour cette date")
+    is_estimated: bool = Field(default=False, description="Vrai si les valeurs sont des estimations (cold start Takeout)")
     total_active_sec: int
     total_deep_work_sec: int = Field(description="Production active (mode production avec saisie)")
     hyperfocus_tunnel_count: int
@@ -142,6 +155,7 @@ def build_daily_kpis(
         return DailyKpis(
             date=date_str,
             is_consolidated=True,
+            is_estimated=bool(daily_metric_row.get("is_estimated")),
             total_active_sec=int(daily_metric_row.get("total_screen_sec") or 0),
             total_deep_work_sec=int(daily_metric_row.get("active_production_sec") or 0),
             hyperfocus_tunnel_count=len(long_tunnels),
