@@ -398,6 +398,18 @@ class Settings(BaseModel):
         return self.SYSTEM_BUFFER_DIR / "drift_state.json"
 
     @property
+    def VOICE_INBOX_DIR(self) -> Path:
+        return self.SYSTEM_BUFFER_DIR / "voice_inbox"
+
+    @property
+    def VOICE_PROCESSED_DIR(self) -> Path:
+        return self.VOICE_INBOX_DIR / "processed"
+
+    @property
+    def CONCEPTS_ARCHIVE_MERGED_DIR(self) -> Path:
+        return self.CONCEPTS_DIR / "_Archive_Merged"
+
+    @property
     def MODEL_REASONING(self) -> str:
         """Alias pour MODEL_HEAVY_SYNTHESIS (gemma4:26b-a4b)."""
         return self.MODEL_HEAVY_SYNTHESIS
@@ -435,6 +447,9 @@ class Settings(BaseModel):
             self.LANCEDB_DIR,
             self.GOOGLE_DRIVE_SYNC_DIR,
             self.KANBAN_SPECS_DIR,
+            self.VOICE_INBOX_DIR,
+            self.VOICE_PROCESSED_DIR,
+            self.CONCEPTS_ARCHIVE_MERGED_DIR,
             self.TAKEOUT_DIR,
             self.MODELS_DIR,
         ]

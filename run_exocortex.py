@@ -278,6 +278,33 @@ def run_mcp_server() -> None:
     run_mcp_stdio_server()
 
 
+def run_ingest_voice() -> None:
+    """Lance l'ingestion des mémos vocaux en attente dans voice_inbox/ (Module 9)."""
+    logger.info("=== Lancement du Sas d'Ingestion Vocale (Module 9 - v0.4.0) ===")
+    from src.ingestors.voice_ingestor import VoiceIngestor
+    ingestor = VoiceIngestor()
+    result = ingestor.run()
+    logger.info(
+        "Ingestion vocale terminée : %d note(s) créée(s), %d erreur(s)",
+        result["processed_count"],
+        len(result["errors"]),
+    )
+
+
+def run_defrag_graph() -> None:
+    """Lance le cycle de Sommeil Profond pour défragmenter le graphe de concepts (Module 10)."""
+    logger.info("=== Lancement du Défragmenteur de Graphe & Contradictions (Module 10 - v0.4.0) ===")
+    from src.consolidators.graph_defragmenter import GraphDefragmenter
+    defragmenter = GraphDefragmenter()
+    result = defragmenter.run_defragmentation_cycle()
+    logger.info(
+        "Défragmentation terminée : %d candidat(s), %d fusion(s), %d contradiction(s)",
+        result["candidates_found"],
+        result["merges_done"],
+        result["contradictions_done"],
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exocortex & Télémétrie Cognitive — Orchestrateur Principal",
@@ -310,6 +337,8 @@ Exemples d'utilisation :
     group.add_argument("--kanban-status", action="store_true", help="Affiche l'état des tickets du Kanban et actualise AGENT_QUEUE.md.")
     group.add_argument("--next-task", action="store_true", help="Dépile et affiche la tâche la plus prioritaire prête pour l'agent codeur.")
     group.add_argument("--complete-task", type=str, metavar="TASK_ID", help="Marque une tâche comme terminée.")
+    group.add_argument("--ingest-voice", action="store_true", help="Ingère et distille les mémos vocaux de voice_inbox/.")
+    group.add_argument("--defrag-graph", action="store_true", help="Exécute le Sommeil Profond pour défragmenter les fiches redondantes.")
 
     parser.add_argument("--date", type=str, default=None, help="Date optionnelle pour la consolidation (YYYY-MM-DD).")
     parser.add_argument("--limit", type=int, default=None, help="Limite optionnelle de sessions à distiller lors du Takeout.")
@@ -344,6 +373,10 @@ Exemples d'utilisation :
         run_next_task(args.project)
     elif args.complete_task:
         run_complete_task(args.complete_task)
+    elif args.ingest_voice:
+        run_ingest_voice()
+    elif args.defrag_graph:
+        run_defrag_graph()
 
 
 if __name__ == "__main__":
