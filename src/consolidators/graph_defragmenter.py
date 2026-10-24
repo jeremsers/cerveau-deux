@@ -140,6 +140,10 @@ class GraphDefragmenter:
                     path_a = Path(rec_a["file_path"]) if rec_a.get("file_path") else settings.CONCEPTS_DIR / f"{rec_a['slug']}.md"
                     path_b = Path(rec_b["file_path"]) if rec_b.get("file_path") else settings.CONCEPTS_DIR / f"{rec_b['slug']}.md"
 
+                    # Interdiction stricte de l'auto-fusion ou comparaison de la même note
+                    if rec_a.get("slug") == rec_b.get("slug") or path_a.resolve() == path_b.resolve():
+                        continue
+
                     # Extraction des tokens pour le garde-fou
                     title_a = str(rec_a.get("title") or "")
                     title_b = str(rec_b.get("title") or "")
@@ -183,15 +187,19 @@ class GraphDefragmenter:
         note_a_path: Path,
         note_b_path: Path,
         merge_decision: ConceptMergeSchema,
+        defer_vector_sync: bool = False,
     ) -> Path:
         """
         Fusionne 2 notes de concepts selon la décision validée :
         1. Parse et cumule total_time_invested_min, fusionne tags, origin et telemetry_lines.
         2. Écrit la note canonique dans 02_Concepts/<canonical_slug>.md.
         3. Déplace sans unlink() les anciennes notes dans 02_Concepts/_Archive_Merged/ (Zéro Perte).
-        4. Nettoie LanceDB des anciens slugs et indexe la nouvelle note.
+        4. Nettoie LanceDB des anciens slugs et indexe la nouvelle note (ou reporte si defer_vector_sync=True).
         5. Réécrit tous les [[wikilinks]] pointant vers les anciennes cibles dans tout le coffre.
         """
+        if note_a_path.resolve() == note_b_path.resolve():
+            raise ValueError(f"Impossible de fusionner une fiche avec elle-même : {note_a_path}")
+
         if not note_a_path.exists() or not note_b_path.exists():
             raise FileNotFoundError(f"L'une des notes à fusionner est introuvable : {note_a_path} / {note_b_path}")
 
@@ -275,11 +283,12 @@ class GraphDefragmenter:
                 shutil.move(str(old_path), str(archive_dest))
                 logger.info("Ancienne note archivée dans _Archive_Merged : %s -> %s", old_path.name, archive_dest.name)
 
-        # 4. Nettoyage et synchronisation LanceDB
+        # 4. Nettoyage et synchronisation LanceDB (sans chargement bge-m3 si defer_vector_sync=True)
         try:
             self.vector_store.delete_by_slug(note_a_path.stem)
             self.vector_store.delete_by_slug(note_b_path.stem)
-            self.vector_store.index_concept_file(target_path)
+            if not defer_vector_sync:
+                self.vector_store.index_concept_file(target_path)
         except Exception as v_exc:
             logger.warning("Avertissement synchronisation LanceDB lors de la fusion : %s", v_exc)
 
@@ -399,6 +408,7 @@ class GraphDefragmenter:
 
         merges_done = 0
         contradictions_done = 0
+        merged_paths: List[Path] = []
         today_str = datetime.now().strftime("%Y-%m-%d")
 
         for cand in candidates:
@@ -435,7 +445,8 @@ class GraphDefragmenter:
                         logger.warning("Échec évaluation LLM pour fusion : %s", llm_exc)
 
                 if decision and decision.should_merge:
-                    self.merge_concepts_pair(path_a, path_b, decision)
+                    target_p = self.merge_concepts_pair(path_a, path_b, decision, defer_vector_sync=True)
+                    merged_paths.append(target_p)
                     merges_done += 1
                 elif decision and decision.contradiction_detected and decision.contradiction_explanation:
                     self.annotate_contradiction(
@@ -471,6 +482,20 @@ class GraphDefragmenter:
                             contradictions_done += 1
                     except Exception as exc:
                         logger.debug("Erreur analyse contradiction : %s", exc)
+
+        # Exclusion mutuelle VRAM : déchargement du modèle 26B avant indexation bge-m3
+        llm_client.unload_model(settings.MODEL_HEAVY_SYNTHESIS)
+
+        # Indexation vectorielle différée des fiches fusionnées
+        if merged_paths:
+            logger.info("Synchronisation vectorielle différée de %d fiche(s) fusionnée(s)...", len(merged_paths))
+            for p in merged_paths:
+                try:
+                    self.vector_store.index_concept_file(p)
+                except Exception as idx_exc:
+                    logger.warning("Erreur indexation vectorielle post-fusion pour %s : %s", p.name, idx_exc)
+
+            llm_client.unload_model(settings.MODEL_EMBEDDING)
 
         logger.info(
             "=== FIN CYCLE DE SOMMEIL PROFOND : %d fusion(s), %d contradiction(s) annotée(s) ===",

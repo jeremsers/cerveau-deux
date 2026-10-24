@@ -561,12 +561,13 @@ class NightConsolidator:
     # PASSE 2 : SYNTHÈSE ÉPISODIQUE & FICHES CONCEPTS (GEMMA 4:26B OU 12B)
     # ==========================================================================
 
-    def run_pass_2_synthesis(self, target_date: date, metric: DailyMetricRecord) -> None:
+    def run_pass_2_synthesis(self, target_date: date, metric: DailyMetricRecord, run_bootloader: bool = True) -> None:
         """
         Passe 2 :
         1. Rédige le journal épisodique 01_Episodique/YYYY-MM-DD.md avec synthèse LLM des tunnels réels.
         2. Pour tout sujet ayant cumulé >= 45 minutes dans la journée, crée ou enrichit la fiche dans 02_Concepts/.
-        3. Purge la VRAM en fin de passe.
+        3. Génère le Bootloader si run_bootloader=True.
+        4. Purge la VRAM en fin de passe.
         """
         if metric.total_screen_sec == 0:
             logger.info("Temps d'écran total nul pour le %s. Aucune note épisodique ou conceptuelle générée.", target_date.isoformat())
@@ -826,10 +827,11 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                 logger.info("Nouvelle fiche conceptuelle atomique créée via synthèse LLM : %s", concept_file.name)
 
         # Génération du Context Bootloader et extraction des Open Loops (Module 8 - v0.3.0)
-        try:
-            self.generate_executive_bootloader(target_date, metric, effective_model)
-        except Exception as exc:
-            logger.warning("Erreur lors de la génération du Context Bootloader : %s", exc)
+        if run_bootloader:
+            try:
+                self.generate_executive_bootloader(target_date, metric, effective_model)
+            except Exception as exc:
+                logger.warning("Erreur lors de la génération du Context Bootloader : %s", exc)
 
         # Purge de la VRAM après la synthèse
         llm_client.unload_model(effective_model)
@@ -1018,13 +1020,34 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
         if llm_client.is_alive():
             llm_client.ensure_local_gguf_models()
 
+        # Passe 0 : Ingestion des mémos vocaux en attente dans voice_inbox/ (v0.4.1)
+        try:
+            from src.ingestors.voice_ingestor import VoiceIngestor
+            v_ingestor = VoiceIngestor(db_manager=self.db)
+            v_res = v_ingestor.run()
+            if v_res.get("processed_count", 0) > 0:
+                logger.info("Passe 0 : %d mémo(s) vocal/vocaux ingéré(s).", v_res["processed_count"])
+        except Exception as v_exc:
+            logger.warning("Avertissement Passe 0 Ingestion Vocale : %s", v_exc)
+
         # Passe 1 : Vision & Tagging
         classified_count = self.run_pass_1_vision_and_tagging()
 
         # Identification des dates à traiter
-        dates_to_process = self.db.get_distinct_activity_dates(processed_only=True)
-        if target_date and target_date not in dates_to_process:
-            dates_to_process.append(target_date)
+        if target_date:
+            dates_to_process = [target_date]
+        else:
+            all_dates = sorted(self.db.get_distinct_activity_dates(processed_only=True))
+            if all_dates:
+                max_date = max(all_dates)
+                # Filtre : dates n'ayant pas encore de journal 01_Episodique/YYYY-MM-DD.md + la date maximale
+                dates_to_process = [
+                    d for d in all_dates
+                    if not (settings.EPISODIC_DIR / f"{d.isoformat()}.md").exists() or d == max_date
+                ]
+            else:
+                dates_to_process = []
+
         if not dates_to_process:
             logger.info("Aucune date avec activité à consolider. Arrêt du Sommeil Paradoxal.")
             return {
@@ -1037,10 +1060,12 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
 
         logger.info("Journées à agréger et synthétiser : %s", [d.isoformat() for d in dates_to_process])
 
-        # Pour chaque date : agrégation SQLite & Passe 2
+        # Pour chaque date : agrégation SQLite & Passe 2 (Bootloader sur la date la plus récente uniquement)
+        max_target_date = max(dates_to_process) if dates_to_process else None
         for d in tqdm(dates_to_process, desc="Consolidation Nocturne (Journaux)", unit="jour"):
             metric = self.calculate_daily_metrics_for_date(d)
-            self.run_pass_2_synthesis(d, metric)
+            should_run_bootloader = (d == max_target_date)
+            self.run_pass_2_synthesis(d, metric, run_bootloader=should_run_bootloader)
 
         # Passe 3 : Vectorisation LanceDB
         vector_count = self.run_pass_3_vector_indexing()

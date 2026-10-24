@@ -548,18 +548,11 @@ def save_distilled_concept_note(
         # Protection anti-écrasement : si une note valide existe déjà sur disque, ne jamais l'écraser par #A_Trier
         for existing_f in settings.CONCEPTS_DIR.glob("*.md"):
             try:
-                txt = existing_f.read_text(encoding="utf-8", errors="replace")
-                has_sid = (
-                    f'session_id: "{sess.session_id}"' in txt
-                    or f"session_id: '{sess.session_id}'" in txt
-                    or f"session_id: {sess.session_id}" in txt
-                )
-                has_success = (
-                    'distillation_status: "success"' in txt
-                    or "distillation_status: 'success'" in txt
-                    or "distillation_status: success" in txt
-                )
-                if has_sid and has_success:
+                note_parsed = parse_concept_file(existing_f)
+                if (
+                    note_parsed.frontmatter.session_id == sess.session_id
+                    and note_parsed.frontmatter.distillation_status == "success"
+                ):
                     logger.info("Protection anti-écrasement activée : note valide %s préservée pour %s.", existing_f.name, sess.session_id)
                     return True, "skipped"
             except Exception:
@@ -598,9 +591,8 @@ def save_distilled_concept_note(
     concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
     if dist_status == "success" and concept_file.exists():
         try:
-            existing_content = concept_file.read_text(encoding="utf-8", errors="replace")
-            m_sid = re.search(r'session_id:\s*["\']?([^"\'\n\r]+)["\']?', existing_content)
-            existing_sid = m_sid.group(1).strip() if m_sid else None
+            existing_note = parse_concept_file(concept_file)
+            existing_sid = existing_note.frontmatter.session_id
             if existing_sid and existing_sid != sess.session_id:
                 # Collision de slug entre deux sessions distinctes
                 short_sid = re.sub(r"[^a-zA-Z0-9]", "", sess.session_id)[:6].lower()

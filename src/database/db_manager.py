@@ -545,15 +545,16 @@ class DBManager:
 
             # 5. Création ou mise à jour de la session parent
             if not sess_row:
+                initial_summary = clean_prompt[:140]
                 conn.execute(
                     """
                     INSERT INTO chat_sessions (
                         session_id, timestamp_start, timestamp_end, turn_count,
                         user_char_count, extracted_topics_json, generated_notes_json,
                         summary, distillation_status
-                    ) VALUES (?, ?, ?, 1, ?, '[]', '[]', '', 'pending');
+                    ) VALUES (?, ?, ?, 1, ?, '[]', '[]', ?, 'pending');
                     """,
-                    (session_id, ts_str, ts_str, u_chars),
+                    (session_id, ts_str, ts_str, u_chars, initial_summary),
                 )
             else:
                 conn.execute(

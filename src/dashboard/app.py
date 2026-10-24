@@ -91,19 +91,6 @@ def get_db_manager() -> DBManager:
     return DBManager(read_only=True)
 
 
-def get_ro_connection() -> sqlite3.Connection:
-    """Ouvre une connexion SQLite en lecture seule stricte."""
-    db_path = get_db_path()
-    if not db_path.exists():
-        try:
-            st.error(f"Base de données introuvable : {db_path}")
-            st.stop()
-        except Exception:
-            raise FileNotFoundError(f"Base de données introuvable : {db_path}")
-    uri = f"file:{db_path.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 @st.cache_data(ttl=30)
@@ -652,7 +639,7 @@ def render_dashboard() -> None:
             )
             filter_status = c_st.selectbox(
                 "Statut Distillation :",
-                ["Tous", "distilled", "skipped", "pending"],
+                ["Tous", "success", "pending", "misc_noise", "failed_fallback"],
                 index=0,
                 key="gemini_status_select",
             )
