@@ -29,7 +29,7 @@
       <div>
         <div class="flex items-center gap-2">
           <span class="font-bold tracking-wider text-sm text-slate-100">EXOCORTEX</span>
-          <span class="text-xs px-2 py-0.5 rounded bg-cyber-cyan/10 text-cyber-cyan font-mono border border-cyber-cyan/30">v0.5.3 SOTA</span>
+          <span class="text-xs px-2 py-0.5 rounded bg-cyber-cyan/10 text-cyber-cyan font-mono border border-cyber-cyan/30">v0.5.4 SOTA</span>
         </div>
         <p class="text-[11px] text-slate-400 font-mono tracking-tight">Command Center Cognitif & Télémétrie</p>
       </div>
@@ -159,7 +159,7 @@
         <div class="cyber-card p-4">
           <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Score d'Alignement</div>
           <div id="kpi-focus-ratio" class="text-2xl font-black text-amber-400 mt-1">--</div>
-          <div class="text-[11px] text-slate-500 mt-0.5">Deep Work / Total</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Production active / Total</div>
         </div>
       </div>
 
@@ -373,10 +373,8 @@
         <div class="cyber-card p-4 space-y-3">
           <h3 class="text-sm font-semibold text-slate-200">Diagnostic Chronobiologique</h3>
           <div class="p-3 bg-cyber-900 border border-cyber-700 rounded-lg space-y-2 text-xs">
-            <div class="text-cyber-cyan font-semibold">Profil : Hyperfocus Crépusculaire & Nocturne</div>
-            <p class="text-slate-400 leading-relaxed">
-              La concentration s'intensifie significativement à partir de 18h, avec des pics d'immersion technique réguliers entre 21h et 02h.
-            </p>
+            <div id="circadian-profile-label" class="text-cyber-cyan font-semibold">Profil : —</div>
+            <p id="circadian-profile-desc" class="text-slate-400 leading-relaxed"></p>
           </div>
           <div class="p-3 bg-cyber-900 border border-cyber-700 rounded-lg space-y-1 text-xs">
             <span class="text-slate-400 font-mono">Volume d'événements analysés :</span>
@@ -396,7 +394,7 @@
             <span>💬</span>
             <span>Explorateur Épistémique & Archéologie Numérique</span>
           </h2>
-          <p class="text-xs text-slate-400">Recherche full-text dans les sessions Gemini, navigation dans les 73k empreintes et Burst Clusters.</p>
+          <p class="text-xs text-slate-400">Recherche full-text dans les sessions de chat, navigation dans les empreintes Search/YouTube et les Burst Clusters.</p>
         </div>
         <!-- Sub-tabs Switcher -->
         <div class="flex items-center gap-1 bg-cyber-900 p-1 rounded-lg border border-cyber-700">
@@ -418,11 +416,9 @@
           <select id="chats-topic-filter" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none">
             <option value="">Tous les Topics</option>
           </select>
+          <!-- Options remplies depuis /api/meta/vocabulary (statuts réels de chat_sessions) -->
           <select id="chats-status-filter" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none">
-            <option value="">Tous les Statuts</option>
-            <option value="success">Success</option>
-            <option value="skipped">Skipped</option>
-            <option value="pending">Pending</option>
+            <option value="">Tous les statuts</option>
           </select>
         </div>
 

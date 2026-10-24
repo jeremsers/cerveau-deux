@@ -15,7 +15,41 @@ const state = {
   loadedViews: new Set(),
   modalRawMarkdown: "",
   epistemicSubTab: "chats",
+  // Vocabulaires servis par /api/meta/vocabulary (v0.5.4) : aucune liste codée en dur côté front
+  modes: {},
 };
+
+const UNCLASSIFIED_MODE = "non_classe";
+
+function modeInfo(mode) {
+  return state.modes[mode] || state.modes[UNCLASSIFIED_MODE] || { label: mode || "Non classé", color: "#64748b" };
+}
+
+async function loadVocabulary() {
+  const vocab = await apiGet("/api/meta/vocabulary");
+  state.modes = Object.fromEntries((vocab.cognitive_modes || []).map((m) => [m.key, m]));
+
+  const statusSelect = document.getElementById("chats-status-filter");
+  if (statusSelect) {
+    statusSelect.innerHTML = `<option value="">Tous les statuts</option>`;
+    (vocab.distillation_statuses || []).forEach((s) => {
+      const opt = document.createElement("option");
+      opt.value = s.key;
+      opt.innerText = s.label;
+      statusSelect.appendChild(opt);
+    });
+  }
+  const topicSelect = document.getElementById("chats-topic-filter");
+  if (topicSelect) {
+    topicSelect.innerHTML = `<option value="">Tous les topics</option>`;
+    (vocab.semantic_topics || []).forEach((t) => {
+      const opt = document.createElement("option");
+      opt.value = t;
+      opt.innerText = t;
+      topicSelect.appendChild(opt);
+    });
+  }
+}
 
 // =============================================================================
 // UTILITAIRES API REST & PRESSE-PAPIER
@@ -197,7 +231,9 @@ async function updateSystemStatus() {
     const driftDot = document.getElementById("drift-dot");
     const driftVal = document.getElementById("drift-val");
     if (driftVal && driftDot) {
-      if (data.drift_state && data.drift_state.drift_detected) {
+      const drift = data.drift_state || {};
+      document.getElementById("topbar-drift")?.setAttribute("title", drift.active ? drift.diagnostic || "" : "");
+      if (drift.active) {
         driftDot.className = "w-2 h-2 rounded-full bg-amber-400 pulse-glow";
         driftVal.innerText = "DRIFT DÉTECTÉ";
         driftVal.className = "font-semibold text-amber-400";
@@ -339,7 +375,7 @@ async function loadTimelineForDate(dateStr) {
             <span class="font-bold text-emerald-400">🔥 ${durMin} min</span>
             <span class="text-[10px] font-mono text-slate-400">${esc(t.start_time?.slice(11, 16) || "")} - ${esc(t.end_time?.slice(11, 16) || "")}</span>
           </div>
-          <div class="font-semibold text-slate-200">${esc(t.executable || "App")}</div>
+          <div class="font-semibold text-slate-200">${esc(t.executable || "App")} <span class="text-[10px] font-mono text-purple-300">#${esc(t.topic)}</span></div>
           <div class="text-[11px] text-slate-400 truncate">${esc(t.top_window_title || "Sans titre")}</div>
         `;
         tunnelsList.appendChild(card);
@@ -365,20 +401,11 @@ function renderGanttChart(events) {
     return;
   }
 
-  // Couleurs par mode cognitif
-  const modeColors = {
-    Deep_Work: "#38bdf8",
-    Execution: "#10b981",
-    Communication: "#8b5cf6",
-    Passive: "#f59e0b",
-    Noise: "#64748b",
-  };
-
   const traces = [];
   const groupedByMode = {};
 
   events.forEach((ev) => {
-    const mode = ev.cognitive_mode || "Deep_Work";
+    const mode = ev.cognitive_mode || UNCLASSIFIED_MODE;
     if (!groupedByMode[mode]) {
       groupedByMode[mode] = { x0: [], x1: [], y: [], text: [] };
     }
@@ -393,11 +420,11 @@ function renderGanttChart(events) {
     traces.push({
       type: "bar",
       orientation: "h",
-      name: mode,
+      name: modeInfo(mode).label,
       base: g.x0,
       x: g.x1.map((end, i) => new Date(end) - new Date(g.x0[i])),
       y: g.y,
-      marker: { color: modeColors[mode] || "#3b82f6" },
+      marker: { color: modeInfo(mode).color },
       hoverinfo: "text",
       hovertext: g.text,
     });
@@ -479,7 +506,7 @@ function filterAndRenderTimelineTable() {
       <td class="py-2 px-3 text-slate-300 font-semibold">${esc(durStr)}</td>
       <td class="py-2 px-3 text-slate-100 font-semibold">${esc(ev.executable || "App")}</td>
       <td class="py-2 px-3">${contextHtml}</td>
-      <td class="py-2 px-3"><span class="px-2 py-0.5 rounded text-[10px] bg-cyber-800 border border-cyber-700 text-slate-300">${esc(ev.cognitive_mode || "Deep_Work")}</span></td>
+      <td class="py-2 px-3"><span class="px-2 py-0.5 rounded text-[10px] bg-cyber-800 border border-cyber-700 text-slate-300">${esc(modeInfo(ev.cognitive_mode).label)}</span></td>
     `;
     tbody.appendChild(tr);
   });
@@ -522,54 +549,35 @@ function renderTreemapChart(data) {
   const container = document.getElementById("treemap-chart-container");
   if (!container || !data || data.length === 0) return;
 
-  const labels = [];
-  const parents = [];
-  const values = [];
-
-  // Groupement par Mode -> Topic -> Executable
-  const modesSet = new Set();
-  const topicsMap = {};
-  const execs = [];
+  // Hiérarchie Mode -> Topic -> Exécutable, nœuds identifiés par un id unique (v0.5.4, B6) :
+  // un même topic sous deux modes, ou un même exécutable sous deux topics, reste distinct.
+  const nodes = new Map();
+  const addNode = (id, label, parent, value) => {
+    const node = nodes.get(id) || { id, label, parent, value: 0 };
+    node.value += value;
+    nodes.set(id, node);
+  };
 
   data.forEach((row) => {
-    const mode = row.cognitive_mode || "Deep_Work";
-    const topic = row.semantic_topic || "Général";
+    const mode = row.cognitive_mode || UNCLASSIFIED_MODE;
+    const topic = row.semantic_topic || "Non_Classe";
     const exec = row.executable || "App";
     const sec = row.total_sec || 0;
-
-    modesSet.add(mode);
-    const topicKey = `${mode}__${topic}`;
-    topicsMap[topicKey] = (topicsMap[topicKey] || 0) + sec;
-    execs.push({ id: `${topicKey}__${exec}`, label: exec, parent: topicKey, val: sec });
+    const modeId = `m:${mode}`;
+    const topicId = `${modeId}|t:${topic}`;
+    addNode(modeId, modeInfo(mode).label, "", sec);
+    addNode(topicId, topic, modeId, sec);
+    addNode(`${topicId}|e:${exec}`, exec, topicId, sec);
   });
 
-  // Niveau 1 : Modes
-  modesSet.forEach((m) => {
-    labels.push(m);
-    parents.push("");
-    values.push(0);
-  });
-
-  // Niveau 2 : Topics
-  Object.keys(topicsMap).forEach((tk) => {
-    const [mode, top] = tk.split("__");
-    labels.push(top);
-    parents.push(mode);
-    values.push(topicsMap[tk]);
-  });
-
-  // Niveau 3 : Exécutables
-  execs.forEach((e) => {
-    labels.push(e.label);
-    parents.push(e.parent.split("__")[1]);
-    values.push(e.val);
-  });
-
+  const all = Array.from(nodes.values());
   const trace = {
     type: "treemap",
-    labels: labels,
-    parents: parents,
-    values: values,
+    ids: all.map((n) => n.id),
+    labels: all.map((n) => n.label),
+    parents: all.map((n) => n.parent),
+    values: all.map((n) => n.value),
+    branchvalues: "total",
     textinfo: "label+value",
     marker: { line: { width: 1, color: "#1e293b" } },
   };
@@ -590,17 +598,18 @@ function renderDonutChart(data) {
 
   const modeTotals = {};
   data.forEach((row) => {
-    const m = row.cognitive_mode || "Deep_Work";
+    const m = row.cognitive_mode || UNCLASSIFIED_MODE;
     modeTotals[m] = (modeTotals[m] || 0) + (row.total_sec || 0);
   });
+  const modeKeys = Object.keys(modeTotals);
 
   const trace = {
     type: "pie",
-    labels: Object.keys(modeTotals),
-    values: Object.values(modeTotals),
+    labels: modeKeys.map((m) => modeInfo(m).label),
+    values: modeKeys.map((m) => modeTotals[m]),
     hole: 0.5,
     marker: {
-      colors: ["#38bdf8", "#10b981", "#8b5cf6", "#f59e0b", "#64748b"],
+      colors: modeKeys.map((m) => modeInfo(m).color),
     },
     textinfo: "percent",
   };
@@ -814,6 +823,10 @@ async function loadCircadianView() {
     const data = await apiGet("/api/telemetry/circadian");
 
     document.getElementById("circadian-total-events").innerText = `${(data.total_events || 0).toLocaleString("fr-FR")} horodatages`;
+    // Diagnostic déduit des données par l'API (seuils explicites), plus de libellé figé (B9)
+    const diag = data.diagnosis || {};
+    document.getElementById("circadian-profile-label").innerText = `Profil : ${diag.label || "—"}`;
+    document.getElementById("circadian-profile-desc").innerText = diag.description || "";
 
     // 1. Heatmap 24h x 7j
     renderCircadianHeatmap(data);
@@ -1369,8 +1382,13 @@ function bindDelegatedActions() {
   });
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   bindDelegatedActions();
+  try {
+    await loadVocabulary();
+  } catch (err) {
+    showToast("Vocabulaire de l'API indisponible", "warning");
+  }
 
   // 1. Initialisation Bandeau & Statut
   updateSystemStatus();

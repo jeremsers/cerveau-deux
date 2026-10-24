@@ -24,9 +24,15 @@ import plotly.graph_objects as go
 import pyperclip
 import streamlit as st
 
-from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
+from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_cognitive_mode, normalize_to_macro_topic, settings
 from src.consolidators.kanban_engine import build_project_record, kanban_engine
 from src.database.db_manager import DBManager
+from src.utils.cognitive_metrics import (
+    HYPERFOCUS_TUNNEL_MIN_SEC,
+    compute_drift_status,
+    compute_focus_tunnels,
+    diagnose_circadian,
+)
 
 # Configuration de styles CSS avancés
 APP_CUSTOM_CSS = """
@@ -116,8 +122,18 @@ def load_timeline_for_date(target_date_str: str) -> pd.DataFrame:
     df["timestamp_end"] = pd.to_datetime(df["timestamp_end"])
     df["duration_min"] = (df["duration_sec"] / 60.0).round(1)
     df["semantic_topic"] = df["semantic_topic"].fillna("Non_Classe")
-    df["cognitive_mode"] = df["cognitive_mode"].fillna("exploration")
+    df["cognitive_mode"] = df["cognitive_mode"].apply(normalize_cognitive_mode)
     return df
+
+
+@st.cache_data(ttl=30)
+def load_today_production_sec() -> int:
+    """Production active du jour (mode production avec saisie), pour déplier le bootloader (B8)."""
+    rows = get_db_manager().fetch_timeline_for_date(date.today().isoformat())
+    return sum(
+        int(r.get("duration_sec") or 0) for r in rows
+        if normalize_cognitive_mode(r.get("cognitive_mode")) == "production" and r.get("active_input")
+    )
 
 
 @st.cache_data(ttl=30)
@@ -128,7 +144,7 @@ def load_treemap_data() -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     df["duration_hours"] = (df["total_sec"] / 3600.0).round(2)
-    df["cognitive_mode"] = df["cognitive_mode"].fillna("exploration")
+    df["cognitive_mode"] = df["cognitive_mode"].apply(normalize_cognitive_mode)
     df["semantic_topic"] = df["semantic_topic"].fillna("Non_Classe")
     df["executable"] = df["executable"].fillna("Inconnu")
     return df
@@ -283,18 +299,12 @@ def render_dashboard() -> None:
     # Alerte de Dérive Attentionnelle (Drift Guard - Module 8)
     if settings.DRIFT_STATE_PATH.exists():
         try:
-            drift_info = json.loads(settings.DRIFT_STATE_PATH.read_text(encoding="utf-8"))
-            if drift_info.get("active_alert"):
-                det_str = drift_info.get("detected_at")
-                is_recent = False
-                if det_str:
-                    det_dt = datetime.fromisoformat(det_str)
-                    if (datetime.now() - det_dt).total_seconds() < 3600:
-                        is_recent = True
-                if is_recent:
-                    drift_type = drift_info.get("drift_type", "Attention Drift")
-                    diagnostic = drift_info.get("diagnostic", "Dérive attentionnelle constatée.")
-                    st.warning(f"⚠️ **Garde-Fou Attentionnel [{drift_type}]** : {diagnostic}")
+            drift = compute_drift_status(json.loads(settings.DRIFT_STATE_PATH.read_text(encoding="utf-8")))
+            if drift.active:
+                st.warning(
+                    f"⚠️ **Garde-Fou Attentionnel [{drift.drift_type or 'Attention Drift'}]** : "
+                    f"{drift.diagnostic or 'Dérive attentionnelle constatée.'}"
+                )
         except Exception:
             pass
 
@@ -302,7 +312,7 @@ def render_dashboard() -> None:
     if settings.BOOTLOADER_PATH.exists():
         try:
             bootloader_text = settings.BOOTLOADER_PATH.read_text(encoding="utf-8")
-            expand_bootloader = bool(kpis.get("active_prod_hours", 0.0) == 0.0)
+            expand_bootloader = load_today_production_sec() == 0
             with st.expander("🚀 Context Bootloader — Reprise Rapide & État Mental", expanded=expand_bootloader):
                 st.markdown(bootloader_text)
         except Exception:
@@ -376,14 +386,19 @@ def render_dashboard() -> None:
             st.plotly_chart(fig_gantt, use_container_width=True)
 
             # Détection et mise en exergue des blocs d'hyperfocus (> 30 min)
-            hyperfocus_blocks = df_day[df_day["duration_sec"] >= 1800].sort_values("duration_sec", ascending=False)
-            if not hyperfocus_blocks.empty:
+            hyperfocus_blocks = sorted(
+                (t for t in compute_focus_tunnels(df_day.to_dict("records")) if t.duration_sec >= HYPERFOCUS_TUNNEL_MIN_SEC),
+                key=lambda t: t.duration_sec,
+                reverse=True,
+            )
+            if hyperfocus_blocks:
                 st.markdown("#### 🎯 Tunnels d'Hyperfocus Détectés (≥ 30 min)")
-                for _, hrow in hyperfocus_blocks.iterrows():
-                    dur_h = round(hrow["duration_sec"] / 3600.0, 2)
+                for tunnel in hyperfocus_blocks:
+                    dur_h = round(tunnel.duration_sec / 3600.0, 2)
                     st.success(
-                        f"**{dur_h}h ({int(hrow['duration_sec'] / 60)} min)** sur **{hrow['executable']}** "
-                        f"— Topic: `#{hrow['semantic_topic']}` | Mode: `{hrow['cognitive_mode']}` | *{hrow['window_title'][:80]}*"
+                        f"**{dur_h}h ({tunnel.duration_sec // 60} min)** sur **{tunnel.executable}** "
+                        f"— Topic: `#{tunnel.topic}` | {tunnel.start_time[11:16]} → {tunnel.end_time[11:16]} "
+                        f"| *{tunnel.top_window_title[:80]}*"
                     )
 
             # Tableau des fenêtres du jour
@@ -460,7 +475,7 @@ def render_dashboard() -> None:
     with tab3:
         st.subheader("Archéologie Longitudinale & Demi-Vie des Obsessions (2024 - 2026)")
         st.markdown(
-            "Ce module retrace l'histoire intellectuelle sur plus de 690 sessions de réflexion, "
+            f"Ce module retrace l'histoire intellectuelle sur {kpis['chat_count']} sessions de réflexion, "
             "distinguant les **Piliers Fondamentaux** (intérêts récurrents durables) des **Passions Éphémères** "
             "(pics d'obsession temporaires)."
         )
@@ -589,17 +604,17 @@ def render_dashboard() -> None:
             with qcol2:
                 night_count = len(df_circ[df_circ["hour"].isin([22, 23, 0, 1, 2, 3, 4, 5])])
                 night_pct = round((night_count / max(1, len(df_circ))) * 100, 1)
+                diagnosis = diagnose_circadian({
+                    q.split(". ", 1)[1]: int(c) for q, c in df_circ["quadrant"].value_counts().items()
+                })
 
                 st.markdown(
                     f"""
                     <div class="card-box">
                         <h4 style="color: #38bdf8; margin-top:0;">🦉 Diagnostic Chronobiologique</h4>
                         <p><b>Index Nocturne :</b> <span style="color:#a855f7; font-size:1.2rem; font-weight:bold;">{night_pct}%</span> de l'activité cognitive se déroule entre 22h et 06h.</p>
-                        <p><b>Profil Détecté :</b> <i>Chronotype du Loup / Chouette Nocturne (Delayed Sleep Phase Tendency)</i>.</p>
-                        <p style="font-size:0.9rem; color:#94a3b8;">
-                        La télémétrie confirme une concentration intense et des sessions d'hyperfocus sans friction pendant les heures calmes de la nuit.
-                        L'Exocortex aligne ses consolidations nocturnes pour s'exécuter à la clôture de ces fenêtres.
-                        </p>
+                        <p><b>Profil Détecté :</b> <i>{diagnosis['label']}</i>.</p>
+                        <p style="font-size:0.9rem; color:#94a3b8;">{diagnosis['description']}</p>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -610,7 +625,7 @@ def render_dashboard() -> None:
     # ------------------------------------------------------------------------------
     with tab5:
         st.subheader("🔍 Explorateur Épistémique & Archéologie des Empreintes")
-        st.caption("Recherche full-text dans les échanges Gemini historiques (6 649 messages) et analyse des 73 153 empreintes numériques.")
+        st.caption(f"Recherche full-text dans les échanges historiques ({kpis['total_turns']} tours) et analyse des {kpis['fp_count']} empreintes numériques.")
 
         tab5_sub1, tab5_sub2 = st.tabs([
             "💬 Volet A : Moteur de Recherche Gemini (Sessions & Messages)",
@@ -622,7 +637,7 @@ def render_dashboard() -> None:
         # ==========================================================================
         with tab5_sub1:
             st.markdown("#### Moteur de Recherche Full-Text (Takeout & Échanges Gemini)")
-            st.caption("Explorez les 6 649 messages et 480 sessions indexées dans la base épistémique.")
+            st.caption(f"Explorez les {kpis['total_turns']} tours et {kpis['chat_count']} sessions indexés dans la base épistémique.")
 
             c_q, c_top, c_st = st.columns([3, 2, 1])
             search_query = c_q.text_input(
@@ -732,7 +747,7 @@ def render_dashboard() -> None:
         # ==========================================================================
         with tab5_sub2:
             st.markdown("#### Archéologie des Empreintes Numériques (YouTube & Google Search)")
-            st.caption("Visualisez les 73 153 empreintes passées, les clusters de recherche en rafale et les connexions aux sessions Gemini.")
+            st.caption(f"Visualisez les {kpis['fp_count']} empreintes passées, les clusters de recherche en rafale et les connexions aux sessions Gemini.")
 
             # KPI bandeau
             fp_kpis = load_footprints_summary()

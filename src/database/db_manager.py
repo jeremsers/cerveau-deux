@@ -1367,9 +1367,9 @@ class DBManager:
         with self.get_ro_connection() as conn:
             cur = conn.execute(
                 """
-                SELECT 
-                    timestamp_start, timestamp_end, duration_sec, executable,
-                    window_title, active_input, input_intensity, semantic_topic, cognitive_mode
+                SELECT
+                    id, timestamp_start, timestamp_end, duration_sec, executable,
+                    window_title, url_or_path, active_input, input_intensity, semantic_topic, cognitive_mode
                 FROM raw_activity
                 WHERE DATE(timestamp_start) = ?
                 ORDER BY timestamp_start ASC;

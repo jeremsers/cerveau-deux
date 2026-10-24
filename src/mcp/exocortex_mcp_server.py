@@ -15,12 +15,13 @@ Garantit :
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -34,6 +35,7 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+from src import __version__
 from src.config import settings
 from src.database.db_manager import DBManager
 from src.database.graph_rag import HybridGraphRAG
@@ -327,6 +329,52 @@ MCP_TOOLS_SPEC = [
 ]
 
 
+# Anciens noms acceptés en entrée (compatibilité), jamais exposés par tools/list
+MCP_TOOL_ALIASES = {
+    "mcp_search_concepts": "search_exocortex_concepts",
+    "mcp_get_concept_note": "get_concept_note",
+    "mcp_get_recent_telemetry": "get_recent_episodic_telemetry",
+    "mcp_get_session_history": "get_session_history",
+    "mcp_get_kanban_queue": "get_active_kanban_queue",
+}
+
+
+def build_tool_functions(
+    db_manager: Optional[DBManager] = None,
+    concepts_dir: Optional[Path] = None,
+) -> Dict[str, Callable[..., Dict[str, Any]]]:
+    """
+    Table UNIQUE nom -> fonction typée des 5 outils (v0.5.4, B10). Les deux chemins (FastMCP du SDK
+    officiel et boucle JSON-RPC autonome) l'utilisent : mêmes noms, mêmes paramètres, mêmes résultats.
+    """
+    def search_exocortex_concepts(
+        query: str, topic: Optional[str] = None, top_k: int = 5, include_graph_neighbors: bool = True
+    ) -> Dict[str, Any]:
+        return mcp_search_concepts(query, topic, int(top_k), bool(include_graph_neighbors), db_manager)
+
+    def get_concept_note(slug_or_title: str) -> Dict[str, Any]:
+        return mcp_get_concept_note(slug_or_title, concepts_dir)
+
+    def get_recent_episodic_telemetry(days: int = 7) -> Dict[str, Any]:
+        return mcp_get_recent_telemetry(int(days), db_manager)
+
+    def get_session_history(session_id: str) -> Dict[str, Any]:
+        return mcp_get_session_history(session_id, db_manager)
+
+    def get_active_kanban_queue(project_id: str = "exocortex") -> Dict[str, Any]:
+        return mcp_get_kanban_queue(project_id, db_manager)
+
+    functions = {
+        "search_exocortex_concepts": search_exocortex_concepts,
+        "get_concept_note": get_concept_note,
+        "get_recent_episodic_telemetry": get_recent_episodic_telemetry,
+        "get_session_history": get_session_history,
+        "get_active_kanban_queue": get_active_kanban_queue,
+    }
+    assert set(functions) == {spec["name"] for spec in MCP_TOOLS_SPEC}
+    return functions
+
+
 # ==============================================================================
 # GESTIONNAIRE JSON-RPC 2.0 AUTONOME (FALLBACK SANS DÉPENDANCE MCP)
 # ==============================================================================
@@ -362,7 +410,7 @@ def handle_jsonrpc_request(
                 },
                 "serverInfo": {
                     "name": "Exocortex",
-                    "version": "0.2.2",
+                    "version": __version__,
                 },
             },
         }
@@ -388,35 +436,8 @@ def handle_jsonrpc_request(
         arguments = params.get("arguments") or {}
 
         try:
-            if tool_name in ("search_exocortex_concepts", "mcp_search_concepts"):
-                tool_result = mcp_search_concepts(
-                    query=arguments.get("query", ""),
-                    topic=arguments.get("topic"),
-                    top_k=int(arguments.get("top_k", 5)),
-                    include_graph_neighbors=bool(arguments.get("include_graph_neighbors", True)),
-                    db_manager=db_manager,
-                )
-            elif tool_name in ("get_concept_note", "mcp_get_concept_note"):
-                tool_result = mcp_get_concept_note(
-                    slug_or_title=arguments.get("slug_or_title", ""),
-                    concepts_dir=concepts_dir,
-                )
-            elif tool_name in ("get_recent_episodic_telemetry", "mcp_get_recent_telemetry"):
-                tool_result = mcp_get_recent_telemetry(
-                    days=int(arguments.get("days", 7)),
-                    db_manager=db_manager,
-                )
-            elif tool_name in ("get_session_history", "mcp_get_session_history"):
-                tool_result = mcp_get_session_history(
-                    session_id=arguments.get("session_id", ""),
-                    db_manager=db_manager,
-                )
-            elif tool_name in ("get_active_kanban_queue", "mcp_get_kanban_queue"):
-                tool_result = mcp_get_kanban_queue(
-                    project_id=arguments.get("project_id", "exocortex"),
-                    db_manager=db_manager,
-                )
-            else:
+            tool_fn = build_tool_functions(db_manager, concepts_dir).get(MCP_TOOL_ALIASES.get(tool_name, tool_name))
+            if tool_fn is None:
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -425,6 +446,8 @@ def handle_jsonrpc_request(
                         "message": f"Outil MCP inconnu : '{tool_name}'",
                     },
                 }
+            accepted = set(inspect.signature(tool_fn).parameters)
+            tool_result = tool_fn(**{k: v for k, v in arguments.items() if k in accepted})
 
             return {
                 "jsonrpc": "2.0",
@@ -469,38 +492,17 @@ def run_mcp_stdio_server(
     Lit les requêtes JSON-RPC 2.0 ligne par ligne sur sys.stdin et écrit
     exclusivement les réponses sur sys.stdout, tout en garantissant 0 print/log parasite.
     """
-    logger.info("Démarrage du Serveur MCP Exocortex v0.2.2 sur stdio...")
+    logger.info("Démarrage du Serveur MCP Exocortex v%s sur stdio...", __version__)
 
     # Vérification et initialisation de FastMCP si disponible
     try:
         from mcp.server.fastmcp import FastMCP  # type: ignore
 
         mcp_app = FastMCP("Exocortex")
-
-        @mcp_app.tool()
-        def search_concepts_tool(query: str, topic: Optional[str] = None, top_k: int = 5, include_graph_neighbors: bool = True) -> str:
-            res = mcp_search_concepts(query, topic, top_k, include_graph_neighbors, db_manager)
-            return json.dumps(res, ensure_ascii=False, indent=2)
-
-        @mcp_app.tool()
-        def get_concept_note_tool(slug_or_title: str) -> str:
-            res = mcp_get_concept_note(slug_or_title, concepts_dir)
-            return json.dumps(res, ensure_ascii=False, indent=2)
-
-        @mcp_app.tool()
-        def get_recent_telemetry_tool(days: int = 7) -> str:
-            res = mcp_get_recent_telemetry(days, db_manager)
-            return json.dumps(res, ensure_ascii=False, indent=2)
-
-        @mcp_app.tool()
-        def get_session_history_tool(session_id: str) -> str:
-            res = mcp_get_session_history(session_id, db_manager)
-            return json.dumps(res, ensure_ascii=False, indent=2)
-
-        @mcp_app.tool()
-        def get_active_kanban_queue_tool(project_id: str = "exocortex") -> str:
-            res = mcp_get_kanban_queue(project_id, db_manager)
-            return json.dumps(res, ensure_ascii=False, indent=2)
+        functions = build_tool_functions(db_manager, concepts_dir)
+        for spec in MCP_TOOLS_SPEC:
+            # Mêmes noms et descriptions que tools/list du moteur autonome
+            mcp_app.add_tool(functions[spec["name"]], name=spec["name"], description=spec["description"])
 
         logger.info("Bibliothèque officielle 'mcp' détectée : exécution via FastMCP.")
         mcp_app.run(transport="stdio")

@@ -44,6 +44,7 @@ from src.llm.prompts import (
     PROMPT_NIGHT_DAY_SYNTHESIS_SYSTEM,
     PROMPT_NIGHT_CONCEPT_SYNTHESIS_SYSTEM,
 )
+from src.utils.cognitive_metrics import compute_focus_tunnels
 from src.utils.markdown_io import (
     ConceptFrontmatter,
     ParsedConceptNote,
@@ -437,54 +438,12 @@ class NightConsolidator:
         # Tri décroissant des sujets
         sorted_topics = dict(sorted(topic_durations.items(), key=lambda x: x[1], reverse=True))
 
-        # --- Algorithme de Tunnels d'Hyperfocus ---
-        # Fusion des blocs partageant le même topic avec tolérance < 120s d'interruption
-        sorted_acts = sorted(
-            activities,
-            key=lambda x: datetime.strptime(x["timestamp_start"], "%Y-%m-%d %H:%M:%S")
-            if isinstance(x["timestamp_start"], str)
-            else x["timestamp_start"],
-        )
-
-        max_hyperfocus_sec = 0
-        max_hyperfocus_topic: Optional[str] = None
-        current_tunnel_topic: Optional[str] = None
-        current_tunnel_duration = 0
-        current_tunnel_interruption_sec = 0
-        context_switch_events = 0
-
-        for idx, act in enumerate(sorted_acts):
-            topic = act.get("semantic_topic") or "Non_Classe"
-            duration = act["duration_sec"]
-
-            if current_tunnel_topic is None:
-                current_tunnel_topic = topic
-                current_tunnel_duration = duration
-                continue
-
-            if topic == current_tunnel_topic:
-                # Même sujet : le tunnel continue (on réintègre l'interruption tolérée)
-                current_tunnel_duration += duration + current_tunnel_interruption_sec
-                current_tunnel_interruption_sec = 0
-            else:
-                # Sujet différent : vérifier si c'est une micro-interruption tolérée (< 120s)
-                if duration < 120 and (idx + 1 < len(sorted_acts)) and (sorted_acts[idx + 1].get("semantic_topic") == current_tunnel_topic):
-                    current_tunnel_interruption_sec += duration
-                    continue
-
-                # Rupture effective du tunnel
-                if current_tunnel_duration > max_hyperfocus_sec:
-                    max_hyperfocus_sec = current_tunnel_duration
-                    max_hyperfocus_topic = current_tunnel_topic
-
-                context_switch_events += 1
-                current_tunnel_topic = topic
-                current_tunnel_duration = duration
-                current_tunnel_interruption_sec = 0
-
-        if current_tunnel_duration > max_hyperfocus_sec:
-            max_hyperfocus_sec = current_tunnel_duration
-            max_hyperfocus_topic = current_tunnel_topic
+        # --- Tunnels d'Hyperfocus : définition unique partagée avec l'API et Streamlit (B7) ---
+        tunnels = compute_focus_tunnels(activities)
+        best_tunnel = max(tunnels, key=lambda t: t.duration_sec, default=None)
+        max_hyperfocus_sec = best_tunnel.duration_sec if best_tunnel else 0
+        max_hyperfocus_topic: Optional[str] = best_tunnel.topic if best_tunnel else None
+        context_switch_events = max(0, len(tunnels) - 1)
 
         # Calcul du taux de switch horaire et du ratio lecture/écriture
         active_hours = max(0.1, total_screen_sec / 3600.0)

@@ -29,7 +29,14 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src import __version__
-from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
+from src.config import (
+    AUTHORIZED_SEMANTIC_TOPICS,
+    COGNITIVE_MODES,
+    DISTILLATION_STATUSES,
+    normalize_cognitive_mode,
+    normalize_to_macro_topic,
+    settings,
+)
 from src.consolidators.drive_compiler import DriveCompiler
 from src.consolidators.kanban_engine import _slugify, build_project_record, kanban_engine
 from src.consolidators.night_consolidator import NightConsolidator
@@ -37,6 +44,13 @@ from src.database.db_manager import DBManager, ProjectRecord
 from src.database.graph_rag import HybridGraphRAG, extract_wikilinks
 from src.llm.ollama_client import HardwareProbe, llm_client
 from src.utils.markdown_io import parse_concept_file
+from src.utils.cognitive_metrics import (
+    HYPERFOCUS_TUNNEL_MIN_SEC,
+    build_daily_kpis,
+    compute_drift_status,
+    compute_focus_tunnels,
+    diagnose_circadian,
+)
 from src.utils.local_auth import TOKEN_HEADER, get_local_token, token_matches
 from src.utils.path_safety import UnsafePathError, resolve_within
 
@@ -180,11 +194,11 @@ def get_system_status() -> Dict[str, Any]:
         except Exception as exc:
             logger.warning("Échec lecture bootloader : %s", exc)
 
-    # Chargement Drift state
-    drift_state: Dict[str, Any] = {"drift_detected": False, "mode": "STABLE"}
+    # État du DriftGuard : objet stable, `active` calculé côté serveur (alerte de moins d'une heure, B3)
+    raw_drift: Optional[Dict[str, Any]] = None
     if settings.DRIFT_STATE_PATH.exists():
         try:
-            drift_state = json.loads(settings.DRIFT_STATE_PATH.read_text(encoding="utf-8"))
+            raw_drift = json.loads(settings.DRIFT_STATE_PATH.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.warning("Échec lecture drift_state : %s", exc)
 
@@ -196,7 +210,17 @@ def get_system_status() -> Dict[str, Any]:
         },
         "ollama_alive": alive,
         "bootloader_content": bootloader_content,
-        "drift_state": drift_state,
+        "drift_state": compute_drift_status(raw_drift).model_dump(),
+    }
+
+
+@app.get("/api/meta/vocabulary")
+def get_vocabulary() -> Dict[str, Any]:
+    """Vocabulaires partagés (modes cognitifs, statuts de distillation, topics) servis aux interfaces (B2, B5)."""
+    return {
+        "cognitive_modes": [{"key": k, **v} for k, v in COGNITIVE_MODES.items()],
+        "distillation_statuses": [{"key": k, "label": v} for k, v in DISTILLATION_STATUSES.items()],
+        "semantic_topics": list(AUTHORIZED_SEMANTIC_TOPICS.keys()),
     }
 
 
@@ -263,49 +287,30 @@ def get_telemetry_timeline(date_str: Optional[str] = Query(None, alias="date")) 
             raise HTTPException(status_code=400, detail="Format de date invalide (attendu: YYYY-MM-DD)")
 
     events = db.fetch_timeline_for_date(target_str)
-
-    # Récupération ou calcul des métriques journalières
-    daily_metric: Dict[str, Any] = {}
-    with db.get_ro_connection() as conn:
-        cur = conn.execute("SELECT * FROM daily_metrics WHERE date = ?;", (target_str,))
-        row = cur.fetchone()
-        if row:
-            daily_metric = dict(row)
-
-    # Extraction des tunnels d'hyperfocus (durée >= 30 min / 1800 s)
-    focus_tunnels: List[Dict[str, Any]] = []
     for ev in events:
-        dur = ev.get("duration_sec") or 0
-        if dur >= 1800:
-            focus_tunnels.append({
-                "start_time": ev.get("timestamp_start"),
-                "end_time": ev.get("timestamp_end"),
-                "duration_sec": dur,
-                "executable": ev.get("executable"),
-                "top_window_title": ev.get("window_title"),
-            })
+        ev["cognitive_mode"] = normalize_cognitive_mode(ev.get("cognitive_mode"))
 
-    if not daily_metric:
-        total_active = sum(e.get("duration_sec") or 0 for e in events)
-        total_deep = sum(e.get("duration_sec") or 0 for e in events if e.get("cognitive_mode") == "Deep_Work")
-        chat_turns = 0
-        with db.get_ro_connection() as conn:
-            cur = conn.execute("SELECT SUM(turn_count) FROM chat_sessions WHERE DATE(timestamp_start) = ?;", (target_str,))
-            r = cur.fetchone()
-            if r and r[0]:
-                chat_turns = r[0]
+    with db.get_ro_connection() as conn:
+        row = conn.execute("SELECT * FROM daily_metrics WHERE date = ?;", (target_str,)).fetchone()
+        turns_row = conn.execute(
+            "SELECT SUM(turn_count) FROM chat_sessions WHERE DATE(timestamp_start) = ?;", (target_str,)
+        ).fetchone()
+    chat_turns = int(turns_row[0] or 0) if turns_row else 0
 
-        daily_metric = {
-            "total_active_sec": total_active,
-            "total_deep_work_sec": total_deep,
-            "hyperfocus_tunnel_count": len(focus_tunnels),
-            "total_chat_turns": chat_turns,
-        }
+    # Tunnels : même définition que la consolidation nocturne et Streamlit (B7)
+    tunnels = compute_focus_tunnels(events)
+    focus_tunnels = [
+        t.model_dump() for t in sorted(tunnels, key=lambda t: t.start_time)
+        if t.duration_sec >= HYPERFOCUS_TUNNEL_MIN_SEC
+    ]
+
+    # KPIs : un seul modèle construit dans les deux cas, journée consolidée ou non (B1)
+    kpis = build_daily_kpis(target_str, events, tunnels, chat_turns, dict(row) if row else None)
 
     return {
         "date": target_str,
         "events": events,
-        "daily_metric": daily_metric,
+        "daily_metric": kpis.model_dump(),
         "focus_tunnels": focus_tunnels,
     }
 
@@ -313,7 +318,11 @@ def get_telemetry_timeline(date_str: Optional[str] = Query(None, alias="date")) 
 @app.get("/api/telemetry/treemap")
 def get_telemetry_treemap() -> List[Dict[str, Any]]:
     """Retourne les données d'agrégation hiérarchique pour le Treemap cognitif."""
-    return _get_read_db().fetch_treemap_data()
+    rows = _get_read_db().fetch_treemap_data()
+    for r in rows:
+        r["cognitive_mode"] = normalize_cognitive_mode(r.get("cognitive_mode"))
+        r["semantic_topic"] = r.get("semantic_topic") or "Non_Classe"
+    return rows
 
 
 @app.get("/api/telemetry/archaeology")
@@ -451,6 +460,7 @@ def get_telemetry_circadian() -> Dict[str, Any]:
         "matrix": matrix,
         "quadrants": quadrants,
         "total_events": len(timestamps),
+        "diagnosis": diagnose_circadian(quadrants),
     }
 
 

@@ -35,6 +35,35 @@ AUTHORIZED_SEMANTIC_TOPICS: Dict[str, str] = {
 }
 
 
+# ==============================================================================
+# VOCABULAIRES PARTAGÉS BACKEND ↔ INTERFACES (v0.5.4, B2/B5)
+# ==============================================================================
+# Source unique servie par l'API (/api/meta/vocabulary) : les interfaces ne codent plus
+# leurs propres listes de modes ou de statuts.
+
+COGNITIVE_MODES: Dict[str, Dict[str, str]] = {
+    "production": {"label": "Production", "color": "#38bdf8"},
+    "exploration": {"label": "Exploration", "color": "#f59e0b"},
+    "chat_ia": {"label": "Chat IA", "color": "#8b5cf6"},
+    "gaming": {"label": "Gaming", "color": "#f43f5e"},
+    "media": {"label": "Média", "color": "#10b981"},
+    "non_classe": {"label": "Non classé", "color": "#64748b"},
+}
+UNCLASSIFIED_MODE = "non_classe"
+
+DISTILLATION_STATUSES: Dict[str, str] = {
+    "success": "Distillée",
+    "pending": "En attente",
+    "misc_noise": "Bruit (triviale)",
+    "failed_fallback": "Échec (quarantaine)",
+}
+
+
+def normalize_cognitive_mode(mode: Optional[str]) -> str:
+    """Ramène un mode inconnu ou NULL à 'non_classe' (jamais à un mode arbitraire)."""
+    return mode if mode in COGNITIVE_MODES else UNCLASSIFIED_MODE
+
+
 def normalize_to_macro_topic(raw_topic: str) -> str:
     """
     Normalise de façon déterministe n'importe quel tag hérité ou émergent

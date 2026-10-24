@@ -31,6 +31,10 @@ httpx>=0.27.0
 requests>=2.31.0
 google-genai>=1.0.0
 
+# --- Serveur MCP (optionnel : à défaut, moteur JSON-RPC autonome intégré) ---
+# Épinglé sur la branche 1.x : mcp.server.fastmcp n'existe plus sous ce chemin en 2.x (v0.5.4, B10)
+mcp>=1.2,<2
+
 # --- Dashboard & Visualisation Interactive ---
 streamlit>=1.35.0
 plotly>=5.22.0
