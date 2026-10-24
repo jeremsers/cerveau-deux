@@ -20,10 +20,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src import __version__
 from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
@@ -34,6 +37,7 @@ from src.database.db_manager import DBManager, ProjectRecord
 from src.database.graph_rag import HybridGraphRAG, extract_wikilinks
 from src.llm.ollama_client import HardwareProbe, llm_client
 from src.utils.markdown_io import parse_concept_file
+from src.utils.local_auth import TOKEN_HEADER, get_local_token, token_matches
 from src.utils.path_safety import UnsafePathError, resolve_within
 
 logger = logging.getLogger("Exocortex.API")
@@ -81,14 +85,76 @@ app = FastAPI(
     description="API REST unifiée pour l'Exocortex, la télémétrie cognitive, le GraphRAG et le Kanban SOTA.",
 )
 
-# Configuration CORS pour dev local et UI intégrées
+# ==============================================================================
+# SÉCURITÉ HTTP (v0.5.2 — D1, D2, D5)
+# ==============================================================================
+# Modèle de menace : une page web ouverte dans le navigateur de l'utilisateur ne doit ni lire
+# les données (CORS restreint, Host vérifié contre le DNS rebinding) ni déclencher d'écriture
+# (jeton local exigé dans un en-tête personnalisé, donc soumis à un pré-vol CORS refusé).
+
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' https://cdn.plot.ly https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
+
+_TOKEN_EXEMPT_PATHS = {"/api/auth/token"}
+# Routes GET à effet de bord (bascule de statut, chargement du modèle d'embedding, arborescence disque)
+_PROTECTED_GET_PATTERN = re.compile(r"^/api/kanban/tasks/[^/]+/(context-pack|coder-prompt)$")
+
+
+def _requires_token(method: str, path: str) -> bool:
+    if not path.startswith("/api/") or path in _TOKEN_EXEMPT_PATHS:
+        return False
+    if method in ("GET", "HEAD"):
+        return bool(_PROTECTED_GET_PATTERN.match(path))
+    return method != "OPTIONS"
+
+
+async def security_middleware(request: Request, call_next):
+    """Vérifie le jeton local des routes sensibles et pose les en-têtes de sécurité."""
+    if _requires_token(request.method, request.url.path) and not token_matches(
+        "api", request.headers.get(TOKEN_HEADER)
+    ):
+        response = JSONResponse(status_code=401, content={"detail": "Jeton local manquant ou invalide."})
+    else:
+        response = await call_next(request)
+    response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+# Ordre Starlette : le dernier middleware ajouté est le plus externe (CORS répond aux pré-vols).
+app.add_middleware(BaseHTTPMiddleware, dispatch=security_middleware)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.WEB_GUI_ALLOWED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.WEB_GUI_CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", TOKEN_HEADER],
 )
+
+
+@app.get("/api/auth/token")
+def get_api_token(request: Request) -> Dict[str, str]:
+    """
+    Remet le jeton local à l'interface web servie par ce serveur (même origine) ou à une
+    origine de développement autorisée. Une page tierce reçoit 403 et, faute d'en-tête CORS,
+    ne pourrait de toute façon pas lire la réponse.
+    """
+    fetch_site = request.headers.get("sec-fetch-site")
+    origin = request.headers.get("origin")
+    same_origin = fetch_site in (None, "same-origin", "none")
+    if not same_origin and origin not in settings.WEB_GUI_CORS_ORIGINS:
+        raise HTTPException(status_code=403, detail="Origine non autorisée.")
+    return {"token": get_local_token("api"), "header": TOKEN_HEADER}
 
 
 def _get_read_db() -> DBManager:

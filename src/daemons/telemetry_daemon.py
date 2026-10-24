@@ -43,6 +43,7 @@ from src.config import settings
 from src.daemons.git_ide_probe import GitIDEProbe
 from src.daemons.browser_telemetry_receiver import BrowserTelemetryServer
 from src.database.db_manager import DBManager, RawActivityRecord
+from src.utils.privacy import is_browser_executable, is_sensitive_window
 
 logger = logging.getLogger("Exocortex.TelemetryDaemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -346,16 +347,11 @@ class TelemetryDaemon:
         sys.exit(0)
 
     def is_blacklisted(self, executable: str, window_title: str) -> bool:
-        """Vérifie si la fenêtre courante contient un titre ou un exécutable interdit (mots de passe, banques)."""
-        exe_lower = executable.lower()
-        if any(b_exe.lower() in exe_lower for b_exe in settings.EXE_BLACKLIST):
-            return True
-
-        title_lower = window_title.lower()
-        if any(b_title.lower() in title_lower for b_title in settings.TITLE_BLACKLIST):
-            return True
-
-        return False
+        """
+        Vérifie si la fenêtre courante est exclue (gestionnaire de mots de passe, banque, navigation
+        privée). Correspondance en mots entiers et sur l'exécutable exact (v0.5.2, D7).
+        """
+        return is_sensitive_window(executable, window_title)
 
     def get_foreground_window_info(self) -> Tuple[int, str, str]:
         """
@@ -550,7 +546,7 @@ class TelemetryDaemon:
                     self.current_state.url_or_path = git_info
 
             # 2. Rattachement automatique du dernier onglet navigateur si applicable
-            elif any(b_name in executable.lower() for b_name in ["chrome", "msedge", "brave", "firefox", "opera"]):
+            elif is_browser_executable(executable):
                 if self.browser_server and self.browser_server.last_tab_telemetry:
                     last_tab = self.browser_server.last_tab_telemetry
                     if (datetime.now() - last_tab["timestamp"]).total_seconds() < 45.0:

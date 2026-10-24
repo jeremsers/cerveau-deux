@@ -5,38 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Exocortex // Cognitive Command Center</title>
   
-  <!-- Tailwind CSS CDN -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            cyber: {
-              950: '#070a12',
-              900: '#0d1322',
-              850: '#111827',
-              800: '#131b2e',
-              700: '#1f293d',
-              cyan: '#38bdf8',
-              blue: '#3b82f6',
-              purple: '#8b5cf6',
-              emerald: '#10b981',
-              amber: '#f59e0b',
-              rose: '#f43f5e',
-            }
-          }
-        }
-      }
-    }
-  </script>
-
-  <!-- Plotly.js CDN -->
-  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-  
-  <!-- Marked.js CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- Bibliothèques tierces : versions épinglées + Subresource Integrity (v0.5.2, D5).
+       Pour mettre à jour : changer la version ET recalculer l'empreinte sha384.
+       Tailwind Play 3.4.16 est servi en local : son CDN n'envoie pas d'en-tête CORS, ce qui rend SRI impossible. -->
+  <script src="vendor/tailwindcss-play-3.4.16.js"></script>
+  <script src="tailwind.config.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" integrity="sha384-7TVmlZWH60iKX5Uk7lSvQhjtcgw2tkFjuwLcXoRSR4zXTyWFJRm9aPAguMh7CIra" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous"></script>
 
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -53,7 +29,7 @@
       <div>
         <div class="flex items-center gap-2">
           <span class="font-bold tracking-wider text-sm text-slate-100">EXOCORTEX</span>
-          <span class="text-xs px-2 py-0.5 rounded bg-cyber-cyan/10 text-cyber-cyan font-mono border border-cyber-cyan/30">v0.5.1 SOTA</span>
+          <span class="text-xs px-2 py-0.5 rounded bg-cyber-cyan/10 text-cyber-cyan font-mono border border-cyber-cyan/30">v0.5.2 SOTA</span>
         </div>
         <p class="text-[11px] text-slate-400 font-mono tracking-tight">Command Center Cognitif & Télémétrie</p>
       </div>

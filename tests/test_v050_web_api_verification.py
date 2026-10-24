@@ -31,7 +31,9 @@ from src.utils.markdown_io import ConceptFrontmatter, ParsedConceptNote, write_c
 def api_client() -> Generator[TestClient, None, None]:
     """Client de test FastAPI pour les requêtes HTTP in-memory."""
     settings.ensure_directories()
-    with TestClient(app) as client:
+    from src.utils.local_auth import TOKEN_HEADER, get_local_token
+
+    with TestClient(app, base_url="http://127.0.0.1", headers={TOKEN_HEADER: get_local_token("api")}) as client:
         yield client
 
 

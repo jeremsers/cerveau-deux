@@ -18,27 +18,30 @@ from typing import Any, Dict, Optional, Tuple
 from src.config import settings
 from src.daemons.git_ide_probe import sanitize_url
 from src.database.db_manager import DBManager
+from src.utils.local_auth import TOKEN_HEADER, get_local_token, token_matches
+from src.utils.privacy import (
+    contains_secret_disclosure,
+    contains_sensitive_term,
+    is_browser_executable,
+    is_sensitive_url,
+)
 
 logger = logging.getLogger("Exocortex.BrowserReceiver")
 
 
-def is_payload_blacklisted(*texts: Optional[str]) -> bool:
+EXTENSION_ORIGIN_PREFIXES = ("chrome-extension://", "moz-extension://", "extension://")
+
+
+def is_payload_blacklisted(*texts: Optional[str], urls: Tuple[Optional[str], ...] = ()) -> bool:
     """
-    Vérifie si l'un des textes fournis contient un terme de la liste noire de confidentialité
-    (titres interdits, mots de passe, gestionnaires de secrets, établissements bancaires).
+    Vrai si l'une des URL appartient à un domaine sensible, ou si l'un des textes contient un terme
+    de la liste noire en mot entier (navigation privée, gestionnaires de secrets, banques) — v0.5.2, D7.
     """
-    for t in texts:
-        if not t:
-            continue
-        t_low = t.lower()
-        for b_title in settings.TITLE_BLACKLIST:
-            if b_title.lower() in t_low:
-                return True
-        for b_exe in settings.EXE_BLACKLIST:
-            clean_exe = b_exe.lower().replace(".exe", "")
-            if clean_exe in t_low:
-                return True
-    return False
+    return any(is_sensitive_url(u) for u in urls) or contains_sensitive_term(*texts)
+
+
+def _is_extension_origin(origin: Optional[str]) -> bool:
+    return bool(origin) and origin.startswith(EXTENSION_ORIGIN_PREFIXES)
 
 
 class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
@@ -51,23 +54,57 @@ class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
         logger.debug("%s - " + format, self.address_string(), *args)
 
     def _send_cors_headers(self) -> None:
-        """Injecte les entêtes CORS pour autoriser les requêtes cross-origin de l'extension."""
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS, GET")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-        self.send_header("Access-Control-Max-Age", "86400")
+        """
+        En-têtes CORS réservés à l'extension (v0.5.2, D4) : l'origine n'est renvoyée que si elle
+        est une origine d'extension. Une page web ne peut donc ni lire les réponses ni passer le
+        pré-vol qu'impose l'en-tête X-Exocortex-Token.
+        """
+        origin = self.headers.get("Origin")
+        if _is_extension_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS, GET")
+            self.send_header("Access-Control-Allow-Headers", f"Content-Type, {TOKEN_HEADER}")
+            self.send_header("Access-Control-Max-Age", "86400")
 
     def do_OPTIONS(self) -> None:
         """Gère les requêtes préliminaires CORS (preflight)."""
-        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_response(HTTPStatus.NO_CONTENT if _is_extension_origin(self.headers.get("Origin")) else HTTPStatus.FORBIDDEN)
         self._send_cors_headers()
         self.end_headers()
 
+    def do_GET(self) -> None:
+        """GET /auth/token : remet le jeton partagé à l'extension (origine d'extension uniquement)."""
+        if self.path != "/auth/token":
+            self._send_json_error(HTTPStatus.NOT_FOUND, f"Route inconnue : {self.path}")
+            return
+        origin = self.headers.get("Origin")
+        # Une page web envoie toujours son Origin sur un fetch cross-origin : seule l'extension
+        # (origine chrome-extension://) ou un client local sans navigateur obtient le jeton.
+        if origin and not _is_extension_origin(origin):
+            self._send_json_error(HTTPStatus.FORBIDDEN, "Origine non autorisée")
+            return
+        self._send_json_response(HTTPStatus.OK, {"token": get_local_token("browser_receiver"), "header": TOKEN_HEADER})
+
     def do_POST(self) -> None:
         """Traite les flux /telemetry/tab et /telemetry/chat_turn."""
-        content_length = int(self.headers.get("Content-Length", 0))
+        if not token_matches("browser_receiver", self.headers.get(TOKEN_HEADER)):
+            self._send_json_error(HTTPStatus.UNAUTHORIZED, "Jeton local manquant ou invalide")
+            return
+
+        if "application/json" not in (self.headers.get("Content-Type") or "").lower():
+            self._send_json_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Type application/json requis")
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = 0
         if content_length <= 0:
             self._send_json_error(HTTPStatus.BAD_REQUEST, "Payload vide")
+            return
+        if content_length > settings.BROWSER_RECEIVER_MAX_BODY_BYTES:
+            self._send_json_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Payload trop volumineux")
             return
 
         try:
@@ -96,7 +133,7 @@ class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
         domain = str(data.get("domain") or "").strip()
 
         # Invariant 1 : Filtrage strict de confidentialité (204 No Content sans toucher SQLite ni RAM)
-        if is_payload_blacklisted(url, title, h1, domain):
+        if is_payload_blacklisted(title, h1, urls=(url, domain)):
             logger.info("Onglet rejeté par la blacklist de confidentialité : %s", domain or url[:30])
             self.send_response(HTTPStatus.NO_CONTENT)
             self._send_cors_headers()
@@ -116,8 +153,9 @@ class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
         }
         server.last_tab_telemetry = tab_info
 
+        # L'URL n'est rattachée qu'à une fenêtre de navigateur (jamais à VS Code ou autre, D4)
         daemon = server.daemon
-        if daemon and daemon.current_state:
+        if daemon and daemon.current_state and is_browser_executable(daemon.current_state.executable):
             daemon.current_state.url_or_path = clean_url
             if h1:
                 daemon.current_state.ocr_snippet = h1[:200]
@@ -141,7 +179,7 @@ class BrowserTelemetryRequestHandler(BaseHTTPRequestHandler):
             return
 
         # Invariant 1 : Filtrage strict de confidentialité (204 No Content)
-        if is_payload_blacklisted(user_prompt, ai_response, url):
+        if is_payload_blacklisted(user_prompt, ai_response, urls=(url,)) or contains_secret_disclosure(user_prompt):
             logger.info("Tour de chat IA rejeté par la blacklist de confidentialité (session: %s)", session_id)
             self.send_response(HTTPStatus.NO_CONTENT)
             self._send_cors_headers()

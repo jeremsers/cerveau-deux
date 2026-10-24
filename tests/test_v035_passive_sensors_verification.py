@@ -99,6 +99,17 @@ def test_git_ide_probe_formatting_and_cache():
         assert cached_result == result
 
 
+EXTENSION_ORIGIN = "chrome-extension://dummy-extension-id"
+
+
+def _extension_headers(base_url: str) -> dict:
+    """En-têtes envoyés par l'extension depuis v0.5.2 : jeton local obtenu via GET /auth/token."""
+    req = urllib.request.Request(f"{base_url}/auth/token", headers={"Origin": EXTENSION_ORIGIN})
+    with urllib.request.urlopen(req) as resp:
+        token = json.loads(resp.read().decode("utf-8"))["token"]
+    return {"Content-Type": "application/json", "Origin": EXTENSION_ORIGIN, "X-Exocortex-Token": token}
+
+
 # ==============================================================================
 # TEST 2 : RÉCEPTEUR HTTP LOCAL, TAB TELEMETRY ET FILTRAGE STRICT BLACKLIST
 # ==============================================================================
@@ -136,7 +147,7 @@ def test_browser_receiver_tab_and_blacklist(tmp_path: Path):
         )
         with urllib.request.urlopen(req_opt) as resp_opt:
             assert resp_opt.status in (200, 204)
-            assert resp_opt.headers.get("Access-Control-Allow-Origin") == "*"
+            assert resp_opt.headers.get("Access-Control-Allow-Origin") == "chrome-extension://dummy-extension-id"
 
         # 2. Requête valide : POST /telemetry/tab
         valid_payload = {
@@ -149,7 +160,7 @@ def test_browser_receiver_tab_and_blacklist(tmp_path: Path):
         req_valid = urllib.request.Request(
             f"{base_url}/telemetry/tab",
             data=body_bytes,
-            headers={"Content-Type": "application/json"},
+            headers=_extension_headers(base_url),
             method="POST",
         )
         with urllib.request.urlopen(req_valid) as resp_valid:
@@ -172,7 +183,7 @@ def test_browser_receiver_tab_and_blacklist(tmp_path: Path):
         req_black = urllib.request.Request(
             f"{base_url}/telemetry/tab",
             data=json.dumps(blacklisted_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_extension_headers(base_url),
             method="POST",
         )
         with urllib.request.urlopen(req_black) as resp_black:
@@ -216,7 +227,7 @@ def test_live_chat_turn_ingestion_idempotence(tmp_path: Path):
         req_1 = urllib.request.Request(
             f"{base_url}/telemetry/chat_turn",
             data=json.dumps(turn_1_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_extension_headers(base_url),
             method="POST",
         )
         with urllib.request.urlopen(req_1) as resp_1:
@@ -239,7 +250,7 @@ def test_live_chat_turn_ingestion_idempotence(tmp_path: Path):
         req_duplicate = urllib.request.Request(
             f"{base_url}/telemetry/chat_turn",
             data=json.dumps(turn_1_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_extension_headers(base_url),
             method="POST",
         )
         with urllib.request.urlopen(req_duplicate) as resp_dup:
@@ -266,7 +277,7 @@ def test_live_chat_turn_ingestion_idempotence(tmp_path: Path):
         req_2 = urllib.request.Request(
             f"{base_url}/telemetry/chat_turn",
             data=json.dumps(turn_2_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_extension_headers(base_url),
             method="POST",
         )
         with urllib.request.urlopen(req_2) as resp_2:
@@ -294,7 +305,7 @@ def test_live_chat_turn_ingestion_idempotence(tmp_path: Path):
         req_black = urllib.request.Request(
             f"{base_url}/telemetry/chat_turn",
             data=json.dumps(turn_blacklisted).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_extension_headers(base_url),
             method="POST",
         )
         with urllib.request.urlopen(req_black) as resp_black:

@@ -169,6 +169,11 @@ _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 _load_env_file(_ENV_FILE)
 
 
+def _env_list(name: str, default: str) -> List[str]:
+    """Lit une variable d'environnement sous forme de liste séparée par des virgules."""
+    return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+
+
 class Settings(BaseModel):
     """Configuration globale du système Exocortex avec validation Pydantic v2."""
 
@@ -284,6 +289,29 @@ class Settings(BaseModel):
     WEB_GUI_PORT: int = Field(
         default_factory=lambda: int(os.getenv("WEB_GUI_PORT", "8500"))
     )
+    # Origines autorisées en CORS sur l'API 8500 (dev front local uniquement, v0.5.2 D1).
+    # L'interface web servie par FastAPI est same-origin et n'en a pas besoin.
+    WEB_GUI_CORS_ORIGINS: List[str] = Field(
+        default_factory=lambda: _env_list(
+            "WEB_GUI_CORS_ORIGINS",
+            "http://localhost:4321,http://127.0.0.1:4321,http://localhost:5173,http://127.0.0.1:5173",
+        )
+    )
+    # Noms d'hôte acceptés (en-tête Host) : bloque le DNS rebinding vers 8500.
+    WEB_GUI_ALLOWED_HOSTS: List[str] = Field(
+        default_factory=lambda: _env_list("WEB_GUI_ALLOWED_HOSTS", "127.0.0.1,localhost")
+    )
+    BROWSER_RECEIVER_MAX_BODY_BYTES: int = Field(
+        default_factory=lambda: int(os.getenv("BROWSER_RECEIVER_MAX_BODY_BYTES", str(512 * 1024)))
+    )
+
+    # --- Compilation Google Drive : catégories jamais exportées (v0.5.2, D6) ---
+    DRIVE_EXCLUDED_TOPICS: List[str] = Field(
+        default_factory=lambda: _env_list(
+            "DRIVE_EXCLUDED_TOPICS",
+            "Sante_et_Pharmacologie,Introspection_et_Neuroatypie,Admin_Finance_et_Droit",
+        )
+    )
 
     # --- Détection Anti-Dérive / Rabbit Hole (v0.3.0 - Module 8) ---
     DRIFT_MAX_SWITCHES_30MIN: int = Field(
@@ -293,41 +321,50 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.getenv("DRIFT_MAX_PASSIVE_MIN", "90"))
     )
 
-    # --- Listes Noires de Confidentialité (Win32 Daemon) ---
+    # --- Listes Noires de Confidentialité (v0.5.2, D7) ---
+    # Termes recherchés en MOTS ENTIERS (insensible à la casse et aux accents) dans les titres de
+    # fenêtres, d'onglets et les tours de chat : navigation privée, gestionnaires de mots de passe,
+    # établissements bancaires et administrations. Les termes génériques ("login", "connexion",
+    # "bank", "password") ne sont plus utilisés : ils écartaient des fenêtres techniques légitimes.
+    # Extensible par TITLE_BLACKLIST_EXTRA (liste séparée par des virgules).
     TITLE_BLACKLIST: List[str] = Field(
         default_factory=lambda: [
-            "bitwarden",
-            "1password",
-            "keepass",
-            "inprivate",
-            "navigation privée",
-            "private browsing",
-            "incognito",
-            "banque",
-            "bank",
-            "paypal",
-            "impots.gouv.fr",
-            "credit-agricole",
-            "bourso",
-            "bnp paribas",
-            "societe generale",
-            "login",
-            "connexion",
-            "authenticator",
-            "mot de passe",
-            "password",
-            "master password",
-            "credentials",
-        ]
+            # Navigation privée
+            "inprivate", "navigation privée", "private browsing", "incognito", "fenêtre privée",
+            # Gestionnaires de mots de passe
+            "bitwarden", "1password", "keepass", "keepassxc", "lastpass", "dashlane", "proton pass",
+            # Banques, paiement et administrations
+            "boursorama", "boursobank", "crédit agricole", "credit agricole", "bnp paribas",
+            "société générale", "societe generale", "la banque postale", "caisse d'épargne",
+            "caisse d'epargne", "banque populaire", "crédit mutuel", "credit mutuel", "lcl",
+            "hello bank", "fortuneo", "monabanq", "revolut", "qonto", "paypal", "impots.gouv.fr",
+        ] + _env_list("TITLE_BLACKLIST_EXTRA", "")
+    )
+    # Domaines dont toute URL est exclue (correspondance sur le nom d'hôte et ses sous-domaines).
+    SENSITIVE_DOMAINS: List[str] = Field(
+        default_factory=lambda: [
+            "boursorama.com", "boursobank.com", "credit-agricole.fr", "ca-paris.fr", "bnpparibas.net",
+            "mabanque.bnpparibas", "societegenerale.fr", "labanquepostale.fr", "caisse-epargne.fr",
+            "banquepopulaire.fr", "creditmutuel.fr", "cic.fr", "lcl.fr", "hellobank.fr", "fortuneo.fr",
+            "monabanq.com", "revolut.com", "n26.com", "qonto.com", "paypal.com", "impots.gouv.fr",
+            "ameli.fr", "caf.fr", "franceconnect.gouv.fr", "bitwarden.com", "1password.com",
+            "lastpass.com", "dashlane.com", "accounts.google.com", "login.microsoftonline.com",
+            "login.live.com",
+        ] + _env_list("SENSITIVE_DOMAINS_EXTRA", "")
     )
     EXE_BLACKLIST: List[str] = Field(
         default_factory=lambda: [
             "keepass.exe",
+            "keepassxc.exe",
             "1password.exe",
             "bitwarden.exe",
+            "dashlane.exe",
             "credentialuihost.exe",
             "authhost.exe",
         ]
+    )
+    BROWSER_EXECUTABLES: List[str] = Field(
+        default_factory=lambda: ["chrome", "msedge", "brave", "firefox", "opera", "vivaldi"]
     )
 
     PROLONGED_SESSION_THRESHOLD_SEC: int = Field(

@@ -1,5 +1,5 @@
 /**
- * Exocortex Cognitive Command Center - Frontend Application Logic (v0.5.0).
+ * Exocortex Cognitive Command Center - Frontend Application Logic (v0.5.2).
  * Cyber-Dark Single Page Application (SPA).
  */
 
@@ -21,16 +21,34 @@ const state = {
 // UTILITAIRES API REST & PRESSE-PAPIER
 // =============================================================================
 
+// Jeton local exigé par l'API pour les écritures et routes sensibles (v0.5.2, D1)
+let apiToken = null;
+
+async function fetchApiToken() {
+  const res = await fetch("/api/auth/token", { headers: { Accept: "application/json" } });
+  if (!res.ok) throw new Error(`Jeton local refusé (HTTP ${res.status})`);
+  apiToken = (await res.json()).token;
+  return apiToken;
+}
+
 async function apiRequest(endpoint, options = {}) {
   try {
-    const res = await fetch(endpoint, {
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...options.headers,
-      },
-      ...options,
-    });
+    const send = async () =>
+      fetch(endpoint, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "X-Exocortex-Token": apiToken || (await fetchApiToken()),
+          ...options.headers,
+        },
+      });
+    let res = await send();
+    if (res.status === 401) {
+      // Jeton régénéré côté serveur : on le relit une fois
+      await fetchApiToken();
+      res = await send();
+    }
     if (!res.ok) {
       const errData = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(errData.detail || `Erreur HTTP ${res.status}`);
@@ -46,6 +64,29 @@ const apiGet = (url) => apiRequest(url, { method: "GET" });
 const apiPost = (url, body) => apiRequest(url, { method: "POST", body: JSON.stringify(body) });
 const apiPatch = (url, body) => apiRequest(url, { method: "PATCH", body: JSON.stringify(body) });
 const apiDelete = (url) => apiRequest(url, { method: "DELETE" });
+
+/**
+ * Échappe toute donnée insérée dans un gabarit HTML (v0.5.2, D2) : chats, titres de fenêtres,
+ * URL et fiches proviennent de sources externes et ne doivent jamais être interprétés.
+ */
+function esc(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/`/g, "&#96;");
+}
+
+/** Rend du Markdown en HTML assaini (DOMPurify) ; repli en texte brut si une bibliothèque manque. */
+function renderMarkdownSafe(container, markdown) {
+  if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+    container.innerHTML = DOMPurify.sanitize(marked.parse(markdown || ""));
+  } else {
+    container.textContent = markdown || "";
+  }
+}
 
 async function copyToClipboard(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -90,7 +131,7 @@ function showToast(message, type = "info") {
   toast.className = `toast px-4 py-2.5 rounded-lg border text-xs font-medium shadow-xl flex items-center gap-2.5 max-w-sm ${bgColors[type] || bgColors.info}`;
   toast.innerHTML = `
     <span>${icons[type] || "ℹ️"}</span>
-    <span class="flex-1">${message}</span>
+    <span class="flex-1">${esc(message)}</span>
   `;
 
   container.appendChild(toast);
@@ -112,14 +153,8 @@ function openMarkdownModal(title, markdownContent) {
   const modalTitle = document.getElementById("modal-markdown-title");
   const modalBody = document.getElementById("modal-markdown-body");
 
-  if (modalTitle) modalTitle.innerHTML = `<span>📄</span> <span>${title}</span>`;
-  if (modalBody) {
-    if (typeof marked !== "undefined") {
-      modalBody.innerHTML = marked.parse(markdownContent);
-    } else {
-      modalBody.innerText = markdownContent;
-    }
-  }
+  if (modalTitle) modalTitle.innerHTML = `<span>📄</span> <span>${esc(title)}</span>`;
+  if (modalBody) renderMarkdownSafe(modalBody, markdownContent);
 
   if (modal) modal.classList.remove("hidden");
 }
@@ -302,10 +337,10 @@ async function loadTimelineForDate(dateStr) {
         card.innerHTML = `
           <div class="flex items-center justify-between">
             <span class="font-bold text-emerald-400">🔥 ${durMin} min</span>
-            <span class="text-[10px] font-mono text-slate-400">${t.start_time?.slice(11, 16) || ""} - ${t.end_time?.slice(11, 16) || ""}</span>
+            <span class="text-[10px] font-mono text-slate-400">${esc(t.start_time?.slice(11, 16) || "")} - ${esc(t.end_time?.slice(11, 16) || "")}</span>
           </div>
-          <div class="font-semibold text-slate-200">${t.executable || "App"}</div>
-          <div class="text-[11px] text-slate-400 truncate">${t.top_window_title || "Sans titre"}</div>
+          <div class="font-semibold text-slate-200">${esc(t.executable || "App")}</div>
+          <div class="text-[11px] text-slate-400 truncate">${esc(t.top_window_title || "Sans titre")}</div>
         `;
         tunnelsList.appendChild(card);
       });
@@ -350,7 +385,7 @@ function renderGanttChart(events) {
     groupedByMode[mode].x0.push(ev.timestamp_start);
     groupedByMode[mode].x1.push(ev.timestamp_end);
     groupedByMode[mode].y.push(ev.executable || "Autre");
-    groupedByMode[mode].text.push(`${ev.window_title || ""}<br>${ev.url_or_path || ""}`);
+    groupedByMode[mode].text.push(`${esc(ev.window_title || "")}<br>${esc(ev.url_or_path || "")}`);
   });
 
   Object.keys(groupedByMode).forEach((mode) => {
@@ -434,17 +469,17 @@ function filterAndRenderTimelineTable() {
     const durSec = ev.duration_sec || 0;
     const durStr = durSec > 60 ? `${Math.floor(durSec / 60)}m ${durSec % 60}s` : `${durSec}s`;
 
-    let contextHtml = `<div class="truncate max-w-md font-sans text-slate-200" title="${ev.window_title || ''}">${ev.window_title || 'Sans titre'}</div>`;
+    let contextHtml = `<div class="truncate max-w-md font-sans text-slate-200" title="${esc(ev.window_title)}">${esc(ev.window_title || "Sans titre")}</div>`;
     if (ev.url_or_path) {
-      contextHtml += `<div class="text-[10px] text-cyber-cyan truncate max-w-md font-mono" title="${ev.url_or_path}">${ev.url_or_path}</div>`;
+      contextHtml += `<div class="text-[10px] text-cyber-cyan truncate max-w-md font-mono" title="${esc(ev.url_or_path)}">${esc(ev.url_or_path)}</div>`;
     }
 
     tr.innerHTML = `
-      <td class="py-2 px-3 text-slate-400">${startH}</td>
-      <td class="py-2 px-3 text-slate-300 font-semibold">${durStr}</td>
-      <td class="py-2 px-3 text-slate-100 font-semibold">${ev.executable || "App"}</td>
+      <td class="py-2 px-3 text-slate-400">${esc(startH)}</td>
+      <td class="py-2 px-3 text-slate-300 font-semibold">${esc(durStr)}</td>
+      <td class="py-2 px-3 text-slate-100 font-semibold">${esc(ev.executable || "App")}</td>
       <td class="py-2 px-3">${contextHtml}</td>
-      <td class="py-2 px-3"><span class="px-2 py-0.5 rounded text-[10px] bg-cyber-800 border border-cyber-700 text-slate-300">${ev.cognitive_mode || "Deep_Work"}</span></td>
+      <td class="py-2 px-3"><span class="px-2 py-0.5 rounded text-[10px] bg-cyber-800 border border-cyber-700 text-slate-300">${esc(ev.cognitive_mode || "Deep_Work")}</span></td>
     `;
     tbody.appendChild(tr);
   });
@@ -622,11 +657,11 @@ async function runGraphRAGSearch() {
         card.className = "cyber-card p-3 space-y-1.5 cursor-pointer hover:border-cyber-cyan transition";
         card.innerHTML = `
           <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-100 text-xs">${n.title}</span>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyber-cyan/20 text-cyber-cyan">${n.similarity_pct}% sim</span>
+            <span class="font-bold text-slate-100 text-xs">${esc(n.title)}</span>
+            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyber-cyan/20 text-cyber-cyan">${esc(n.similarity_pct)}% sim</span>
           </div>
-          <div class="text-[10px] font-mono text-purple-300">#${n.semantic_topic}</div>
-          <p class="text-[11px] text-slate-400 line-clamp-3 leading-relaxed">${n.excerpt}</p>
+          <div class="text-[10px] font-mono text-purple-300">#${esc(n.semantic_topic)}</div>
+          <p class="text-[11px] text-slate-400 line-clamp-3 leading-relaxed">${esc(n.excerpt)}</p>
         `;
         card.onclick = () => loadAndOpenConcept(n.slug);
         hop0Container.appendChild(card);
@@ -642,11 +677,11 @@ async function runGraphRAGSearch() {
         card.className = "cyber-card p-3 space-y-1.5 cursor-pointer hover:border-purple-400 transition";
         card.innerHTML = `
           <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-100 text-xs">${n.title}</span>
-            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300">Score: ${n.score}</span>
+            <span class="font-bold text-slate-100 text-xs">${esc(n.title)}</span>
+            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300">Score: ${esc(n.score)}</span>
           </div>
-          <div class="text-[10px] font-mono text-purple-300">#${n.semantic_topic}</div>
-          <p class="text-[11px] text-slate-400 line-clamp-3 leading-relaxed">${n.excerpt}</p>
+          <div class="text-[10px] font-mono text-purple-300">#${esc(n.semantic_topic)}</div>
+          <p class="text-[11px] text-slate-400 line-clamp-3 leading-relaxed">${esc(n.excerpt)}</p>
         `;
         card.onclick = () => loadAndOpenConcept(n.slug);
         hop1Container.appendChild(card);
@@ -660,7 +695,7 @@ async function runGraphRAGSearch() {
       bubble.className = `px-3 py-1.5 rounded-full text-xs font-mono flex items-center gap-1.5 cursor-pointer border ${
         isHop0 ? "bg-cyber-cyan/10 border-cyber-cyan/50 text-cyber-cyan hover:bg-cyber-cyan/20" : "bg-purple-900/30 border-purple-500/50 text-purple-300 hover:bg-purple-900/50"
       }`;
-      bubble.innerHTML = `<span>${isHop0 ? "🎯" : "🔗"}</span> <span>${nd.label}</span>`;
+      bubble.innerHTML = `<span>${isHop0 ? "🎯" : "🔗"}</span> <span>${esc(nd.label)}</span>`;
       bubble.onclick = () => loadAndOpenConcept(nd.id);
       vizContainer.appendChild(bubble);
     });
@@ -758,12 +793,12 @@ function filterAndRenderArchaeologyTable() {
     else if (item.archetype.includes("Émergent")) badgeClass = "bg-emerald-950/80 text-emerald-300 border-emerald-500/50";
 
     tr.innerHTML = `
-      <td class="py-2.5 px-3 font-semibold text-slate-200">${item.topic}</td>
-      <td class="py-2.5 px-3"><span class="px-2 py-0.5 rounded text-[10px] font-sans border ${badgeClass}">${item.archetype}</span></td>
-      <td class="py-2.5 px-3 text-right font-bold text-cyber-cyan">${item.session_count}</td>
-      <td class="py-2.5 px-3 text-slate-400">${item.first_focus}</td>
-      <td class="py-2.5 px-3 text-slate-400">${item.last_focus}</td>
-      <td class="py-2.5 px-3 text-right text-slate-300">${item.span_days} j</td>
+      <td class="py-2.5 px-3 font-semibold text-slate-200">${esc(item.topic)}</td>
+      <td class="py-2.5 px-3"><span class="px-2 py-0.5 rounded text-[10px] font-sans border ${badgeClass}">${esc(item.archetype)}</span></td>
+      <td class="py-2.5 px-3 text-right font-bold text-cyber-cyan">${esc(item.session_count)}</td>
+      <td class="py-2.5 px-3 text-slate-400">${esc(item.first_focus)}</td>
+      <td class="py-2.5 px-3 text-slate-400">${esc(item.last_focus)}</td>
+      <td class="py-2.5 px-3 text-right text-slate-300">${esc(item.span_days)} j</td>
       <td class="py-2.5 px-3 text-right text-slate-400">${item.total_chars.toLocaleString("fr-FR")}</td>
     `;
     tbody.appendChild(tr);
@@ -888,29 +923,29 @@ async function loadEpistemicChats() {
         notes = JSON.parse(s.generated_notes_json || "[]");
       } catch (e) {}
 
-      const topicsBadges = topics.map((t) => `<span class="px-1.5 py-0.5 rounded bg-cyber-800 text-slate-300 text-[10px] font-mono">#${t}</span>`).join(" ");
+      const topicsBadges = topics.map((t) => `<span class="px-1.5 py-0.5 rounded bg-cyber-800 text-slate-300 text-[10px] font-mono">#${esc(t)}</span>`).join(" ");
 
       const notesButtons = notes
-        .map((n) => `<button class="text-cyber-cyan hover:underline text-[11px] font-mono mr-2" onclick="loadAndOpenConcept('${n}')">[[${n}]]</button>`)
+        .map((n) => `<button class="text-cyber-cyan hover:underline text-[11px] font-mono mr-2" data-action="open-concept" data-slug="${esc(n)}">[[${esc(n)}]]</button>`)
         .join(" ");
 
       card.innerHTML = `
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="flex items-center gap-2">
-            <span class="font-bold text-slate-100 text-xs">${(s.timestamp_start || "").slice(0, 16)}</span>
-            <span class="px-2 py-0.5 rounded text-[10px] bg-cyber-blue/20 text-cyber-cyan font-mono">${s.turn_count} tours</span>
-            <span class="px-2 py-0.5 rounded text-[10px] bg-cyber-800 text-slate-400 font-mono">${s.user_char_count} chars</span>
+            <span class="font-bold text-slate-100 text-xs">${esc((s.timestamp_start || "").slice(0, 16))}</span>
+            <span class="px-2 py-0.5 rounded text-[10px] bg-cyber-blue/20 text-cyber-cyan font-mono">${esc(s.turn_count)} tours</span>
+            <span class="px-2 py-0.5 rounded text-[10px] bg-cyber-800 text-slate-400 font-mono">${esc(s.user_char_count)} chars</span>
           </div>
           <div>${topicsBadges}</div>
         </div>
-        <div class="text-xs text-slate-300 leading-relaxed">${s.summary || "Aucun résumé cognitif"}</div>
+        <div class="text-xs text-slate-300 leading-relaxed">${esc(s.summary || "Aucun résumé cognitif")}</div>
         ${notesButtons ? `<div class="pt-1 text-xs"><span class="text-slate-500 text-[11px]">Notes liées : </span>${notesButtons}</div>` : ""}
         <div class="pt-1 flex justify-end">
-          <button class="btn-cyber-ghost px-2.5 py-1 rounded text-[11px]" onclick="toggleChatMessages('${s.session_id}', this)">
+          <button class="btn-cyber-ghost px-2.5 py-1 rounded text-[11px]" data-action="toggle-chat" data-session-id="${esc(s.session_id)}">
             💬 Voir les échanges
           </button>
         </div>
-        <div id="chat-messages-${s.session_id}" class="hidden space-y-2 pt-2 border-t border-cyber-700/60"></div>
+        <div class="chat-messages hidden space-y-2 pt-2 border-t border-cyber-700/60"></div>
       `;
       container.appendChild(card);
     });
@@ -920,7 +955,7 @@ async function loadEpistemicChats() {
 }
 
 async function toggleChatMessages(sessionId, btn) {
-  const container = document.getElementById(`chat-messages-${sessionId}`);
+  const container = btn.closest(".cyber-card")?.querySelector(".chat-messages");
   if (!container) return;
 
   if (!container.classList.contains("hidden")) {
@@ -931,7 +966,7 @@ async function toggleChatMessages(sessionId, btn) {
 
   btn.innerText = "Chargement...";
   try {
-    const msgs = await apiGet(`/api/epistemic/chats/${sessionId}/messages`);
+    const msgs = await apiGet(`/api/epistemic/chats/${encodeURIComponent(sessionId)}/messages`);
     container.innerHTML = "";
 
     msgs.forEach((m, idx) => {
@@ -939,11 +974,11 @@ async function toggleChatMessages(sessionId, btn) {
       turnDiv.className = "p-2.5 rounded bg-cyber-900 border border-cyber-700/60 space-y-1.5 text-xs";
       turnDiv.innerHTML = `
         <div class="font-semibold text-slate-400 flex items-center justify-between">
-          <span>Tour ${idx + 1} (${m.user_char_count} chars)</span>
-          <span class="font-mono text-[10px]">${(m.timestamp || "").slice(11, 19)}</span>
+          <span>Tour ${idx + 1} (${esc(m.user_char_count)} chars)</span>
+          <span class="font-mono text-[10px]">${esc((m.timestamp || "").slice(11, 19))}</span>
         </div>
-        <div class="text-slate-200"><b class="text-cyber-cyan">Utilisateur:</b> ${m.user_prompt}</div>
-        <div class="text-slate-300 border-t border-cyber-700/40 pt-1.5"><b class="text-purple-400">Gemini:</b> ${m.ai_response}</div>
+        <div class="text-slate-200 whitespace-pre-wrap"><b class="text-cyber-cyan">Utilisateur:</b> ${esc(m.user_prompt)}</div>
+        <div class="text-slate-300 whitespace-pre-wrap border-t border-cyber-700/40 pt-1.5"><b class="text-purple-400">Assistant:</b> ${esc(m.ai_response)}</div>
       `;
       container.appendChild(turnDiv);
     });
@@ -975,10 +1010,10 @@ async function loadEpistemicFootprints() {
         const item = document.createElement("div");
         item.className = "flex items-center justify-between p-2 rounded bg-cyber-900 border border-cyber-700/60";
         item.innerHTML = `
-          <span class="text-slate-200 font-semibold truncate max-w-xs">${c.channel_or_domain}</span>
+          <span class="text-slate-200 font-semibold truncate max-w-xs">${esc(c.channel_or_domain)}</span>
           <div class="flex items-center gap-2">
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-cyber-800 text-slate-400 font-mono">${c.source}</span>
-            <span class="font-bold text-cyber-cyan font-mono">${c.footprint_count}</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-cyber-800 text-slate-400 font-mono">${esc(c.source)}</span>
+            <span class="font-bold text-cyber-cyan font-mono">${esc(c.footprint_count)}</span>
           </div>
         `;
         topList.appendChild(item);
@@ -994,10 +1029,10 @@ async function loadEpistemicFootprints() {
         item.className = "p-2 rounded bg-cyber-900 border border-cyber-700/60 space-y-1";
         item.innerHTML = `
           <div class="flex items-center justify-between">
-            <span class="font-bold text-amber-300 font-mono text-[11px]">${b.cluster_id}</span>
-            <span class="text-emerald-400 font-bold">${b.event_count} événements</span>
+            <span class="font-bold text-amber-300 font-mono text-[11px]">${esc(b.cluster_id)}</span>
+            <span class="text-emerald-400 font-bold">${esc(b.event_count)} événements</span>
           </div>
-          <div class="text-[11px] text-slate-400 truncate">${b.samples || ""}</div>
+          <div class="text-[11px] text-slate-400 truncate">${esc(b.samples || "")}</div>
         `;
         burstList.appendChild(item);
       });
@@ -1034,11 +1069,11 @@ async function searchFootprintsTable() {
       const tr = document.createElement("tr");
       tr.className = "hover:bg-cyber-800/40 transition";
       tr.innerHTML = `
-        <td class="py-2 px-3 text-slate-400">${(fp.timestamp || "").slice(0, 16)}</td>
-        <td class="py-2 px-3"><span class="px-1.5 py-0.5 rounded text-[10px] bg-cyber-800 text-slate-300">${fp.source}</span></td>
-        <td class="py-2 px-3 text-slate-200 font-semibold">${fp.channel_or_domain || "-"}</td>
-        <td class="py-2 px-3 text-slate-100 max-w-sm truncate" title="${fp.title_or_query || ''}">${fp.title_or_query || "-"}</td>
-        <td class="py-2 px-3 text-purple-300">${fp.semantic_topic || "-"}</td>
+        <td class="py-2 px-3 text-slate-400">${esc((fp.timestamp || "").slice(0, 16))}</td>
+        <td class="py-2 px-3"><span class="px-1.5 py-0.5 rounded text-[10px] bg-cyber-800 text-slate-300">${esc(fp.source)}</span></td>
+        <td class="py-2 px-3 text-slate-200 font-semibold">${esc(fp.channel_or_domain || "-")}</td>
+        <td class="py-2 px-3 text-slate-100 max-w-sm truncate" title="${esc(fp.title_or_query)}">${esc(fp.title_or_query || "-")}</td>
+        <td class="py-2 px-3 text-purple-300">${esc(fp.semantic_topic || "-")}</td>
       `;
       tbody.appendChild(tr);
     });
@@ -1188,35 +1223,36 @@ function createKanbanCardElement(task) {
     statusBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-cyber-cyan/20 text-cyber-cyan border border-cyber-cyan/40">PRÊT CODEUR</span>';
   }
 
+  const tid = esc(task.task_id);
   card.innerHTML = `
     <div class="flex items-center justify-between gap-1 text-[11px]">
       <div class="flex items-center gap-1.5 font-mono font-bold text-cyber-cyan">
-        <span>${task.task_id}</span>
+        <span>${tid}</span>
         ${prioBadges[task.priority] || ""}
-        <span class="px-1 py-0.5 rounded text-[10px] bg-cyber-800 text-slate-400 font-sans">${task.complexity}</span>
+        <span class="px-1 py-0.5 rounded text-[10px] bg-cyber-800 text-slate-400 font-sans">${esc(task.complexity)}</span>
       </div>
       <div>${statusBadge}</div>
     </div>
 
-    <div class="font-bold text-xs text-slate-100 leading-tight">${task.title}</div>
-    <div class="text-[10px] text-purple-300 font-mono">#${task.component_tag || "general"}</div>
+    <div class="font-bold text-xs text-slate-100 leading-tight">${esc(task.title)}</div>
+    <div class="text-[10px] text-purple-300 font-mono">#${esc(task.component_tag || "general")}</div>
 
-    ${task.summary_pitch ? `<p class="text-[11px] text-slate-400 line-clamp-2 leading-snug">${task.summary_pitch}</p>` : ""}
+    ${task.summary_pitch ? `<p class="text-[11px] text-slate-400 line-clamp-2 leading-snug">${esc(task.summary_pitch)}</p>` : ""}
 
-    <!-- Actions 1-Clic SOTA -->
+    <!-- Actions 1-Clic SOTA (délégation d'événements : aucun handler inline, CSP v0.5.2) -->
     <div class="pt-2 border-t border-cyber-700/60 flex flex-wrap items-center gap-1.5">
-      <button class="btn-cyber-action px-2 py-1 rounded text-[10px] flex items-center gap-1 font-semibold" title="Copier Context-Pack haute-fidélité pour Gemini Web" onclick="copyTaskContextPack('${task.task_id}')">
+      <button class="btn-cyber-action px-2 py-1 rounded text-[10px] flex items-center gap-1 font-semibold" title="Copier Context-Pack haute-fidélité pour Gemini Web" data-action="copy-context-pack" data-task-id="${tid}">
         <span>📋</span> <span>Context-Pack</span>
       </button>
 
-      <button class="btn-cyber-primary px-2 py-1 rounded text-[10px] flex items-center gap-1 font-semibold" title="Extraire le prompt codeur et basculer en cours" onclick="copyTaskCoderPrompt('${task.task_id}')">
+      <button class="btn-cyber-primary px-2 py-1 rounded text-[10px] flex items-center gap-1 font-semibold" title="Extraire le prompt codeur et basculer en cours" data-action="copy-coder-prompt" data-task-id="${tid}">
         <span>🤖</span> <span>Prompt Codeur</span>
       </button>
 
-      ${task.spec_file_path ? `<button class="btn-cyber-ghost px-2 py-1 rounded text-[10px]" title="Consulter la spec" onclick="viewTaskSpec('${task.task_id}')">📄 Spec</button>` : ""}
+      ${task.spec_file_path ? `<button class="btn-cyber-ghost px-2 py-1 rounded text-[10px]" title="Consulter la spec" data-action="view-spec" data-task-id="${tid}">📄 Spec</button>` : ""}
 
       <!-- Sélecteur rapide de statut -->
-      <select class="bg-cyber-900 border border-cyber-700 text-slate-300 text-[10px] rounded px-1.5 py-1 outline-none ml-auto" onchange="changeTaskStatus('${task.task_id}', this.value)">
+      <select class="bg-cyber-900 border border-cyber-700 text-slate-300 text-[10px] rounded px-1.5 py-1 outline-none ml-auto" data-action="change-status" data-task-id="${tid}">
         <option value="radar" ${task.status === "radar" ? "selected" : ""}>Radar</option>
         <option value="needs_spec" ${task.status === "needs_spec" ? "selected" : ""}>Needs Spec</option>
         <option value="ready_for_agent" ${task.status === "ready_for_agent" ? "selected" : ""}>Prêt</option>
@@ -1225,7 +1261,7 @@ function createKanbanCardElement(task) {
         <option value="icebox" ${task.status === "icebox" ? "selected" : ""}>Frigo</option>
       </select>
 
-      <button class="text-slate-500 hover:text-rose-400 text-xs px-1" title="Supprimer la tâche" onclick="deleteTask('${task.task_id}')">🗑️</button>
+      <button class="text-slate-500 hover:text-rose-400 text-xs px-1" title="Supprimer la tâche" data-action="delete-task" data-task-id="${tid}">🗑️</button>
     </div>
   `;
 
@@ -1235,7 +1271,7 @@ function createKanbanCardElement(task) {
 // Actions Métier SOTA
 async function copyTaskContextPack(taskId) {
   try {
-    const data = await apiGet(`/api/kanban/tasks/${taskId}/context-pack`);
+    const data = await apiGet(`/api/kanban/tasks/${encodeURIComponent(taskId)}/context-pack`);
     await copyToClipboard(data.prompt);
     showToast(`Context-Pack pour ${taskId} copié ! Prêt pour Gemini Web App.`, "success");
   } catch (err) {
@@ -1245,7 +1281,7 @@ async function copyTaskContextPack(taskId) {
 
 async function copyTaskCoderPrompt(taskId) {
   try {
-    const data = await apiGet(`/api/kanban/tasks/${taskId}/coder-prompt?mark_in_progress=true`);
+    const data = await apiGet(`/api/kanban/tasks/${encodeURIComponent(taskId)}/coder-prompt?mark_in_progress=true`);
     if (!data.prompt) {
       showToast("Aucune spec ou prompt codeur attaché à ce ticket.", "warning");
       return;
@@ -1265,7 +1301,7 @@ async function viewTaskSpec(taskId) {
       showToast("Aucun chemin de spec disponible.", "warning");
       return;
     }
-    const coderPromptData = await apiGet(`/api/kanban/tasks/${taskId}/coder-prompt`);
+    const coderPromptData = await apiGet(`/api/kanban/tasks/${encodeURIComponent(taskId)}/coder-prompt`);
     openMarkdownModal(`Spécification Technique : ${taskId} - ${task.title}`, coderPromptData.prompt || "# Spécification\n\nContenu non extrait.");
   } catch (err) {
     showToast(`Impossible de lire la spec : ${err.message}`, "error");
@@ -1274,7 +1310,7 @@ async function viewTaskSpec(taskId) {
 
 async function changeTaskStatus(taskId, newStatus) {
   try {
-    await apiPatch(`/api/kanban/tasks/${taskId}/status`, { status: newStatus });
+    await apiPatch(`/api/kanban/tasks/${encodeURIComponent(taskId)}/status`, { status: newStatus });
     showToast(`Statut de ${taskId} mis à jour : ${newStatus}`, "info");
     await loadKanbanTasks();
   } catch (err) {
@@ -1285,7 +1321,7 @@ async function changeTaskStatus(taskId, newStatus) {
 async function deleteTask(taskId) {
   if (!confirm(`Confirmer la suppression de la tâche ${taskId} ?`)) return;
   try {
-    await apiDelete(`/api/kanban/tasks/${taskId}`);
+    await apiDelete(`/api/kanban/tasks/${encodeURIComponent(taskId)}`);
     showToast(`Tâche ${taskId} supprimée.`, "info");
     await loadKanbanTasks();
   } catch (err) {
@@ -1297,7 +1333,45 @@ async function deleteTask(taskId) {
 // INITIALISATION DES ÉVÉNEMENTS & DOM LOADED
 // =============================================================================
 
+/**
+ * Délégation d'événements pour les éléments générés dynamiquement (v0.5.2, D2) :
+ * remplace les attributs onclick/onchange inline, interdits par la Content-Security-Policy.
+ */
+function bindDelegatedActions() {
+  document.addEventListener("click", (e) => {
+    const el = e.target.closest("[data-action]");
+    if (!el || el.tagName === "SELECT") return;
+    const { action, taskId, slug, sessionId } = el.dataset;
+    switch (action) {
+      case "open-concept":
+        loadAndOpenConcept(slug);
+        break;
+      case "toggle-chat":
+        toggleChatMessages(sessionId, el);
+        break;
+      case "copy-context-pack":
+        copyTaskContextPack(taskId);
+        break;
+      case "copy-coder-prompt":
+        copyTaskCoderPrompt(taskId);
+        break;
+      case "view-spec":
+        viewTaskSpec(taskId);
+        break;
+      case "delete-task":
+        deleteTask(taskId);
+        break;
+    }
+  });
+  document.addEventListener("change", (e) => {
+    const el = e.target.closest("[data-action='change-status']");
+    if (el) changeTaskStatus(el.dataset.taskId, el.value);
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  bindDelegatedActions();
+
   // 1. Initialisation Bandeau & Statut
   updateSystemStatus();
   setInterval(updateSystemStatus, 10000);

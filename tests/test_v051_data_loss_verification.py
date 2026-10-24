@@ -315,7 +315,9 @@ def test_a8_merge_prompt_receives_full_bodies(exo_env, monkeypatch):
 def test_d3_api_rejects_path_traversal_and_invalid_projects(exo_env, tmp_path):
     from src.api.server import app
 
-    client = TestClient(app)
+    from src.utils.local_auth import TOKEN_HEADER, get_local_token
+
+    client = TestClient(app, base_url="http://127.0.0.1", headers={TOKEN_HEADER: get_local_token("api")})
     (exo_env.episodic_dir / "2026-10-01.md").write_text("secret", encoding="utf-8")
     assert client.get("/api/concepts/..%5C01_Episodique%5C2026-10-01").status_code in (400, 404)
     assert client.get("/api/concepts/..").status_code in (400, 404)

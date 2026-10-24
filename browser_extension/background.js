@@ -5,10 +5,40 @@
  */
 
 const RECEIVER_BASE_URL = "http://127.0.0.1:8502";
+const TOKEN_HEADER = "X-Exocortex-Token";
 
 // Débounce pour éviter d'envoyer trop de requêtes lors d'un zapping rapide
 let lastSentUrl = null;
 let lastSentTime = 0;
+
+// Jeton partagé avec le récepteur (v0.5.2) : le récepteur ne le remet qu'à une origine d'extension
+let receiverToken = null;
+
+async function fetchReceiverToken() {
+  const res = await fetch(`${RECEIVER_BASE_URL}/auth/token`);
+  if (!res.ok) throw new Error(`Jeton refusé (${res.status})`);
+  receiverToken = (await res.json()).token;
+  return receiverToken;
+}
+
+/**
+ * POST JSON authentifié vers le récepteur ; renouvelle le jeton une fois en cas de 401
+ * (fichier de jeton recréé côté démon).
+ */
+async function postToReceiver(path, payload) {
+  const send = async () =>
+    fetch(`${RECEIVER_BASE_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", [TOKEN_HEADER]: receiverToken || (await fetchReceiverToken()) },
+      body: JSON.stringify(payload),
+    });
+  let res = await send();
+  if (res.status === 401) {
+    await fetchReceiverToken();
+    res = await send();
+  }
+  return res;
+}
 
 /**
  * Transmet l'onglet actif au récepteur local.
@@ -42,11 +72,7 @@ async function sendActiveTabTelemetry(tab) {
       h1: "",
     };
 
-    const res = await fetch(`${RECEIVER_BASE_URL}/telemetry/tab`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const res = await postToReceiver("/telemetry/tab", payload);
 
     if (res.ok || res.status === 204) {
       lastSentUrl = url;
@@ -62,11 +88,7 @@ async function sendActiveTabTelemetry(tab) {
  */
 async function sendChatTurnTelemetry(turnData) {
   try {
-    await fetch(`${RECEIVER_BASE_URL}/telemetry/chat_turn`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(turnData),
-    });
+    await postToReceiver("/telemetry/chat_turn", turnData);
   } catch (err) {
     // Silence radio si récepteur éteint
   }
@@ -102,11 +124,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         h1: message.h1 || "",
         domain: new URL(sender.tab.url).hostname,
       };
-      fetch(`${RECEIVER_BASE_URL}/telemetry/tab`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
+      postToReceiver("/telemetry/tab", payload).catch(() => {});
     }
     sendResponse({ status: "acknowledged" });
   }

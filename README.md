@@ -193,7 +193,7 @@ Situés dans `Vault_Data/Google_Drive_Sync/`, ces 4 fichiers sont compilés auto
 ---
 
 ### 5. Tableau de Bord "Bandeur de Stats" (Streamlit)
-Interroge `telemetry.db` en **lecture seule stricte** (`file:telemetry.db?mode=ro`) pour éviter tout verrouillage :
+Lit les métriques via des connexions SQLite en lecture seule (`mode=ro`) ; l'onglet Kanban, lui, **écrit** dans la base (création de projets et de tâches) :
 - **Bandeau KPIs Macro :** Heures totales traquées, record d'hyperfocus, fréquence de zapping (`switches/h`), ratio prod/conso, volume épistémique.
 - **Onglet 1 (Chronologie & Focus Quotidien) :** Diagramme de Gantt interactif Plotly minute par minute et mise en exergue des tunnels d'hyperfocus.
 - **Onglet 2 (Cartographie des Obsessions) :** Treemap hiérarchique (`Mode Cognitif` → `Topic Sémantique` → `Application`) et camembert des modes cognitifs.
@@ -203,6 +203,10 @@ Interroge `telemetry.db` en **lecture seule stricte** (`file:telemetry.db?mode=r
 ---
 
 ## 🔒 Confidentialité & Sécurité
-- **Blacklist Intégrée :** Les titres de fenêtres contenant des termes sensibles (mots de passe, banques, navigation privée, impôts) et les exécutables de gestionnaires de mots de passe sont strictement exclus de la télémétrie.
-- **Données 100% Locales :** La base SQLite, les vecteurs LanceDB et les notes Markdown restent intégralement sur votre machine locale. Aucune donnée n'est transmise à l'extérieur sauf si vous activez explicitement le mode Cloud SOTA avec votre propre clé API Gemini.
-
+- **Liste noire ciblée :** fenêtres et onglets de navigation privée, gestionnaires de mots de passe, banques et administrations sont exclus de la télémétrie. La correspondance se fait en mots entiers sur des marques et marqueurs précis, et par domaine sur les URL (`TITLE_BLACKLIST`, `SENSITIVE_DOMAINS`, extensibles via `TITLE_BLACKLIST_EXTRA` et `SENSITIVE_DOMAINS_EXTRA`). Un tour de chat qui divulgue un mot de passe ou une clé d'API est rejeté.
+- **Stockage local :** la base SQLite, les vecteurs LanceDB et les notes Markdown restent sur votre machine.
+- **Ce qui peut sortir de la machine :**
+  - les 4 méga-documents de `Vault_Data/Google_Drive_Sync/`, si ce dossier est synchronisé avec Google Drive puis lu par Gemini Web. Les catégories de `DRIVE_EXCLUDED_TOPICS` (par défaut `Sante_et_Pharmacologie`, `Introspection_et_Neuroatypie`, `Admin_Finance_et_Droit`) n'y figurent jamais ;
+  - les sessions envoyées à l'API Gemini si vous activez le mode `TAKEOUT_MODE=cloud_api` avec votre clé ;
+  - les fichiers de staging Takeout que vous copiez vous-même dans Gemini Web (mode `web_manual`).
+- **Services locaux protégés :** l'API du Command Center (8500) et le récepteur de l'extension (8502) n'écoutent que sur `127.0.0.1`, refusent les origines web tierces (CORS restreint, contrôle de l'en-tête `Host`) et exigent un jeton local (`_System_Buffer/*_token`) pour toute écriture. L'interface web applique une Content-Security-Policy et échappe tout contenu affiché.

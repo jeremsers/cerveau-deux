@@ -2,6 +2,8 @@
  * Exocortex Cognitive Telemetry - Content Script.
  * Détecte les en-têtes H1 de la page courante et capture au fil de l'eau
  * les échanges avec les LLMs (Gemini Web, Claude.ai, ChatGPT).
+ * Depuis v0.5.2, injecté uniquement sur ces trois plateformes (manifest) : aucun autre site
+ * n'est observé ; les onglets ordinaires ne remontent que leur URL et leur titre.
  */
 
 (function () {

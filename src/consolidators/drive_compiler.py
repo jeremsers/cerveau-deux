@@ -31,13 +31,37 @@ logger = logging.getLogger("Exocortex.DriveCompiler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
+PRIVATE_TOPICS_LABEL = "Catégories privées (exclues de l'export)"
+
+
 class DriveCompiler:
-    """Compilateur des 4 méga-documents pour synchronisation Google Drive."""
+    """
+    Compilateur des 4 méga-documents pour synchronisation Google Drive.
+    Les catégories de settings.DRIVE_EXCLUDED_TOPICS (santé, introspection, finances par défaut)
+    ne quittent jamais la machine : leurs fiches sont exclues et leurs noms masqués (v0.5.2, D6).
+    """
 
     def __init__(self, db_manager: Optional[DBManager] = None) -> None:
         self.db = db_manager or DBManager()
         self.output_dir = settings.GOOGLE_DRIVE_SYNC_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.excluded_topics = {normalize_to_macro_topic(t) for t in settings.DRIVE_EXCLUDED_TOPICS}
+
+    def is_excluded_topic(self, topic: Optional[str]) -> bool:
+        return bool(topic) and normalize_to_macro_topic(str(topic)) in self.excluded_topics
+
+    def _mask_topic(self, topic: str) -> str:
+        return PRIVATE_TOPICS_LABEL if self.is_excluded_topic(topic) else topic
+
+    def _redact_journal(self, text: str) -> str:
+        """Retire d'un texte exporté (journal, taxonomie) les lignes qui nomment une catégorie exclue."""
+        if not self.excluded_topics:
+            return text
+        kept = [
+            line for line in text.splitlines()
+            if not any(topic in line for topic in self.excluded_topics)
+        ]
+        return "\n".join(kept)
 
     # ==========================================================================
     # 1. 00_CORE_IDENTITE_ET_STYLE.md
@@ -58,7 +82,7 @@ class DriveCompiler:
         taxonomie_text = ""
         if settings.TAXONOMIE_TAGS_PATH.exists():
             with open(settings.TAXONOMIE_TAGS_PATH, "r", encoding="utf-8") as f:
-                taxonomie_text = f.read().strip()
+                taxonomie_text = self._redact_journal(f.read().strip())
         else:
             taxonomie_text = "# Taxonomie\n\nTaxonomie non encore initialisée."
 
@@ -72,6 +96,12 @@ class DriveCompiler:
 ---
 
 """
+        if self.excluded_topics:
+            header += (
+                "> **Confidentialité :** les catégories suivantes ne sont jamais exportées vers Drive : "
+                + ", ".join(f"`{t}`" for t in sorted(self.excluded_topics))
+                + ".\n\n"
+            )
         full_content = f"{header}{profil_text}\n\n---\n\n{taxonomie_text}\n"
 
         with open(target_file, "w", encoding="utf-8") as f:
@@ -142,7 +172,7 @@ class DriveCompiler:
         max_hf_topic = "Aucun"
         for r in cur_rows:
             if r["max_hyperfocus_sec"] == max_hyperfocus_7d:
-                max_hf_topic = r["max_hyperfocus_topic"] or "Non_Classe"
+                max_hf_topic = self._mask_topic(r["max_hyperfocus_topic"] or "Non_Classe")
                 break
 
         avg_switches = (
@@ -177,7 +207,8 @@ class DriveCompiler:
             try:
                 t_dict = json.loads(r["top_topics_json"])
                 for top, sec in t_dict.items():
-                    topics_7d[top] = topics_7d.get(top, 0) + sec
+                    label = self._mask_topic(top)
+                    topics_7d[label] = topics_7d.get(label, 0) + sec
             except Exception:
                 pass
 
@@ -212,7 +243,7 @@ class DriveCompiler:
             for ep_file in sorted(settings.EPISODIC_DIR.glob("*.md"), reverse=True)[:7]:
                 try:
                     with open(ep_file, "r", encoding="utf-8") as ef:
-                        episodic_notes.append((ep_file.stem, ef.read().strip()))
+                        episodic_notes.append((ep_file.stem, self._redact_journal(ef.read().strip())))
                 except Exception as exc:
                     logger.warning("Erreur lecture note épisodique %s : %s", ep_file.name, exc)
 
@@ -276,6 +307,8 @@ class DriveCompiler:
                 try:
                     note = parse_concept_file(cf)
                     fm = note.frontmatter
+                    if self.is_excluded_topic(fm.semantic_topic):
+                        continue
                     updated_at_str = fm.updated_at or fm.created_at or "2000-01-01"
                     time_min = fm.total_time_invested_min
                     title = fm.title or cf.stem
@@ -346,6 +379,8 @@ class DriveCompiler:
                     note = parse_concept_file(cf)
                     fm = note.frontmatter
                     topic = fm.semantic_topic
+                    if self.is_excluded_topic(topic):
+                        continue
                     title = fm.title or cf.stem.replace("-", " ").title()
                     time_min = fm.total_time_invested_min
                     updated_at = fm.updated_at or fm.created_at or "Inconnu"
