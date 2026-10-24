@@ -334,6 +334,21 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.getenv("PROLONGED_SESSION_THRESHOLD_SEC", "180"))
     )
 
+    # --- Kanban : dépôts autorisés pour le context-pack (v0.5.1, D3) ---
+    # Liste de racines séparées par ';'. Vide = tout dépôt Git local est accepté.
+    KANBAN_ALLOWED_REPO_ROOTS: List[Path] = Field(
+        default_factory=lambda: [
+            Path(p.strip()).resolve()
+            for p in os.getenv("KANBAN_ALLOWED_REPO_ROOTS", "").split(";")
+            if p.strip()
+        ]
+    )
+
+    # --- Captures d'écran : purge des orphelins du staging (v0.5.1, A4) ---
+    SCREEN_ORPHAN_MAX_AGE_HOURS: int = Field(
+        default_factory=lambda: int(os.getenv("SCREEN_ORPHAN_MAX_AGE_HOURS", "24"))
+    )
+
     # --- Propriétés Calculées d'Arborescence Vault ---
     @property
     def META_DIR(self) -> Path:
@@ -416,6 +431,11 @@ class Settings(BaseModel):
         return self.CONCEPTS_DIR / "_Archive_Merged"
 
     @property
+    def CONCEPTS_QUARANTINE_DIR(self) -> Path:
+        """Fiches retirées par le Vault Doctor (déplacées, jamais supprimées)."""
+        return self.CONCEPTS_DIR / "_Quarantine"
+
+    @property
     def MODEL_REASONING(self) -> str:
         """Alias pour MODEL_HEAVY_SYNTHESIS (gemma4:26b-a4b)."""
         return self.MODEL_HEAVY_SYNTHESIS
@@ -456,6 +476,7 @@ class Settings(BaseModel):
             self.VOICE_INBOX_DIR,
             self.VOICE_PROCESSED_DIR,
             self.CONCEPTS_ARCHIVE_MERGED_DIR,
+            self.CONCEPTS_QUARANTINE_DIR,
             self.TAKEOUT_DIR,
             self.MODELS_DIR,
         ]

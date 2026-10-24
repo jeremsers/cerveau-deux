@@ -25,14 +25,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from src import __version__
 from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
 from src.consolidators.drive_compiler import DriveCompiler
-from src.consolidators.kanban_engine import _slugify, kanban_engine
+from src.consolidators.kanban_engine import _slugify, build_project_record, kanban_engine
 from src.consolidators.night_consolidator import NightConsolidator
 from src.database.db_manager import DBManager, ProjectRecord
 from src.database.graph_rag import HybridGraphRAG, extract_wikilinks
 from src.llm.ollama_client import HardwareProbe, llm_client
 from src.utils.markdown_io import parse_concept_file
+from src.utils.path_safety import UnsafePathError, resolve_within
 
 logger = logging.getLogger("Exocortex.API")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -75,7 +77,7 @@ class SpecIngestRequest(BaseModel):
 
 app = FastAPI(
     title="Exocortex Cognitive Command Center API",
-    version="0.5.0",
+    version=__version__,
     description="API REST unifiée pour l'Exocortex, la télémétrie cognitive, le GraphRAG et le Kanban SOTA.",
 )
 
@@ -554,7 +556,11 @@ def search_graphrag(
 def get_concept_by_slug(slug: str) -> Dict[str, Any]:
     """Lit et parse une fiche conceptuelle du coffre Obsidian 02_Concepts/."""
     clean_slug = slug[:-3] if slug.endswith(".md") else slug
-    target_path = settings.CONCEPTS_DIR / f"{clean_slug}.md"
+    try:
+        # Confinement strict sous 02_Concepts/ : '..', '/', '\\' refusés (D3)
+        target_path = resolve_within(settings.CONCEPTS_DIR, f"{clean_slug}.md")
+    except UnsafePathError:
+        raise HTTPException(status_code=400, detail="Slug de fiche invalide.")
 
     if not target_path.exists():
         # Recherche insensible à la casse
@@ -597,19 +603,41 @@ def get_kanban_projects() -> List[Dict[str, Any]]:
     return projects
 
 
+def _build_project_or_400(project_id: str, req: ProjectCreateRequest) -> ProjectRecord:
+    try:
+        return build_project_record(
+            project_id=project_id,
+            name=req.name,
+            prefix=req.prefix,
+            repo_path=req.repo_path,
+            description=req.description or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/kanban/projects")
 def create_kanban_project(req: ProjectCreateRequest) -> Dict[str, Any]:
-    """Crée ou met à jour un projet Kanban."""
-    record = ProjectRecord(
-        project_id=req.project_id.strip().lower(),
-        name=req.name.strip(),
-        prefix=req.prefix.strip().upper(),
-        repo_path=req.repo_path.strip() if req.repo_path else None,
-        description=req.description.strip() if req.description else "",
-    )
-    kanban_engine.db.upsert_project(record)
+    """Crée un projet Kanban. Refuse un slug existant (409) : la mise à jour passe par PUT."""
+    record = _build_project_or_400(req.project_id, req)
+    try:
+        kanban_engine.db.create_project(record)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     saved = kanban_engine.db.get_project_by_id(record.project_id)
     return saved or {}
+
+
+@app.put("/api/kanban/projects/{project_id}")
+def update_kanban_project(project_id: str, req: ProjectCreateRequest) -> Dict[str, Any]:
+    """Met à jour un projet existant sans toucher à ses tâches (ON CONFLICT DO UPDATE, A2)."""
+    if not kanban_engine.db.get_project_by_id(project_id):
+        raise HTTPException(status_code=404, detail=f"Projet '{project_id}' introuvable.")
+    record = _build_project_or_400(project_id, req)
+    if record.project_id != project_id:
+        raise HTTPException(status_code=400, detail="Le slug d'un projet ne peut pas être modifié.")
+    kanban_engine.db.upsert_project(record)
+    return kanban_engine.db.get_project_by_id(project_id) or {}
 
 
 @app.get("/api/kanban/tasks")
@@ -636,15 +664,18 @@ def get_kanban_tasks(
 @app.post("/api/kanban/tasks")
 def create_kanban_task(req: TaskCreateRequest) -> Dict[str, Any]:
     """Crée une nouvelle tâche Kanban et met à jour AGENT_QUEUE.md."""
-    task_id = kanban_engine.create_task(
-        project_id=req.project_id,
-        title=req.title,
-        component_tag=req.component_tag or "general",
-        summary_pitch=req.summary_pitch or "",
-        priority=req.priority or 2,
-        complexity=req.complexity or "M",
-        initial_status=req.initial_status or "radar",
-    )
+    try:
+        task_id = kanban_engine.create_task(
+            project_id=req.project_id,
+            title=req.title,
+            component_tag=req.component_tag or "general",
+            summary_pitch=req.summary_pitch or "",
+            priority=req.priority or 2,
+            complexity=req.complexity or "M",
+            initial_status=req.initial_status or "radar",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     task = kanban_engine.db.get_kanban_task_by_id(task_id)
     return task or {}
 
@@ -719,6 +750,8 @@ def ingest_kanban_spec(req: SpecIngestRequest) -> Dict[str, Any]:
             target_task_id=req.target_task_id,
         )
         return updated_task
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.error("Erreur ingestion spec : %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))

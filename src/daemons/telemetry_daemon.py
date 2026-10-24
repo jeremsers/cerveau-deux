@@ -426,6 +426,13 @@ class TelemetryDaemon:
             img.save(save_path, "WEBP", quality=75)
 
             if self.current_state:
+                # Une seule capture est référencée par fenêtre : l'ancienne est supprimée (A4)
+                previous = self.current_state.screenshot_path
+                if previous and Path(previous).resolve() != save_path.resolve():
+                    try:
+                        Path(previous).unlink(missing_ok=True)
+                    except Exception as exc:
+                        logger.debug("Impossible de supprimer l'ancienne capture %s : %s", previous, exc)
                 self.current_state.last_dhash = dhash
                 self.current_state.screenshot_path = str(save_path.resolve())
                 self.current_state.last_screenshot_ts = datetime.now()
@@ -461,6 +468,8 @@ class TelemetryDaemon:
         # Filtre de Dwell Time : ignorer si durée < 20 secondes (bruit de zapping)
         if duration < settings.DWELL_TIME_THRESHOLD_SEC:
             self.context_switches_count += 1
+            if state.screenshot_path:
+                Path(state.screenshot_path).unlink(missing_ok=True)
             logger.debug(
                 "Fenêtre quittée en %d s (< %d s). Considérée comme zapping.",
                 duration,

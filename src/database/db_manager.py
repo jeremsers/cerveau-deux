@@ -294,31 +294,6 @@ class DBManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_session ON historical_footprints(linked_gemini_session_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_cluster ON historical_footprints(cluster_id);")
 
-            # Déduplication et contrainte d'unicité v0.1.3
-            conn.execute(
-                """
-                DELETE FROM historical_footprints
-                WHERE id NOT IN (
-                    SELECT MIN(id) FROM historical_footprints
-                    GROUP BY source, timestamp, title_or_query
-                );
-                """
-            )
-            conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_footprint
-                ON historical_footprints(source, timestamp, title_or_query);
-                """
-            )
-
-            # Nettoyage des micro-sessions bruitées de chat_sessions (v0.1.3)
-            conn.execute(
-                """
-                DELETE FROM chat_sessions
-                WHERE turn_count < 3 OR user_char_count < 250;
-                """
-            )
-
             # 5. Tables Kanban & Multi-Projets (v0.2.0 - Module 7)
             conn.execute(
                 """
@@ -369,20 +344,79 @@ class DBManager:
                 ),
             )
 
+            self._apply_migrations(conn)
+
+    def _apply_migrations(self, conn: sqlite3.Connection) -> None:
+        """
+        Migrations destructives versionnées par PRAGMA user_version (v0.5.1) :
+        chacune s'exécute une seule fois par base, jamais à chaque démarrage.
+        Le filtrage des micro-sessions n'est plus une migration : il est fait à l'ingestion
+        Takeout (seules les sessions qualifiées y sont insérées), ce qui préserve les sessions
+        vocales et live qui démarrent à un seul tour.
+        """
+        version = conn.execute("PRAGMA user_version;").fetchone()[0]
+
+        if version < 1:
+            # Déduplication one-shot des empreintes puis contrainte d'unicité (v0.1.3)
+            conn.execute(
+                """
+                DELETE FROM historical_footprints
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM historical_footprints
+                    GROUP BY source, timestamp, title_or_query
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_footprint
+                ON historical_footprints(source, timestamp, title_or_query);
+                """
+            )
+            conn.execute("PRAGMA user_version = 1;")
+
+        if version < 2:
+            # Réparation one-shot des sessions vocales effacées par l'ancien nettoyage au démarrage (A1) :
+            # leurs messages sont restés orphelins dans chat_messages.
+            conn.execute(
+                """
+                INSERT INTO chat_sessions (
+                    session_id, timestamp_start, timestamp_end, turn_count, user_char_count,
+                    extracted_topics_json, generated_notes_json, summary, distillation_status
+                )
+                SELECT m.session_id, MIN(m.timestamp), MAX(m.timestamp), COUNT(*), SUM(m.user_char_count),
+                       '[]', '[]', SUBSTR(MIN(m.user_prompt), 1, 200), 'success'
+                FROM chat_messages m
+                WHERE m.session_id LIKE 'voice\\_%' ESCAPE '\\'
+                  AND m.session_id NOT IN (SELECT session_id FROM chat_sessions)
+                GROUP BY m.session_id;
+                """
+            )
+            conn.execute("PRAGMA user_version = 2;")
+
     # ==========================================================================
     # INSERTIONS PAR LOTS (BATCH OPERATIONS)
     # ==========================================================================
 
     def insert_chat_sessions_batch(self, sessions: List[ChatSessionRecord]) -> int:
-        """Insère ou remplace un lot de sessions Gemini dans chat_sessions."""
+        """
+        Insère un lot de sessions dans chat_sessions. Une session déjà connue (réingestion Takeout)
+        ne voit mettre à jour que ses colonnes temporelles et volumétriques : statut de distillation,
+        résumé LLM, topics et notes générées sont préservés (v0.5.1, A3).
+        """
         if not sessions:
             return 0
         sql = """
-            INSERT OR REPLACE INTO chat_sessions (
+            INSERT INTO chat_sessions (
                 session_id, timestamp_start, timestamp_end, turn_count,
                 user_char_count, extracted_topics_json, generated_notes_json, summary,
                 distillation_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                timestamp_start = excluded.timestamp_start,
+                timestamp_end = excluded.timestamp_end,
+                turn_count = excluded.turn_count,
+                user_char_count = excluded.user_char_count;
         """
         payload = [
             (
@@ -501,7 +535,10 @@ class DBManager:
 
             # 2. Récupérer les messages existants pour cette session
             cur_msgs = conn.execute(
-                "SELECT turn_index, user_prompt, ai_response FROM chat_messages WHERE session_id = ? ORDER BY turn_index ASC;",
+                """
+                SELECT turn_index, user_prompt, ai_response, timestamp, user_char_count
+                FROM chat_messages WHERE session_id = ? ORDER BY turn_index ASC;
+                """,
                 (session_id,),
             )
             existing_msgs = cur_msgs.fetchall()
@@ -545,16 +582,21 @@ class DBManager:
 
             # 5. Création ou mise à jour de la session parent
             if not sess_row:
-                initial_summary = clean_prompt[:140]
+                # Si des messages orphelins existent (session effacée avant v0.5.1), la session
+                # est reconstruite à partir d'eux au lieu de repartir à 1 tour.
+                prior_turns = len(existing_msgs)
+                prior_chars = sum(int(r[4] or 0) for r in existing_msgs)
+                start_ts = str(existing_msgs[0][3]) if existing_msgs else ts_str
+                initial_summary = (existing_msgs[0][1].strip() if existing_msgs else clean_prompt)[:140]
                 conn.execute(
                     """
                     INSERT INTO chat_sessions (
                         session_id, timestamp_start, timestamp_end, turn_count,
                         user_char_count, extracted_topics_json, generated_notes_json,
                         summary, distillation_status
-                    ) VALUES (?, ?, ?, 1, ?, '[]', '[]', ?, 'pending');
+                    ) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, 'pending');
                     """,
-                    (session_id, ts_str, ts_str, u_chars, initial_summary),
+                    (session_id, start_ts, ts_str, prior_turns + 1, prior_chars + u_chars, initial_summary),
                 )
             else:
                 conn.execute(
@@ -778,19 +820,36 @@ class DBManager:
             cursor = conn.execute(query, (min_events,))
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_unprocessed_raw_activities(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """Récupère les entrées brutes de télémétrie non encore traitées par le LLM."""
+    def get_unprocessed_raw_activities(
+        self, limit: int = 1000, exclude_pending_screenshots: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Récupère les entrées brutes de télémétrie non encore traitées par le LLM.
+        exclude_pending_screenshots=True écarte celles dont la capture n'a pas encore été
+        analysée, pour ne jamais les marquer traitées avant la vision (v0.5.1, A4).
+        """
+        screenshot_clause = (
+            "AND (screenshot_path IS NULL OR screenshot_path = '')" if exclude_pending_screenshots else ""
+        )
         with self.get_connection() as conn:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT * FROM raw_activity
-                WHERE processed = 0
+                WHERE processed = 0 {screenshot_clause}
                 ORDER BY timestamp_start ASC
                 LIMIT ?;
                 """,
                 (limit,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_referenced_screenshot_paths(self) -> Set[str]:
+        """Chemins de captures encore référencés par raw_activity (en attente d'analyse)."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT screenshot_path FROM raw_activity WHERE screenshot_path IS NOT NULL AND screenshot_path != '';"
+            )
+            return {str(row[0]) for row in cursor.fetchall()}
 
     def mark_raw_activities_processed(self, updates: List[Tuple[int, str, str]]) -> int:
         """Met à jour le semantic_topic, le cognitive_mode et processed=1 pour un lot d'activités."""
@@ -822,6 +881,10 @@ class DBManager:
 
     def update_activity_visual_summary(self, activity_id: int, visual_summary: str) -> None:
         """Met à jour l'ocr_snippet avec le résumé visuel et efface le screenshot_path."""
+        if not visual_summary:
+            with self.get_connection() as conn:
+                conn.execute("UPDATE raw_activity SET screenshot_path = NULL WHERE id = ?;", (activity_id,))
+            return
         sql = """
             UPDATE raw_activity
             SET ocr_snippet = CASE 
@@ -990,15 +1053,24 @@ class DBManager:
             return dict(row) if row else None
 
     def upsert_project(self, project: ProjectRecord) -> None:
-        """Insère ou met à jour un projet."""
+        """
+        Insère ou met à jour un projet. ON CONFLICT DO UPDATE (et non INSERT OR REPLACE, qui
+        supprime puis réinsère la ligne et déclenche ON DELETE CASCADE sur kanban_tasks) :
+        les tâches du projet et sa date de création sont préservées (v0.5.1, A2).
+        """
         created_str = (
             project.created_at.strftime("%Y-%m-%d %H:%M:%S")
             if isinstance(project.created_at, datetime)
             else str(project.created_at)
         )
         sql = """
-            INSERT OR REPLACE INTO projects (project_id, name, prefix, repo_path, description, created_at)
-            VALUES (?, ?, ?, ?, ?, ?);
+            INSERT INTO projects (project_id, name, prefix, repo_path, description, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                name = excluded.name,
+                prefix = excluded.prefix,
+                repo_path = excluded.repo_path,
+                description = excluded.description;
         """
         with self.get_connection() as conn:
             conn.execute(
@@ -1012,6 +1084,12 @@ class DBManager:
                     created_str,
                 ),
             )
+
+    def create_project(self, project: ProjectRecord) -> None:
+        """Crée un projet ; lève ValueError si le slug existe déjà (aucune mise à jour implicite)."""
+        if self.get_project_by_id(project.project_id):
+            raise ValueError(f"Le projet '{project.project_id}' existe déjà.")
+        self.upsert_project(project)
 
     def generate_next_task_id(self, project_id: str) -> str:
         """

@@ -9,9 +9,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+import yaml
 from tqdm import tqdm
 
 from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
@@ -53,13 +56,15 @@ def register_new_taxonomy_tag(tag_name: str, description: Optional[str] = None) 
 
 def scan_and_upgrade_existing_concepts(db: DBManager) -> Set[str]:
     """
-    Scanne tous les fichiers Markdown existants dans Vault_Data/02_Concepts/ :
-    - Détecte et purge les faux succès (fallbacks heuristiques v0.1.1) du disque et de LanceDB.
+    Scanne les fiches issues du Takeout Gemini (origin gemini_takeout + session_id) dans Vault_Data/02_Concepts/ :
+    - Détecte les faux succès (fallbacks heuristiques v0.1.1, troncatures) et les déplace dans
+      02_Concepts/_Quarantine/ (jamais de suppression définitive), puis les retire de LanceDB.
     - Assainit les fiches réussies sur place :
         * Retrait des blocs de requêtes/vidéos corrélées YouTube/Search.
         * Remapping déterministe vers les 16 macro-catégories maîtresses (+ insertion de l'ancien topic dans tags).
         * Ajout de session_id et distillation_status: "success" dans le frontmatter.
         * Synchronisation des statuts en base SQLite.
+    - Les fiches vocales, nocturnes, manuelles et fusionnées sont laissées intactes.
     - Retourne l'ensemble des session_id complétées pour le mode Delta (Skip instantané).
     """
     doctor = VaultDoctor(db_manager=db)
@@ -92,6 +97,7 @@ class VaultDoctor:
 
         purged_fallbacks = 0
         upgraded_notes = 0
+        skipped_foreign = 0
 
         with tqdm(total=len(concept_files), desc="Assainissement Notes Existantes", unit="note") as pbar:
             for fpath in concept_files:
@@ -106,6 +112,22 @@ class VaultDoctor:
                     pbar.update(1)
                     continue
 
+                raw_fm = _read_raw_frontmatter(content)
+
+                # Fiches fusionnées par le défragmenteur : leurs sessions sources restent terminées (A8)
+                merged_sids = _as_str_list(raw_fm.get("session_ids"))
+                if merged_sids or raw_fm.get("merged_from"):
+                    for sid in merged_sids:
+                        completed_session_ids.add(sid)
+                        self.db.update_session_distillation_metadata(
+                            session_id=sid,
+                            topics_list=[normalize_to_macro_topic(str(raw_fm.get("semantic_topic") or ""))],
+                            notes_list=[fpath.stem],
+                            distillation_status="success",
+                        )
+                    pbar.update(1)
+                    continue
+
                 # Extraction de session_id
                 m_sid = re.search(r'session_id:\s*["\']?([^"\'\n\r]+)["\']?', content)
                 if m_sid:
@@ -113,6 +135,16 @@ class VaultDoctor:
                 else:
                     m_body_sid = re.search(r'Session Gemini [^\w]*([a-zA-Z0-9_-]+)', content)
                     extracted_sid = m_body_sid.group(1).strip() if m_body_sid else None
+
+                # Périmètre strict (A6) : seules les fiches issues du Takeout Gemini, rattachées à une
+                # session, relèvent du Vault Doctor. Notes vocales, nocturnes ou manuelles ne sont ni
+                # purgées ni réécrites (le défaut ConceptFrontmatter.origin ne compte pas : on lit le YAML brut).
+                if "gemini_takeout" not in _as_str_list(raw_fm.get("origin")) or not extracted_sid:
+                    if extracted_sid:
+                        completed_session_ids.add(extracted_sid)
+                    skipped_foreign += 1
+                    pbar.update(1)
+                    continue
 
                 # Découpe du corps Markdown avant le bloc de télémétrie final de l'Exocortex
                 if "> - **Temps estimé sur ce sujet :**" in content:
@@ -155,11 +187,14 @@ class VaultDoctor:
 
                 if is_fallback:
                     if is_truncated:
-                        logger.warning("Fiche tronquée détectée et purgée : %s (dernière ligne : '%s')", fpath.name, last_line[-40:])
+                        logger.warning("Fiche tronquée détectée et mise en quarantaine : %s (dernière ligne : '%s')", fpath.name, last_line[-40:])
                     try:
-                        fpath.unlink()
+                        quarantined = move_to_quarantine(fpath)
+                        logger.info("Fiche déplacée en quarantaine : %s", quarantined)
                     except Exception as exc:
-                        logger.warning("Impossible de supprimer %s : %s", fpath.name, exc)
+                        logger.warning("Impossible de mettre %s en quarantaine : %s", fpath.name, exc)
+                        pbar.update(1)
+                        continue
                     vector_store.delete_by_slug(fpath.stem)
                     purged_fallbacks += 1
                     if extracted_sid:
@@ -223,10 +258,44 @@ class VaultDoctor:
                 completed_session_ids.add(row[0])
 
         logger.info(
-            "Assainissement terminé : %d fallbacks purgés, %d fiches assainies sur place, %d sessions complètes en mémoire.",
+            "Assainissement terminé : %d fallbacks en quarantaine, %d fiches assainies sur place, "
+            "%d fiches hors périmètre Takeout ignorées, %d sessions complètes en mémoire.",
             purged_fallbacks,
             upgraded_notes,
+            skipped_foreign,
             len(completed_session_ids),
         )
         return completed_session_ids
+
+
+def _read_raw_frontmatter(content: str) -> Dict[str, Any]:
+    """Lit le frontmatter YAML tel qu'écrit sur disque, sans valeurs par défaut du modèle."""
+    match = re.match(r"^---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", content, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        loaded = yaml.safe_load(match.group(1))
+        return loaded if isinstance(loaded, dict) else {}
+    except yaml.YAMLError:
+        return {}
+
+
+def _as_str_list(value: Any) -> List[str]:
+    """Normalise un champ YAML scalaire ou liste en liste de chaînes non vides."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [s.strip() for s in str(value).strip("[]").replace('"', "").replace("'", "").split(",") if s.strip()]
+
+
+def move_to_quarantine(fpath: Path) -> Path:
+    """Déplace une fiche dans 02_Concepts/_Quarantine/ (jamais de suppression définitive)."""
+    quarantine_dir = settings.CONCEPTS_QUARANTINE_DIR
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    dest = quarantine_dir / fpath.name
+    if dest.exists():
+        dest = quarantine_dir / f"{fpath.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}{fpath.suffix}"
+    shutil.move(str(fpath), str(dest))
+    return dest
 

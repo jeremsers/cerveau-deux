@@ -20,7 +20,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.config import settings
-from src.database.db_manager import DBManager, KanbanTaskRecord
+from src.database.db_manager import DBManager, KanbanTaskRecord, ProjectRecord
+from src.utils.path_safety import is_under_any, resolve_within, safe_slug
+
+PROJECT_PREFIX_PATTERN = re.compile(r"^[A-Z0-9]{1,8}$")
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
 def _slugify(text: str) -> str:
@@ -28,6 +32,50 @@ def _slugify(text: str) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
     return text[:50] or "task"
+
+
+def validate_repo_path(repo_path: str) -> Path:
+    """
+    Valide le dépôt local d'un projet avant de lister son arborescence (v0.5.1, D3) :
+    dossier existant, dépôt Git (présence de .git) et, si KANBAN_ALLOWED_REPO_ROOTS est
+    défini, situé sous l'une de ces racines. Lève ValueError sinon.
+    """
+    repo = Path(repo_path.strip()).expanduser()
+    if not repo.is_absolute() or not repo.is_dir():
+        raise ValueError(f"Dépôt introuvable ou chemin non absolu : {repo_path}")
+    repo = repo.resolve()
+    if not (repo / ".git").exists():
+        raise ValueError(f"Le dossier n'est pas un dépôt Git : {repo}")
+    allowed_roots = settings.KANBAN_ALLOWED_REPO_ROOTS
+    if allowed_roots and not is_under_any(repo, allowed_roots):
+        raise ValueError(f"Dépôt hors des racines autorisées (KANBAN_ALLOWED_REPO_ROOTS) : {repo}")
+    return repo
+
+
+def build_project_record(
+    project_id: str,
+    name: str,
+    prefix: str,
+    repo_path: Optional[str] = None,
+    description: str = "",
+) -> ProjectRecord:
+    """Normalise et valide les champs d'un projet saisis par l'utilisateur (API, Streamlit)."""
+    clean_id = safe_slug(project_id, max_len=50, fallback="")
+    if not clean_id:
+        raise ValueError("Slug de projet invalide : utilisez lettres, chiffres et tirets.")
+    clean_prefix = prefix.strip().upper()
+    if not PROJECT_PREFIX_PATTERN.match(clean_prefix):
+        raise ValueError("Préfixe invalide : 1 à 8 caractères A-Z ou 0-9.")
+    if not name.strip():
+        raise ValueError("Le nom du projet est obligatoire.")
+    clean_repo = str(validate_repo_path(repo_path)) if repo_path and repo_path.strip() else None
+    return ProjectRecord(
+        project_id=clean_id,
+        name=name.strip(),
+        prefix=clean_prefix,
+        repo_path=clean_repo,
+        description=(description or "").strip(),
+    )
 
 
 def _generate_repo_tree(repo_path: Path, max_depth: int = 4) -> str:
@@ -177,6 +225,8 @@ class KanbanEngine:
         initial_status: str = "radar",
     ) -> str:
         """Crée une nouvelle tâche Kanban dans un projet et actualise le manifeste."""
+        if not self.db.get_project_by_id(project_id):
+            raise ValueError(f"Projet inconnu : '{project_id}'.")
         task_id = self.db.generate_next_task_id(project_id)
         record = KanbanTaskRecord(
             task_id=task_id,
@@ -216,9 +266,10 @@ class KanbanEngine:
         # 1. Extraction de l'arborescence du dépôt
         repo_tree_str = "(Aucun dépôt local configuré pour ce projet)"
         if repo_path_str:
-            repo_p = Path(repo_path_str)
-            if repo_p.exists() and repo_p.is_dir():
-                repo_tree_str = _generate_repo_tree(repo_p, max_depth=4)
+            try:
+                repo_tree_str = _generate_repo_tree(validate_repo_path(repo_path_str), max_depth=4)
+            except ValueError as exc:
+                repo_tree_str = f"(Dépôt ignoré : {exc})"
 
         # 2. Recherche sémantique dans LanceDB (0 Mo VRAM au repos)
         related_concepts_str = "Aucun extrait conceptuel pertinent disponible (Ollama hors-ligne ou base vide)."
@@ -343,10 +394,11 @@ status: "ready_for_agent"
         title = task["title"]
         slug = _slugify(title)
 
-        # Enregistrement physique du fichier Markdown
-        dest_dir = settings.KANBAN_SPECS_DIR / project_id
+        # Enregistrement physique du fichier Markdown, confiné sous 03_Kanban_Specs/ (D3)
+        task_id_part = task["task_id"] if TASK_ID_PATTERN.match(task["task_id"]) else safe_slug(task["task_id"])
+        dest_dir = resolve_within(settings.KANBAN_SPECS_DIR, safe_slug(project_id, fallback="projet"))
+        spec_path = resolve_within(dest_dir, f"{task_id_part}_{slug}.md")
         dest_dir.mkdir(parents=True, exist_ok=True)
-        spec_path = dest_dir / f"{task['task_id']}_{slug}.md"
         spec_path.write_text(raw, encoding="utf-8")
 
         # Mise à jour en base SQLite

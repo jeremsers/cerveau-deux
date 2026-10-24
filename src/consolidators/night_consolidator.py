@@ -209,48 +209,29 @@ class NightConsolidator:
         if free_gb < settings.MIN_FREE_VRAM_GB:
             raise VRAMInsufficientError(f"VRAM insuffisante ({free_gb:.2f} Go < {settings.MIN_FREE_VRAM_GB} Go). Batch différé.")
 
-        # 1. Traitement des captures d'écran différées
-        screenshot_activities = self.db.get_unprocessed_activities_with_screenshots(limit=50)
-        logger.info("Nombre d'activités avec capture d'écran à analyser : %d", len(screenshot_activities))
-
-        for act in tqdm(screenshot_activities, desc="Consolidation Nocturne (Captures)", unit="img"):
-            act_id = act["id"]
-            img_path = Path(act["screenshot_path"])
-            visual_summary = ""
-
-            if img_path.exists():
-                prompt = (
-                    "Analyse cette capture d'écran de l'utilisateur en une seule phrase dense et factuelle : "
-                    "identifie l'application, le projet, le code ou le contenu textuel affiché. Zéro bavardage."
-                )
-                try:
-                    visual_summary = llm_client.generate_vision(
-                        prompt=prompt,
-                        image_path=img_path,
-                        model=settings.MODEL_FAST_VISION,
-                        keep_alive="5m",
-                    )
-                except Exception as exc:
-                    logger.warning("Échec vision pour %s : %s", img_path.name, exc)
-                    visual_summary = f"Capture d'écran sur {act.get('executable', 'application')}"
-
-                # Suppression physique du fichier .webp pour respecter le budget disque
-                try:
-                    img_path.unlink()
-                    logger.debug("Image temporaire supprimée du disque : %s", img_path.name)
-                except Exception as exc:
-                    logger.warning("Impossible de supprimer %s : %s", img_path, exc)
-
-            # Mise à jour de la base de données
-            self.db.update_activity_visual_summary(act_id, visual_summary)
+        # 1. Traitement des captures d'écran différées, par lots jusqu'à épuisement (A4) :
+        #    aucune activité n'est marquée traitée tant que sa capture n'a pas été lue.
+        seen_screenshot_ids: Set[int] = set()
+        while True:
+            screenshot_activities = [
+                a for a in self.db.get_unprocessed_activities_with_screenshots(limit=50)
+                if a["id"] not in seen_screenshot_ids
+            ]
+            if not screenshot_activities:
+                break
+            logger.info("Lot d'activités avec capture d'écran à analyser : %d", len(screenshot_activities))
+            for act in tqdm(screenshot_activities, desc="Consolidation Nocturne (Captures)", unit="img"):
+                seen_screenshot_ids.add(act["id"])
+                self._analyze_activity_screenshot(act)
 
         # 2. Classification sémantique des activités brutes (processed = 0)
-        unprocessed = self.db.get_unprocessed_raw_activities(limit=500)
+        unprocessed = self.db.get_unprocessed_raw_activities(limit=500, exclude_pending_screenshots=True)
         logger.info("Activités brutes à classifier : %d", len(unprocessed))
 
         if not unprocessed:
             logger.info("Aucune activité brute en attente de classification.")
             llm_client.unload_model(settings.MODEL_FAST_VISION)
+            self.purge_orphan_screenshots()
             return 0
 
         # Regroupement par signature unique (executable, window_title, ocr_snippet) pour minimiser les appels
@@ -309,8 +290,63 @@ class NightConsolidator:
 
         # 3. Purge explicite de la VRAM (keep_alive=0)
         llm_client.unload_model(settings.MODEL_FAST_VISION)
+        self.purge_orphan_screenshots()
         logger.info("--- FIN PASSE 1 : VRAM PURGÉE ---")
         return len(updates)
+
+    def _analyze_activity_screenshot(self, act: Dict[str, Any]) -> None:
+        """Résume une capture par le modèle de vision, supprime le fichier et libère screenshot_path."""
+        img_path = Path(act["screenshot_path"])
+        visual_summary = ""
+
+        if img_path.exists():
+            prompt = (
+                "Analyse cette capture d'écran de l'utilisateur en une seule phrase dense et factuelle : "
+                "identifie l'application, le projet, le code ou le contenu textuel affiché. Zéro bavardage."
+            )
+            try:
+                visual_summary = llm_client.generate_vision(
+                    prompt=prompt,
+                    image_path=img_path,
+                    model=settings.MODEL_FAST_VISION,
+                    keep_alive="5m",
+                )
+            except Exception as exc:
+                logger.warning("Échec vision pour %s : %s", img_path.name, exc)
+                visual_summary = f"Capture d'écran sur {act.get('executable', 'application')}"
+
+            # Suppression physique du fichier .webp pour respecter le budget disque
+            try:
+                img_path.unlink()
+                logger.debug("Image temporaire supprimée du disque : %s", img_path.name)
+            except Exception as exc:
+                logger.warning("Impossible de supprimer %s : %s", img_path, exc)
+
+        self.db.update_activity_visual_summary(act["id"], visual_summary)
+
+    def purge_orphan_screenshots(self) -> int:
+        """
+        Supprime du staging les captures .webp qu'aucune activité ne référence plus (A4).
+        Seules les captures plus anciennes que SCREEN_ORPHAN_MAX_AGE_HOURS sont visées, pour ne
+        pas toucher la capture de la fenêtre que le démon tient encore en mémoire.
+        """
+        staging = settings.SCREEN_STAGING_DIR
+        if not staging.exists():
+            return 0
+        referenced = {os.path.normcase(str(Path(p).resolve())) for p in self.db.get_referenced_screenshot_paths()}
+        cutoff = datetime.now().timestamp() - settings.SCREEN_ORPHAN_MAX_AGE_HOURS * 3600
+        purged = 0
+        for img in staging.glob("*.webp"):
+            try:
+                if os.path.normcase(str(img.resolve())) in referenced or img.stat().st_mtime > cutoff:
+                    continue
+                img.unlink()
+                purged += 1
+            except Exception as exc:
+                logger.debug("Purge capture orpheline impossible %s : %s", img.name, exc)
+        if purged:
+            logger.info("%d capture(s) orpheline(s) supprimée(s) du staging.", purged)
+        return purged
 
     # ==========================================================================
     # CALCUL ANALYTIQUE DES TUNNELS D'HYPERFOCUS ET DAILY_METRICS

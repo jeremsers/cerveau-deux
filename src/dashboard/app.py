@@ -25,8 +25,8 @@ import pyperclip
 import streamlit as st
 
 from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
-from src.consolidators.kanban_engine import kanban_engine
-from src.database.db_manager import DBManager, ProjectRecord
+from src.consolidators.kanban_engine import build_project_record, kanban_engine
+from src.database.db_manager import DBManager
 
 # Configuration de styles CSS avancés
 APP_CUSTOM_CSS = """
@@ -837,17 +837,21 @@ def render_dashboard() -> None:
                 new_desc = st.text_area("Description du projet", placeholder="Contexte architectural et objectifs...", key="new_proj_desc")
                 if st.button("Enregistrer le Projet", key="btn_save_proj", use_container_width=True):
                     if new_pname.strip() and new_pid.strip() and new_prefix.strip():
-                        kanban_engine.db.upsert_project(
-                            ProjectRecord(
-                                project_id=new_pid.strip().lower(),
-                                name=new_pname.strip(),
-                                prefix=new_prefix.strip().upper(),
-                                repo_path=new_repo.strip() or None,
-                                description=new_desc.strip(),
+                        try:
+                            # Validation commune (slug, préfixe, dépôt Git) et refus d'un slug existant (A2, D3)
+                            kanban_engine.db.create_project(
+                                build_project_record(
+                                    project_id=new_pid,
+                                    name=new_pname,
+                                    prefix=new_prefix,
+                                    repo_path=new_repo,
+                                    description=new_desc,
+                                )
                             )
-                        )
-                        st.success(f"Projet '{new_pname}' créé !")
-                        st.rerun()
+                            st.success(f"Projet '{new_pname}' créé !")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
                     else:
                         st.error("Nom, Slug et Préfixe sont obligatoires.")
 

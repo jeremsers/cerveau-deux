@@ -36,8 +36,25 @@ from src.utils.markdown_io import (
     parse_concept_file,
     write_concept_file,
 )
+from src.utils.path_safety import resolve_within, safe_slug
 
 logger = logging.getLogger("Exocortex.GraphDefragmenter")
+
+# Taille maximale de chaque corps de fiche transmis au LLM pour une décision de fusion :
+# assez pour contenir une fiche complète, borné pour tenir dans num_ctx.
+MERGE_PROMPT_BODY_MAX_CHARS = 12000
+
+
+def _collect_session_ids(note: ParsedConceptNote) -> Set[str]:
+    """Rassemble session_id et session_ids (fiche déjà fusionnée) d'une note."""
+    ids: Set[str] = set()
+    if note.frontmatter.session_id:
+        ids.add(str(note.frontmatter.session_id).strip())
+    extra = (note.frontmatter.model_extra or {}).get("session_ids") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    ids.update(str(s).strip() for s in extra if str(s).strip())
+    return ids
 
 STOPWORDS_SIGNIFICANT = {
     "le", "la", "les", "un", "une", "des", "du", "de", "d", "l", "en", "et", "ou",
@@ -234,9 +251,13 @@ class GraphDefragmenter:
             f"> - **Fiches sources fusionnées :** [[{note_a.frontmatter.title}]] et [[{note_b.frontmatter.title}]]"
         )
 
-        # 2. Construction de la note canonique
-        canonical_slug = merge_decision.canonical_slug or note_a_path.stem
-        target_path = settings.CONCEPTS_DIR / f"{canonical_slug}.md"
+        # 2. Construction de la note canonique (slug issu du LLM : slugifié et confiné, A7)
+        target_path = self._resolve_canonical_target(merge_decision, note_a_path, note_b_path)
+        canonical_slug = target_path.stem
+
+        # Sessions sources conservées pour le mode Delta du Takeout (A8)
+        merged_session_ids = sorted(_collect_session_ids(note_a) | _collect_session_ids(note_b))
+        merged_from = sorted({note_a_path.stem, note_b_path.stem})
 
         fm = ConceptFrontmatter(
             id=canonical_slug,
@@ -249,6 +270,8 @@ class GraphDefragmenter:
             updated_at=updated_at,
             total_time_invested_min=total_time,
             summary_1_line=merge_decision.merged_summary_1_line,
+            session_ids=merged_session_ids,
+            merged_from=merged_from,
         )
 
         canonical_note = ParsedConceptNote(
@@ -302,6 +325,33 @@ class GraphDefragmenter:
         self.rewrite_vault_wikilinks(old_targets=old_targets, new_target=merge_decision.canonical_title)
 
         return target_path
+
+    def _resolve_canonical_target(
+        self,
+        merge_decision: ConceptMergeSchema,
+        note_a_path: Path,
+        note_b_path: Path,
+    ) -> Path:
+        """
+        Détermine le chemin de la fiche fusionnée à partir du slug proposé par le LLM (A7) :
+        - slugification stricte (aucun '/', '\\' ni '..' possible) ;
+        - chemin résolu obligatoirement sous 02_Concepts/ ;
+        - une note existante hors de la paire n'est jamais écrasée : suffixe -2, -3, ...
+        """
+        concepts_dir = settings.CONCEPTS_DIR
+        pair = {note_a_path.resolve(), note_b_path.resolve()}
+        base_slug = safe_slug(
+            merge_decision.canonical_slug or merge_decision.canonical_title,
+            fallback=note_a_path.stem,
+        )
+        candidate_slug = base_slug
+        counter = 2
+        while True:
+            target = resolve_within(concepts_dir, f"{candidate_slug}.md")
+            if not target.exists() or target.resolve() in pair:
+                return target
+            candidate_slug = f"{base_slug}-{counter}"
+            counter += 1
 
     def annotate_contradiction(
         self,
@@ -366,8 +416,8 @@ class GraphDefragmenter:
                 continue
 
             for md_file in s_dir.rglob("*.md"):
-                # Exclure le dossier d'archivage des fiches fusionnées
-                if "_Archive_Merged" in md_file.parts:
+                # Exclure les dossiers d'archivage (fusions) et de quarantaine (Vault Doctor)
+                if "_Archive_Merged" in md_file.parts or "_Quarantine" in md_file.parts:
                     continue
 
                 try:
@@ -429,8 +479,10 @@ class GraphDefragmenter:
                 if llm_client.is_alive():
                     prompt = (
                         f"Évalue ces deux fiches conceptuelles pour fusion ou contradiction :\n\n"
-                        f"--- FICHE A ({path_a.name}) ---\n{note_a.frontmatter.title}\n{note_a.body[:1500]}\n\n"
-                        f"--- FICHE B ({path_b.name}) ---\n{note_b.frontmatter.title}\n{note_b.body[:1500]}\n\n"
+                        f"--- FICHE A ({path_a.name}) ---\n{note_a.frontmatter.title}\n{note_a.body[:MERGE_PROMPT_BODY_MAX_CHARS]}\n\n"
+                        f"--- FICHE B ({path_b.name}) ---\n{note_b.frontmatter.title}\n{note_b.body[:MERGE_PROMPT_BODY_MAX_CHARS]}\n\n"
+                        "Si tu fusionnes, merged_markdown_body doit conserver TOUS les faits, commandes et arbitrages "
+                        "des deux fiches (aucune perte d'information).\n"
                         "Remplis le schéma ConceptMergeSchema :\n"
                         "- should_merge : vrai si elles traitent du même concept et sont redondantes.\n"
                         "- contradiction_detected : vrai si l'une remplace l'autre suite à un arbitrage technique."
@@ -462,8 +514,8 @@ class GraphDefragmenter:
                 if llm_client.is_alive():
                     prompt = (
                         f"Y a-t-il une contradiction ou une évolution d'arbitrage entre ces deux choix ?\n\n"
-                        f"Choix 1 ({older_path.name}) : {parse_concept_file(older_path).body[:1000]}\n\n"
-                        f"Choix 2 récent ({newer_path.name}) : {parse_concept_file(newer_path).body[:1000]}\n\n"
+                        f"Choix 1 ({older_path.name}) : {parse_concept_file(older_path).body[:MERGE_PROMPT_BODY_MAX_CHARS // 2]}\n\n"
+                        f"Choix 2 récent ({newer_path.name}) : {parse_concept_file(newer_path).body[:MERGE_PROMPT_BODY_MAX_CHARS // 2]}\n\n"
                         "Remplis ConceptMergeSchema (should_merge=False si fiches distinctes mais contradictoires)."
                     )
                     try:
