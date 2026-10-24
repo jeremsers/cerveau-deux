@@ -36,8 +36,11 @@ from src.database.db_manager import (
 )
 from src.database.vector_store import vector_store
 from src.consolidators.drive_compiler import DriveCompiler
-from src.llm.ollama_client import llm_client
+from src.llm.ollama_client import VRAMInsufficientError, llm_client
 from src.llm.prompts import (
+    PROFILE_SPLIT_MARKER,
+    PROMPT_BURST_CLUSTER_SYSTEM,
+    PROMPT_BURST_CLUSTER_USER,
     PROMPT_COGNITIVE_PROFILING_SYSTEM,
     PROMPT_COGNITIVE_PROFILING_USER,
     PROMPT_SESSION_DISTILLATION_SYSTEM,
@@ -48,6 +51,18 @@ from src.llm.prompts import (
 
 logger = logging.getLogger("Exocortex.TakeoutIngestor")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# Marqueur du profil cognitif par défaut : tant qu'il est présent, le profil peut être remplacé
+# automatiquement (mode cloud_api) ou par --import-profile (v0.5.3, B15).
+PROFILE_TEMPLATE_MARKER = "<!-- exocortex:profil-gabarit -->"
+_LEGACY_PROFILE_TEMPLATE_SIGNATURE = "- Rigueur technique absolue, orientation systèmes et architectures locales robustes."
+
+# Nombre de rafales classées par appel au 12B (B11)
+BURST_LLM_BATCH_SIZE = 15
+
+
+def _allowed_taxonomy_block() -> str:
+    return "\n".join(f"- `{k}` : {v}" for k, v in AUTHORIZED_SEMANTIC_TOPICS.items() if k != "A_Trier")
 
 
 # ==============================================================================
@@ -185,15 +200,16 @@ def generate_staging_files(
             "2. Assurez-vous d'utiliser le modèle Gemini 1.5 Pro ou Gemini 2.0 / 2.5 Pro (fenêtre 1M-2M tokens).\n"
             "3. Téléversez en pièce jointe le fichier '00_USER_PROMPTS_ONLY.md' situé dans :\n"
             f"   {user_prompts_file.resolve()}\n"
-            "4. Copiez-collez l'intégralité du prompt ci-dessous dans la zone de texte :\n\n"
+            "4. Copiez-collez l'intégralité du prompt ci-dessous dans la zone de texte.\n"
+            "5. Enregistrez la réponse de Gemini dans un fichier texte, puis importez-la :\n"
+            "   python run_exocortex.py --import-profile <chemin_du_fichier>\n\n"
             "--------------------------- DÉBUT DU PROMPT À COPIER ---------------------------\n"
         )
-        f.write(PROMPT_COGNITIVE_PROFILING_SYSTEM)
+        f.write(PROMPT_COGNITIVE_PROFILING_SYSTEM.format(allowed_taxonomy=_allowed_taxonomy_block()))
         f.write(
             "\n\nTu trouveras en pièce jointe le document '00_USER_PROMPTS_ONLY.md' contenant l'historique complet.\n"
-            "Analyse l'intégralité de ces prompts et génère les deux livrables distincts séparés par '===SPLIT_LIVRABLE===' :\n"
-            "1. Le document Markdown complet pour '00_Meta/Profil_Cognitif.md'\n"
-            "2. Le document Markdown complet pour '00_Meta/Taxonomie_Tags.md' (15 à 30 topics normalisés).\n"
+            "Analyse l'intégralité de ces prompts et rédige le contenu complet de '00_Meta/Profil_Cognitif.md', "
+            "en Markdown, commençant par le titre '# Profil Cognitif & Empreinte Intellectuelle'.\n"
         )
         f.write("\n---------------------------- FIN DU PROMPT À COPIER ----------------------------\n")
 
@@ -304,6 +320,152 @@ def perform_burst_clustering(
 
     logger.info("Burst Clustering terminé : %d clusters denses formés.", clusters_formed)
     return clusters_formed
+
+
+class BurstTopicItem(BaseModel):
+    cluster_id: str = Field(description="Identifiant exact de la rafale")
+    semantic_topic: str = Field(description="L'une des macro-catégories autorisées")
+
+
+class BurstBatchClassification(BaseModel):
+    clusters: List[BurstTopicItem] = Field(default_factory=list)
+
+
+def heuristic_burst_topic(queries: List[str], min_votes: int = 2) -> Optional[str]:
+    """
+    Repli CPU sans LLM (B11) : chaque mot des requêtes vote pour une macro-catégorie via
+    normalize_to_macro_topic ; la catégorie majoritaire est retenue si elle réunit min_votes voix.
+    """
+    votes: Dict[str, int] = {}
+    for q in queries:
+        for word in set(re.findall(r"[a-zA-ZÀ-ÿ0-9][\wÀ-ÿ'-]{2,}", q.lower())):
+            topic = normalize_to_macro_topic(word)
+            if topic != "A_Trier":
+                votes[topic] = votes.get(topic, 0) + 1
+    if not votes:
+        return None
+    best, count = max(votes.items(), key=lambda kv: kv[1])
+    return best if count >= min_votes else None
+
+
+def classify_burst_clusters(db: DBManager, min_events: int = settings.SEARCH_BURST_MIN_EVENTS) -> int:
+    """
+    Attribue un semantic_topic aux rafales Search/YouTube qui n'en ont pas (v0.5.3, B11) :
+    lots de BURST_LLM_BATCH_SIZE rafales par appel au 12B, puis repli heuristique pour les
+    rafales non résolues (Ollama hors ligne, VRAM insuffisante, réponse invalide).
+    Retourne le nombre de rafales classées.
+    """
+    clusters = db.get_untopiced_burst_clusters(min_events=min_events)
+    if not clusters:
+        return 0
+    logger.info("Classification thématique de %d rafale(s) Search/YouTube...", len(clusters))
+
+    resolved: Dict[str, str] = {}
+    if llm_client.is_alive():
+        allowed = _allowed_taxonomy_block()
+        try:
+            for start in range(0, len(clusters), BURST_LLM_BATCH_SIZE):
+                batch = clusters[start:start + BURST_LLM_BATCH_SIZE]
+                block = "\n".join(
+                    f"- `{c['cluster_id']}` : " + " | ".join((c["queries"] or "").split(" || ")[:12])[:900]
+                    for c in batch
+                )
+                try:
+                    res = llm_client.generate_structured(
+                        prompt=PROMPT_BURST_CLUSTER_USER.format(allowed_taxonomy=allowed, clusters_block=block),
+                        response_model=BurstBatchClassification,
+                        system=PROMPT_BURST_CLUSTER_SYSTEM,
+                        model=settings.MODEL_FAST_VISION,
+                        keep_alive="5m",
+                        enable_thinking=False,
+                        num_predict=2048,
+                    )
+                except VRAMInsufficientError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Échec de classification LLM d'un lot de rafales : %s", exc)
+                    continue
+                batch_ids = {c["cluster_id"] for c in batch}
+                for item in res.clusters:
+                    if item.cluster_id in batch_ids:
+                        resolved[item.cluster_id] = normalize_to_macro_topic(item.semantic_topic)
+        except VRAMInsufficientError as exc:
+            logger.warning("VRAM insuffisante pour classer les rafales au 12B (%s) : repli heuristique.", exc)
+        finally:
+            llm_client.unload_model(settings.MODEL_FAST_VISION)
+
+    classified = 0
+    for c in clusters:
+        topic = resolved.get(c["cluster_id"])
+        if not topic or topic == "A_Trier":
+            topic = heuristic_burst_topic((c["queries"] or "").split(" || "))
+        if topic:
+            db.set_cluster_topic(c["cluster_id"], topic)
+            classified += 1
+    logger.info("%d rafale(s) classée(s) sur %d.", classified, len(clusters))
+    return classified
+
+
+# ==============================================================================
+# PROFIL COGNITIF (v0.5.3, B15)
+# ==============================================================================
+
+def is_profile_template(path: Optional[Path] = None) -> bool:
+    """Vrai si le profil est absent ou encore le gabarit par défaut (remplaçable automatiquement)."""
+    target = path or settings.PROFIL_COGNITIF_PATH
+    if not target.exists():
+        return True
+    content = target.read_text(encoding="utf-8", errors="replace")
+    return PROFILE_TEMPLATE_MARKER in content or _LEGACY_PROFILE_TEMPLATE_SIGNATURE in content
+
+
+def extract_profile_from_reply(reply: str) -> str:
+    """
+    Extrait le profil d'une réponse Gemini : partie précédant ===SPLIT_LIVRABLE=== (anciennes
+    consignes à deux livrables), en-tête « SECTION 1 » et blocs ```markdown retirés.
+    """
+    text = reply.strip()
+    if PROFILE_SPLIT_MARKER in text:
+        text = text.split(PROFILE_SPLIT_MARKER, 1)[0].strip()
+    text = re.sub(r"^```(?:markdown|md)?\s*\n", "", text)
+    text = re.sub(r"\n```\s*$", "", text)
+    text = re.sub(r"^#\s*SECTION\s*1\s*:[^\n]*\n", "", text, flags=re.IGNORECASE).strip()
+    if not text.startswith("#"):
+        text = f"# Profil Cognitif & Empreinte Intellectuelle\n\n{text}"
+    return text
+
+
+def import_cognitive_profile(reply: str, target: Optional[Path] = None) -> Path:
+    """Écrit le profil extrait d'une réponse Gemini dans 00_Meta/Profil_Cognitif.md (la taxonomie reste fermée)."""
+    profile = extract_profile_from_reply(reply)
+    if len(profile) < 200:
+        raise ValueError("Profil trop court ou vide : vérifiez le fichier importé.")
+    out = target or settings.PROFIL_COGNITIF_PATH
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(profile + "\n", encoding="utf-8")
+    logger.info("Profil cognitif importé dans %s (%d caractères).", out, len(profile))
+    return out
+
+
+def generate_cognitive_profile_cloud(user_prompts_file: Path, max_chars: int = 3_000_000) -> Optional[Path]:
+    """
+    Mode cloud_api : produit automatiquement le profil via Gemini à partir de 00_USER_PROMPTS_ONLY.md,
+    uniquement si le profil est encore le gabarit (un profil importé ou écrit à la main n'est jamais écrasé).
+    """
+    if settings.TAKEOUT_MODE != "cloud_api" or not llm_client.is_cloud_available():
+        return None
+    if not is_profile_template() or not user_prompts_file.exists():
+        return None
+    prompts_content = user_prompts_file.read_text(encoding="utf-8", errors="replace")[:max_chars]
+    try:
+        reply = llm_client.generate_cloud_sota(
+            prompt=PROMPT_COGNITIVE_PROFILING_USER.format(prompts_content=prompts_content),
+            system=PROMPT_COGNITIVE_PROFILING_SYSTEM.format(allowed_taxonomy=_allowed_taxonomy_block()),
+        )
+        return import_cognitive_profile(str(reply))
+    except Exception as exc:
+        logger.warning("Profil cognitif cloud non généré : %s", exc)
+        return None
 
 
 # ==============================================================================
@@ -645,12 +807,29 @@ def save_distilled_concept_note(
     return True, dist_status
 
 
+def _build_distillation_prompt(
+    sess: ReconstructedSession,
+    allowed_topics_str: str,
+    max_user_chars: int,
+    max_ai_chars: int,
+    max_total_chars: int,
+) -> str:
+    """Construit le prompt de distillation d'une session (taille adaptée à chaque vague)."""
+    clean_turns_text: List[str] = []
+    for t in sess.turns:
+        u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=max_user_chars)
+        a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=max_ai_chars)
+        clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
+    session_text = "\n\n---\n\n".join(clean_turns_text)[:max_total_chars]
+    return PROMPT_SESSION_DISTILLATION_USER.format(allowed_taxonomy=allowed_topics_str, session_text=session_text)
+
+
 def initialize_meta_and_concepts(
     sessions: List[ReconstructedSession],
     noise_sessions: List[ReconstructedSession],
     db: DBManager,
     max_distill_sessions: Optional[int] = None,
-) -> None:
+) -> Dict[str, int]:
     """
     Initialise 00_Meta/, assainit l'existant, distille les sessions restantes via l'architecture
     à 3 vagues séquentielles (Multi-Pass VRAM Queue : 26B Thinking -> 26B No-Think -> 12B Fallback),
@@ -664,6 +843,9 @@ def initialize_meta_and_concepts(
         with open(settings.PROFIL_COGNITIF_PATH, "w", encoding="utf-8") as f:
             f.write(
                 "# Profil Cognitif & Empreinte Intellectuelle\n\n"
+                f"{PROFILE_TEMPLATE_MARKER}\n"
+                "> Gabarit par défaut : remplacez-le via `python run_exocortex.py --import-profile <fichier>` "
+                "(mode web_manual) ou laissez le mode cloud_api le générer.\n\n"
                 "## 1. Style de Raisonnement\n"
                 "- Rigueur technique absolue, orientation systèmes et architectures locales robustes.\n"
                 "- Tolérance zéro pour le code squelette, les placeholders ou le bavardage non exécutable.\n"
@@ -700,55 +882,77 @@ def initialize_meta_and_concepts(
         len(completed_session_ids),
     )
 
-    if sessions_to_distill and llm_client.is_alive():
-        llm_client.ensure_local_gguf_models()
-
     ok_count = 0
     misc_count = 0
     a_trier_count = 0
     llm_rejected_sessions: List[ReconstructedSession] = []
+    deferred_sessions: List[ReconstructedSession] = []
+
+    def _record(st: str, sess: ReconstructedSession) -> None:
+        nonlocal ok_count, misc_count
+        if st == "success":
+            ok_count += 1
+        elif st == "misc_noise":
+            misc_count += 1
+            llm_rejected_sessions.append(sess)
 
     vague1_queue: List[ReconstructedSession] = list(sessions_to_distill)
     vague2_queue: List[ReconstructedSession] = []
     vague3_queue: List[ReconstructedSession] = []
 
     # ==========================================================================
+    # VAGUE 0 (mode cloud_api) : Gemini Cloud, indépendante d'Ollama et de la VRAM (B14)
+    # ==========================================================================
+    if vague1_queue and settings.TAKEOUT_MODE == "cloud_api" and llm_client.is_cloud_available():
+        logger.info("--- DISTILLATION CLOUD SOTA (%s) [%d sessions] ---", settings.GEMINI_MODEL, len(vague1_queue))
+        local_fallback: List[ReconstructedSession] = []
+        with tqdm(total=len(vague1_queue), desc="Distillation Cloud SOTA", unit="sess") as pbar:
+            for sess in vague1_queue:
+                try:
+                    distilled_cloud = llm_client.generate_cloud_sota(
+                        prompt=_build_distillation_prompt(sess, allowed_topics_str, 2500, 3500, 20000),
+                        system=PROMPT_SESSION_DISTILLATION_SYSTEM,
+                        response_model=DistilledConceptSchema,
+                    )
+                    _, st = save_distilled_concept_note(sess, distilled_cloud, db, allow_quarantine=False)
+                    _record(st, sess)
+                except Exception as exc:
+                    logger.warning("Échec Cloud SOTA pour %s : %s. Repli local.", sess.session_id, exc)
+                    local_fallback.append(sess)
+                pbar.update(1)
+        vague1_queue = local_fallback
+
+    if vague1_queue and llm_client.is_alive():
+        llm_client.ensure_local_gguf_models()
+    elif vague1_queue:
+        logger.warning("Ollama hors ligne : %d session(s) restent en attente (pending) pour un prochain run.", len(vague1_queue))
+        deferred_sessions.extend(vague1_queue)
+        vague1_queue = []
+
+    # ==========================================================================
     # VAGUE 1 : gemma4:26b-a4b (Thinking ACTIF, num_predict=8192, Prompt Complet)
     # ==========================================================================
     if vague1_queue and llm_client.is_alive():
-        logger.info("--- DÉMARRAGE VAGUE 1 : gemma4:26b-a4b (Thinking ACTIF, num_predict=8192) [%d sessions] ---", len(vague1_queue))
         free_gb = llm_client.force_clear_vram()
         min_strict = getattr(settings, "VRAM_STRICT_ABORT_FREE_GB", 8.0)
         if free_gb < min_strict:
-            logger.error("VRAM insuffisante avant Vague 1 (%.2f Go < %.2f Go). Report.", free_gb, min_strict)
-            raise VRAMInsufficientError(f"VRAM insuffisante ({free_gb:.2f} Go < {min_strict} Go)")
+            # Report sans interrompre le pipeline (B13) : les sessions restent 'pending' et seront
+            # reprises au prochain run grâce au mode Delta ; bruit et journaux sont tout de même produits.
+            logger.error(
+                "VRAM insuffisante avant Vague 1 (%.2f Go < %.2f Go). Distillation de %d session(s) reportée.",
+                free_gb, min_strict, len(vague1_queue),
+            )
+            deferred_sessions.extend(vague1_queue)
+            vague1_queue = []
 
+    if vague1_queue and llm_client.is_alive():
+        logger.info("--- DÉMARRAGE VAGUE 1 : gemma4:26b-a4b (Thinking ACTIF, num_predict=8192) [%d sessions] ---", len(vague1_queue))
         with tqdm(total=len(vague1_queue), desc="Distillation Vague 1 (26B Thinking)", unit="sess") as pbar:
             for sess in vague1_queue:
-                clean_turns_text: List[str] = []
-                for t in sess.turns:
-                    u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=2500)
-                    a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=3500)
-                    clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
-                session_text = "\n\n---\n\n".join(clean_turns_text)[:20000]
-
-                user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
-                    allowed_taxonomy=allowed_topics_str,
-                    session_text=session_text,
-                )
+                user_prompt = _build_distillation_prompt(sess, allowed_topics_str, 2500, 3500, 20000)
 
                 distilled: Optional[DistilledConceptSchema] = None
-                if settings.TAKEOUT_MODE == "cloud_api" and llm_client.is_cloud_available():
-                    try:
-                        distilled = llm_client.generate_cloud_sota(
-                            prompt=user_prompt,
-                            system=PROMPT_SESSION_DISTILLATION_SYSTEM,
-                            response_model=DistilledConceptSchema,
-                        )
-                    except Exception as exc:
-                        logger.warning("Échec Cloud SOTA pour %s : %s", sess.session_id, exc)
-
-                if not distilled and llm_client.is_alive():
+                if llm_client.is_alive():
                     try:
                         distilled = llm_client.generate_structured(
                             prompt=user_prompt,
@@ -769,11 +973,7 @@ def initialize_meta_and_concepts(
 
                 if distilled:
                     _, st = save_distilled_concept_note(sess, distilled, db, allow_quarantine=False)
-                    if st == "success":
-                        ok_count += 1
-                    elif st == "misc_noise":
-                        misc_count += 1
-                        llm_rejected_sessions.append(sess)
+                    _record(st, sess)
 
                 pbar.set_postfix({"ok": ok_count, "v2_pending": len(vague2_queue)})
                 pbar.update(1)
@@ -790,17 +990,7 @@ def initialize_meta_and_concepts(
 
         with tqdm(total=len(vague2_queue), desc="Distillation Vague 2 (26B No-Think)", unit="sess") as pbar:
             for sess in vague2_queue:
-                clean_turns_text = []
-                for t in sess.turns:
-                    u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=800)
-                    a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=1000)
-                    clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
-                session_text = "\n\n---\n\n".join(clean_turns_text)[:6000]
-
-                user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
-                    allowed_taxonomy=allowed_topics_str,
-                    session_text=session_text,
-                )
+                user_prompt = _build_distillation_prompt(sess, allowed_topics_str, 800, 1000, 6000)
 
                 distilled = None
                 try:
@@ -823,11 +1013,7 @@ def initialize_meta_and_concepts(
 
                 if distilled:
                     _, st = save_distilled_concept_note(sess, distilled, db, allow_quarantine=False)
-                    if st == "success":
-                        ok_count += 1
-                    elif st == "misc_noise":
-                        misc_count += 1
-                        llm_rejected_sessions.append(sess)
+                    _record(st, sess)
 
                 pbar.set_postfix({"ok": ok_count, "v3_pending": len(vague3_queue)})
                 pbar.update(1)
@@ -849,17 +1035,7 @@ def initialize_meta_and_concepts(
 
         with tqdm(total=len(vague3_queue), desc="Distillation Vague 3 (12B Fallback)", unit="sess") as pbar:
             for sess in vague3_queue:
-                clean_turns_text = []
-                for t in sess.turns:
-                    u_clean = sanitize_turn_text(t.user_prompt, max_turn_chars=800)
-                    a_clean = sanitize_turn_text(t.ai_response, max_turn_chars=1000)
-                    clean_turns_text.append(f"### Utilisateur :\n{u_clean}\n\n### Assistant :\n{a_clean}")
-                session_text = "\n\n---\n\n".join(clean_turns_text)[:6000]
-
-                user_prompt = PROMPT_SESSION_DISTILLATION_USER.format(
-                    allowed_taxonomy=allowed_topics_str,
-                    session_text=session_text,
-                )
+                user_prompt = _build_distillation_prompt(sess, allowed_topics_str, 800, 1000, 6000)
 
                 distilled = None
                 try:
@@ -878,11 +1054,7 @@ def initialize_meta_and_concepts(
 
                 if distilled:
                     _, st = save_distilled_concept_note(sess, distilled, db, allow_quarantine=False)
-                    if st == "success":
-                        ok_count += 1
-                    elif st == "misc_noise":
-                        misc_count += 1
-                        llm_rejected_sessions.append(sess)
+                    _record(st, sess)
                 else:
                     # Échec définitif -> Sauvegarde en quarantaine avec protection anti-écrasement
                     _, st = save_distilled_concept_note(sess, None, db, allow_quarantine=True)
@@ -899,12 +1071,25 @@ def initialize_meta_and_concepts(
     # Déchargement complet de la VRAM après la distillation
     llm_client.unload_all_models()
     logger.info("Distillation LLM achevée : %d réussies, %d en quarantaine, %d bruit LLM.", ok_count, a_trier_count, misc_count)
+    if deferred_sessions:
+        logger.warning(
+            "%d session(s) reportée(s) (Ollama hors ligne ou VRAM insuffisante) : elles restent 'pending' "
+            "et seront distillées au prochain run.",
+            len(deferred_sessions),
+        )
 
     # 4. Compilation du registre consolidé du bruit (00_Meta/00_MISC_ET_BRUIT_ARCHIVE.md)
     compile_misc_noise_archive(noise_sessions, llm_rejected_sessions)
 
     # 5. Cold Start Épisodique Rétroactif (01_Episodique/YYYY-MM-DD.md & daily_metrics)
     generate_cold_start_episodic_journals(sessions, db)
+
+    return {
+        "distilled_success": ok_count,
+        "quarantined": a_trier_count,
+        "llm_noise": misc_count,
+        "deferred_sessions": len(deferred_sessions),
+    }
 
 
 # ==============================================================================
@@ -1022,14 +1207,19 @@ class TakeoutIngestor:
         # 5. Jointure temporelle [-60 min ; +30 min] (sur les sessions qualifiées)
         linked_count = perform_temporal_join(qualified_sessions, self.db)
 
-        # 6. Burst Clustering sur les traces restantes
+        # 6. Burst Clustering sur les traces restantes, puis topic de chaque rafale (B11)
         burst_count = perform_burst_clustering(self.db)
+        bursts_topiced = classify_burst_clusters(self.db)
 
         # 7. Génération des fichiers de staging
         user_prompts_file, batch_files, web_prompt_file = generate_staging_files(qualified_sessions)
 
+        # 7b. Mode cloud_api : profil cognitif automatique tant que le profil est le gabarit (B15)
+        settings.ensure_directories()
+        profile_path = generate_cognitive_profile_cloud(user_prompts_file)
+
         # 8. Initialisation de 00_Meta, assainissement existant, distillation Delta et Cold Start épisodique
-        initialize_meta_and_concepts(
+        distillation_report = initialize_meta_and_concepts(
             qualified_sessions,
             noise_sessions,
             self.db,
@@ -1053,6 +1243,9 @@ class TakeoutIngestor:
             "noise_sessions_count": len(noise_sessions),
             "linked_footprints": linked_count,
             "burst_clusters": burst_count,
+            "burst_clusters_topiced": bursts_topiced,
+            "cognitive_profile_generated": bool(profile_path),
+            "distillation": distillation_report,
             "staging_prompts_file": str(user_prompts_file),
             "staging_batches_count": len(batch_files),
             "web_prompt_file": str(web_prompt_file),

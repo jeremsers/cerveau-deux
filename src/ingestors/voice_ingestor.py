@@ -23,9 +23,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.config import settings
+from pydantic import BaseModel, Field
+
+from src.config import AUTHORIZED_SEMANTIC_TOPICS, normalize_to_macro_topic, settings
 from src.database.db_manager import ChatMessageRecord, ChatSessionRecord, DBManager
 from src.llm.ollama_client import llm_client
+from src.llm.prompts import PROMPT_VOICE_MEMO_SYSTEM, PROMPT_VOICE_MEMO_USER
 from src.utils.markdown_io import (
     ConceptFrontmatter,
     ParsedConceptNote,
@@ -35,6 +38,19 @@ from src.utils.markdown_io import (
 logger = logging.getLogger("Exocortex.VoiceIngestor")
 
 SUPPORTED_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".ogg", ".wav", ".flac"}
+
+
+class VoiceMemoSchema(BaseModel):
+    """Sortie structurée de la distillation d'un mémo vocal (v0.5.3, B12)."""
+    concept_title: str = Field(description="Titre conceptuel précis, jamais le début de la transcription.")
+    semantic_topic: str = Field(description="Exactement l'une des macro-catégories autorisées.")
+    tags: List[str] = Field(default_factory=list, description="2 à 5 tags en kebab-case.")
+    summary_1_line: str = Field(description="Résumé dense en une phrase.")
+    synthesized_markdown_body: str = Field(description="Corps Markdown structuré : idées, décisions, actions.")
+
+
+def _allowed_taxonomy_block() -> str:
+    return "\n".join(f"- `{k}` : {v}" for k, v in AUTHORIZED_SEMANTIC_TOPICS.items() if k != "A_Trier")
 
 
 def _slugify(text: str) -> str:
@@ -121,59 +137,50 @@ class VoiceIngestor:
         transcription: str,
         audio_name: str,
         dt: datetime,
-    ) -> Tuple[str, str, str, str]:
+    ) -> Tuple[str, str, str, str, List[str]]:
         """
-        Détermine le titre, le sujet, le résumé et le corps de la note.
-        Utilise un prompt LLM léger si disponible, sinon un découpage heuristique.
+        Détermine le titre, le sujet, le résumé, le corps et les tags de la note (v0.5.3, B12).
+        Distillation structurée par le 12B (VoiceMemoSchema) si Ollama répond ; sinon repli
+        heuristique classé A_Trier (et non plus Dev_et_Architecture_Tech d'office).
+        La transcription brute est toujours conservée en fin de corps.
         """
         clean_text = transcription.strip()
         date_str = dt.strftime("%Y-%m-%d")
+        transcript_section = f"## Transcription brute\n\n{clean_text}\n"
 
-        # Heuristique par défaut
-        first_line = clean_text.split("\n")[0]
-        # Nettoyage ponctuation initiale
-        first_line = re.sub(r"^[^\w]+", "", first_line).strip()
+        # Repli heuristique
+        first_line = re.sub(r"^[^\w]+", "", clean_text.split("\n")[0]).strip()
         raw_title = first_line[:60].strip() or f"Note Vocale du {date_str}"
-        if not raw_title.startswith("Note Vocale") and not raw_title.startswith("Réflexion"):
-            title = f"Réflexion Vocale : {raw_title}"
-        else:
-            title = raw_title
-
-        topic = "Dev_et_Architecture_Tech"
+        title = raw_title if raw_title.startswith(("Note Vocale", "Réflexion")) else f"Réflexion Vocale : {raw_title}"
+        topic = "A_Trier"
         summary_1_line = clean_text[:120].replace("\n", " ").strip()
+        tags = ["vocal", "reflexion"]
+        body = transcript_section
 
-        body = f"## 1. Transcription & Synthèse Brute\n\n{clean_text}\n"
-
-        # Synthèse optionnelle via LLM si Ollama est actif
         if llm_client.is_alive() and len(clean_text) > 40:
             try:
-                prompt = (
-                    f"Voici la transcription brute d'un mémo vocal enregistré le {date_str} :\n\n"
-                    f"\"\"\"\n{clean_text[:2000]}\n\"\"\"\n\n"
-                    "Formule en français :\n"
-                    "1. Un titre conceptuel court et précis (ex: 'Architecture : ...')\n"
-                    "2. Un résumé d'une ligne\n"
-                    "3. La macro-catégorie la plus adaptée parmi (Dev_et_Architecture_Tech, IA_et_LLM_Local, HomeLab_et_Hardware, Freelance_et_Carriere, Admin_Finance_et_Droit, Introspection_et_Neuroatypie, Philo_et_Epistemologie, Sante_et_Pharmacologie, A_Trier)\n\n"
-                    "Réponds sous ce format exact :\n"
-                    "TITRE: <titre>\n"
-                    "TOPIC: <topic>\n"
-                    "RESUME: <resume>"
+                distilled = llm_client.generate_structured(
+                    prompt=PROMPT_VOICE_MEMO_USER.format(
+                        allowed_taxonomy=_allowed_taxonomy_block(),
+                        date_str=date_str,
+                        transcription=clean_text[:12000],
+                    ),
+                    response_model=VoiceMemoSchema,
+                    system=PROMPT_VOICE_MEMO_SYSTEM,
+                    model=settings.MODEL_FAST_VISION,
+                    enable_thinking=False,
+                    num_predict=4096,
                 )
-                resp = llm_client.generate(prompt=prompt, model=settings.MODEL_FAST_VISION, max_tokens=150)
-                if resp:
-                    t_match = re.search(r"TITRE:\s*(.+)", resp)
-                    tp_match = re.search(r"TOPIC:\s*(.+)", resp)
-                    r_match = re.search(r"RESUME:\s*(.+)", resp)
-                    if t_match:
-                        title = t_match.group(1).strip().strip("'\"`")
-                    if tp_match:
-                        topic = tp_match.group(1).strip()
-                    if r_match:
-                        summary_1_line = r_match.group(1).strip()
+                title = distilled.concept_title.strip() or title
+                topic = normalize_to_macro_topic(distilled.semantic_topic)
+                summary_1_line = distilled.summary_1_line.strip() or summary_1_line
+                tags = ["vocal"] + [_slugify(t) for t in distilled.tags if t.strip()][:6]
+                synthesized = re.sub(r">\s*\[!abstract\][^\n]*\n(?:>[^\n]*\n?)*", "", distilled.synthesized_markdown_body).strip()
+                body = f"{synthesized}\n\n{transcript_section}" if synthesized else transcript_section
             except Exception as llm_exc:
-                logger.debug("Échec enrichissement LLM du mémo vocal : %s", llm_exc)
+                logger.warning("Distillation LLM du mémo vocal %s impossible (%s) : repli A_Trier.", audio_name, llm_exc)
 
-        return title, topic, summary_1_line, body
+        return title, topic, summary_1_line, body, tags
 
     def process_file(self, audio_path: Path) -> Optional[Path]:
         """Traite un fichier audio unique de bout en bout."""
@@ -216,7 +223,7 @@ class VoiceIngestor:
         self.db.insert_chat_messages_batch([message_rec])
 
         # 3. Distillation en note conceptuelle
-        title, topic, summary_1_line, body = self.distill_memo(transcription, audio_path.name, dt)
+        title, topic, summary_1_line, body, tags = self.distill_memo(transcription, audio_path.name, dt)
         slug = _slugify(title)
         concept_file = settings.CONCEPTS_DIR / f"{slug}.md"
 
@@ -232,7 +239,7 @@ class VoiceIngestor:
             type="concept",
             origin=["voice_memo"],
             semantic_topic=topic,
-            tags=["vocal", "reflexion"],
+            tags=tags,
             session_id=session_id,
             created_at=date_str,
             updated_at=date_str,
@@ -256,7 +263,16 @@ class VoiceIngestor:
             file_path=concept_file,
         )
         write_concept_file(note, concept_file)
-        logger.info("Fiche conceptuelle créée pour mémo vocal : %s", concept_file.name)
+        logger.info("Fiche conceptuelle créée pour mémo vocal : %s (%s)", concept_file.name, topic)
+
+        # Rattachement de la fiche et du topic à la session vocale (Explorateur épistémique)
+        self.db.update_session_distillation_metadata(
+            session_id=session_id,
+            topics_list=[topic],
+            notes_list=[concept_file.stem],
+            summary=summary_1_line,
+            distillation_status="success",
+        )
 
         # 4. Archivage du fichier audio dans processed/
         target_processed = self.processed_dir / audio_path.name

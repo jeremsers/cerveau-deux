@@ -328,6 +328,22 @@ def run_web(port: Optional[int] = None, host: Optional[str] = None) -> None:
     uvicorn.run("src.api.server:app", host=effective_host, port=effective_port, log_level="info")
 
 
+def run_import_profile(reply_path: str) -> None:
+    """Importe le profil cognitif produit par Gemini Web (livrable du mode web_manual, v0.5.3)."""
+    from src.ingestors.takeout_ingestor import import_cognitive_profile
+
+    source = Path(reply_path)
+    if not source.is_file():
+        logger.error("Fichier introuvable : %s", source)
+        sys.exit(1)
+    try:
+        out = import_cognitive_profile(source.read_text(encoding="utf-8", errors="replace"))
+    except ValueError as exc:
+        logger.error("Import du profil refusé : %s", exc)
+        sys.exit(1)
+    logger.info("Profil cognitif importé : %s", out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exocortex & Télémétrie Cognitive — Orchestrateur Principal",
@@ -346,6 +362,7 @@ Exemples d'utilisation :
   python run_exocortex.py --kanban-status     # Affiche l'état du Kanban et actualise AGENT_QUEUE.md
   python run_exocortex.py --next-task         # Dépile la tâche prête la plus prioritaire
   python run_exocortex.py --complete-task EXO-005  # Marque la tâche EXO-005 comme terminée
+  python run_exocortex.py --import-profile reponse_gemini.md  # Importe le profil cognitif (mode web_manual)
         """,
     )
     group = parser.add_mutually_exclusive_group(required=True)
@@ -364,6 +381,12 @@ Exemples d'utilisation :
     group.add_argument("--complete-task", type=str, metavar="TASK_ID", help="Marque une tâche comme terminée.")
     group.add_argument("--ingest-voice", action="store_true", help="Ingère et distille les mémos vocaux de voice_inbox/.")
     group.add_argument("--defrag-graph", action="store_true", help="Exécute le Sommeil Profond pour défragmenter les fiches redondantes.")
+    group.add_argument(
+        "--import-profile",
+        type=str,
+        metavar="FICHIER",
+        help="Importe la réponse de Gemini Web (mode web_manual) dans 00_Meta/Profil_Cognitif.md.",
+    )
 
     parser.add_argument("--date", type=str, default=None, help="Date optionnelle pour la consolidation (YYYY-MM-DD).")
     parser.add_argument("--limit", type=int, default=None, help="Limite optionnelle de sessions à distiller lors du Takeout.")
@@ -406,6 +429,8 @@ Exemples d'utilisation :
         run_ingest_voice()
     elif args.defrag_graph:
         run_defrag_graph()
+    elif args.import_profile:
+        run_import_profile(args.import_profile)
 
 
 if __name__ == "__main__":

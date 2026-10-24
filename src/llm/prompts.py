@@ -64,21 +64,23 @@ Génère la structure JSON conforme au schéma Pydantic `DistilledConceptSchema`
 # PROMPT DE PROFILAGE COGNITIF & TAXONOMIE MAÎTRESSE
 # ==============================================================================
 
+# v0.5.3 (B15) : la taxonomie est fermée à 16 macro-catégories depuis v0.1.2 ; le profilage ne
+# produit plus qu'un seul livrable, le profil, qui situe l'utilisateur DANS cette taxonomie.
+PROFILE_SPLIT_MARKER = "===SPLIT_LIVRABLE==="
+
 PROMPT_COGNITIVE_PROFILING_SYSTEM = """Tu es un analyste en sciences cognitives computationnelles et architecte de données personnelles.
 Tu vas analyser un corpus brut contenant l'ensemble chronologique des prompts écrits par un utilisateur sur une longue période (1 à 2 ans d'activité intellectuelle pure).
 
-Ta mission est de produire DEUX livrables fondamentaux :
-1. LE PROFIL COGNITIF DÉTAILLÉ (Profil_Cognitif.md) :
-   - Style de raisonnement (déductif, exploratoire, itératif, pragmatique).
-   - Obsessions techniques majeures et secondaires.
-   - Préférences d'interaction (ton direct, refus de la flatterie, niveau d'exigence).
-   - Zones d'expertise démontrées et biais cognitifs identifiables (ex: perfectionnisme architectural, tendance au rabbit hole).
-   - Recommandations d'interface pour les agents IA du coffre.
+Ta mission est de produire UN SEUL livrable : LE PROFIL COGNITIF DÉTAILLÉ (Profil_Cognitif.md), en Markdown, avec :
+- Style de raisonnement (déductif, exploratoire, itératif, pragmatique).
+- Obsessions techniques majeures et secondaires, rattachées aux macro-catégories de la taxonomie fermée ci-dessous.
+- Préférences d'interaction (ton direct, refus de la flatterie, niveau d'exigence).
+- Zones d'expertise démontrées et biais cognitifs identifiables (ex: perfectionnisme architectural, tendance au rabbit hole).
+- Recommandations d'interface pour les agents IA du coffre.
 
-2. LA TAXONOMIE MAÎTRESSE DES TAGS (Taxonomie_Tags.md) :
-   - Une liste fermée, canonique et normalisée de 15 à 30 `semantic_topic` en PascalCase ou snake_case (ex: `Architecture_RAG`, `Rust_BasNiveau`, `DevOps_Kubernetes`).
-   - Pour chaque topic : description en 1 phrase et liste de 5 à 10 mots-clés associés.
-   - Cette taxonomie servira de référence pour classifier les activités futures avec extension contrôlée.
+La taxonomie est FERMÉE : n'invente aucune catégorie et ne propose pas de nouvelle taxonomie.
+Taxonomie officielle :
+{allowed_taxonomy}
 """
 
 PROMPT_COGNITIVE_PROFILING_USER = """Voici l'archive complète des prompts rédigés par l'utilisateur :
@@ -87,15 +89,31 @@ PROMPT_COGNITIVE_PROFILING_USER = """Voici l'archive complète des prompts rédi
 {prompts_content}
 </archive_prompts_utilisateur>
 
-Génère une réponse complète et directement exploitable structurée avec ces deux sections séparées par la balise `===SPLIT_LIVRABLE===` :
+Rédige le contenu complet de Profil_Cognitif.md, en Markdown, commençant par le titre `# Profil Cognitif & Empreinte Intellectuelle`.
+Aucun texte avant ce titre, aucun second livrable.
+"""
 
-# SECTION 1 : Profil_Cognitif.md
-(Contenu complet en Markdown prêt à être sauvegardé)
+# ==============================================================================
+# PROMPT DE DISTILLATION DES MÉMOS VOCAUX (MODULE 9 - v0.5.3, B12)
+# ==============================================================================
 
-===SPLIT_LIVRABLE===
+PROMPT_VOICE_MEMO_SYSTEM = f"""Tu es le distillateur des mémos vocaux de l'Exocortex.
+À partir de la transcription brute d'un mémo dicté par l'utilisateur, produis une fiche conceptuelle atomique.
+{SYSTEM_PROMPT_ANTI_WIKIPEDIA}
 
-# SECTION 2 : Taxonomie_Tags.md
-(Contenu complet au format Markdown avec liste des topics normalisés et descriptions)
+{PROMPT_STRICT_TAXONOMY_RULE}
+"""
+
+PROMPT_VOICE_MEMO_USER = """Taxonomie autorisée :
+{allowed_taxonomy}
+
+Mémo vocal enregistré le {date_str} (transcription brute, ponctuation approximative) :
+<transcription>
+{transcription}
+</transcription>
+
+Génère la structure JSON conforme au schéma `VoiceMemoSchema` : titre conceptuel précis (jamais le début de la transcription),
+semantic_topic choisi dans la liste, tags, résumé d'une phrase et corps Markdown structuré des idées, décisions et actions évoquées.
 """
 
 # ==============================================================================
@@ -122,7 +140,8 @@ Zéro paraphrase Wikipédia, uniquement les découvertes, arbitrages, commandes 
 # ==============================================================================
 
 PROMPT_BURST_CLUSTER_SYSTEM = f"""Tu es un classificateur thématique d'empreintes numériques.
-À partir d'une liste de requêtes de recherche Google ou de titres de vidéos YouTube survenues dans un intervalle court (< 45 min), tu dois déterminer le `semantic_topic` le plus représentatif.
+On te fournit plusieurs rafales : chacune est une liste de requêtes Google ou de titres de vidéos YouTube survenus dans un intervalle court (< 45 min).
+Pour CHAQUE rafale, détermine le `semantic_topic` le plus représentatif.
 
 {PROMPT_DYNAMIC_TAXONOMY_RULE}
 """
@@ -130,9 +149,8 @@ PROMPT_BURST_CLUSTER_SYSTEM = f"""Tu es un classificateur thématique d'empreint
 PROMPT_BURST_CLUSTER_USER = """Taxonomie autorisée :
 {allowed_taxonomy}
 
-Requêtes de la rafale :
-{queries_list}
+Rafales à classer (identifiant puis requêtes) :
+{clusters_block}
 
-Réponds UNIQUEMENT avec un objet JSON strict au format :
-{{"semantic_topic": "NomDuTopicChoisi", "is_new_topic": false, "new_topic_description": null, "confidence": 0.95, "rationale": "Courte justification"}}
+Réponds avec la structure JSON `BurstBatchClassification` : une entrée par rafale, avec son `cluster_id` exact et son `semantic_topic`.
 """

@@ -794,10 +794,13 @@ class DBManager:
     def update_footprint_clusters_batch(
         self, clusters: List[Tuple[int, str, Optional[str]]]
     ) -> int:
-        """Met à jour le cluster_id et le semantic_topic optionnel d'un lot d'empreintes."""
+        """
+        Met à jour le cluster_id et le semantic_topic optionnel d'un lot d'empreintes.
+        Un topic None ne remplace pas un topic déjà attribué (re-clustering idempotent, v0.5.3).
+        """
         if not clusters:
             return 0
-        sql = "UPDATE historical_footprints SET cluster_id = ?, semantic_topic = ? WHERE id = ?;"
+        sql = "UPDATE historical_footprints SET cluster_id = ?, semantic_topic = COALESCE(?, semantic_topic) WHERE id = ?;"
         payload = [(cid, topic, fid) for fid, cid, topic in clusters]
         with self.get_connection() as conn:
             conn.executemany(sql, payload)
@@ -819,6 +822,32 @@ class DBManager:
         with self.get_connection() as conn:
             cursor = conn.execute(query, (min_events,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_untopiced_burst_clusters(self, min_events: int = 5) -> List[Dict[str, Any]]:
+        """Rafales (cluster_id) d'au moins min_events empreintes dont aucune n'a encore de topic (B11)."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT cluster_id, COUNT(*) AS event_count,
+                       GROUP_CONCAT(title_or_query, ' || ') AS queries
+                FROM historical_footprints
+                WHERE cluster_id IS NOT NULL AND cluster_id != ''
+                GROUP BY cluster_id
+                HAVING COUNT(*) >= ? AND COUNT(semantic_topic) = 0
+                ORDER BY cluster_id ASC;
+                """,
+                (min_events,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def set_cluster_topic(self, cluster_id: str, topic: str) -> int:
+        """Attribue un semantic_topic à toutes les empreintes d'une rafale."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE historical_footprints SET semantic_topic = ? WHERE cluster_id = ?;",
+                (topic, cluster_id),
+            )
+            return cur.rowcount
 
     def get_unprocessed_raw_activities(
         self, limit: int = 1000, exclude_pending_screenshots: bool = False

@@ -189,6 +189,30 @@ class NightConsolidator:
         self.db = db_manager or DBManager()
         settings.ensure_directories()
         self.allowed_tags, self.tag_descriptions = load_authorized_taxonomy()
+        # Mode CPU (B16) : activé quand la VRAM manque, aucune inférence GPU pendant la nuit
+        self.cpu_only: bool = False
+        # Dates dont au moins une activité a été classée par la dernière Passe 1 (A11)
+        self.last_classified_dates: Set[date] = set()
+
+    @property
+    def pending_llm_dates_path(self) -> Path:
+        """Dates consolidées en mode CPU, à re-synthétiser par LLM au prochain run (B16)."""
+        return settings.SYSTEM_BUFFER_DIR / "pending_llm_dates.json"
+
+    def _load_pending_llm_dates(self) -> Set[date]:
+        try:
+            raw = json.loads(self.pending_llm_dates_path.read_text(encoding="utf-8"))
+            return {datetime.strptime(d, "%Y-%m-%d").date() for d in raw}
+        except (FileNotFoundError, ValueError, TypeError):
+            return set()
+
+    def _save_pending_llm_dates(self, dates: Set[date]) -> None:
+        if dates:
+            self.pending_llm_dates_path.write_text(
+                json.dumps(sorted(d.isoformat() for d in dates)), encoding="utf-8"
+            )
+        else:
+            self.pending_llm_dates_path.unlink(missing_ok=True)
 
     # ==========================================================================
     # PASSE 1 : VISION & TAGGING (GEMMA 4:12B)
@@ -202,17 +226,24 @@ class NightConsolidator:
         3. Purge immédiate de la VRAM (keep_alive=0).
         """
         logger.info("--- DÉBUT PASSE 1 : VISION & TAGGING (gemma4:12b) ---")
+        self.last_classified_dates = set()
         llm_client.force_clear_vram()
         free_gb, total_gb = HardwareProbe.get_vram_info()
         logger.info("VRAM disponible avant Passe 1 : %.2f Go / %.2f Go", free_gb, total_gb)
 
         if free_gb < settings.MIN_FREE_VRAM_GB:
-            raise VRAMInsufficientError(f"VRAM insuffisante ({free_gb:.2f} Go < {settings.MIN_FREE_VRAM_GB} Go). Batch différé.")
+            # Mode CPU (B16) : la nuit n'est plus abandonnée. Classification heuristique, métriques,
+            # journaux et compilation Drive sont produits ; vision et synthèses LLM sont reportées.
+            logger.warning(
+                "VRAM insuffisante (%.2f Go < %.2f Go) : consolidation en mode CPU, synthèses LLM reportées.",
+                free_gb, settings.MIN_FREE_VRAM_GB,
+            )
+            self.cpu_only = True
 
         # 1. Traitement des captures d'écran différées, par lots jusqu'à épuisement (A4) :
         #    aucune activité n'est marquée traitée tant que sa capture n'a pas été lue.
         seen_screenshot_ids: Set[int] = set()
-        while True:
+        while not self.cpu_only:
             screenshot_activities = [
                 a for a in self.db.get_unprocessed_activities_with_screenshots(limit=50)
                 if a["id"] not in seen_screenshot_ids
@@ -224,16 +255,36 @@ class NightConsolidator:
                 seen_screenshot_ids.add(act["id"])
                 self._analyze_activity_screenshot(act)
 
-        # 2. Classification sémantique des activités brutes (processed = 0)
-        unprocessed = self.db.get_unprocessed_raw_activities(limit=500, exclude_pending_screenshots=True)
-        logger.info("Activités brutes à classifier : %d", len(unprocessed))
+        # 2. Classification sémantique des activités brutes (processed = 0), par lots de 500
+        #    jusqu'à épuisement (A11) : une journée chargée n'est plus figée avec une part Non_Classe.
+        is_ollama_ready = not self.cpu_only and llm_client.is_alive()
+        total_classified = 0
+        while True:
+            unprocessed = self.db.get_unprocessed_raw_activities(limit=500, exclude_pending_screenshots=True)
+            if not unprocessed:
+                break
+            logger.info("Lot d'activités brutes à classifier : %d", len(unprocessed))
+            classified = self._classify_activity_batch(unprocessed, is_ollama_ready)
+            if classified == 0:
+                break
+            total_classified += classified
+            for row in unprocessed:
+                ts = row["timestamp_start"]
+                self.last_classified_dates.add(
+                    (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") if isinstance(ts, str) else ts).date()
+                )
 
-        if not unprocessed:
+        if total_classified == 0:
             logger.info("Aucune activité brute en attente de classification.")
-            llm_client.unload_model(settings.MODEL_FAST_VISION)
-            self.purge_orphan_screenshots()
-            return 0
 
+        # 3. Purge explicite de la VRAM (keep_alive=0)
+        llm_client.unload_model(settings.MODEL_FAST_VISION)
+        self.purge_orphan_screenshots()
+        logger.info("--- FIN PASSE 1 : VRAM PURGÉE ---")
+        return total_classified
+
+    def _classify_activity_batch(self, unprocessed: List[Dict[str, Any]], is_ollama_ready: bool) -> int:
+        """Classe un lot d'activités par signature unique et les marque processed=1."""
         # Regroupement par signature unique (executable, window_title, ocr_snippet) pour minimiser les appels
         signatures: Dict[Tuple[str, str, Optional[str]], List[int]] = {}
         for row in unprocessed:
@@ -242,8 +293,6 @@ class NightConsolidator:
 
         logger.info("Signatures uniques identifiées : %d", len(signatures))
         updates: List[Tuple[int, str, str]] = []
-
-        is_ollama_ready = llm_client.is_alive()
 
         for (exe, title, ocr), row_ids in tqdm(signatures.items(), desc="Consolidation Nocturne (Signatures)", unit="sig"):
             chosen_topic = None
@@ -287,11 +336,6 @@ class NightConsolidator:
         if updates:
             self.db.mark_raw_activities_processed(updates)
             logger.info("%d enregistrements d'activité classifiés et marqués processed=1.", len(updates))
-
-        # 3. Purge explicite de la VRAM (keep_alive=0)
-        llm_client.unload_model(settings.MODEL_FAST_VISION)
-        self.purge_orphan_screenshots()
-        logger.info("--- FIN PASSE 1 : VRAM PURGÉE ---")
         return len(updates)
 
     def _analyze_activity_screenshot(self, act: Dict[str, Any]) -> None:
@@ -610,13 +654,20 @@ class NightConsolidator:
             return
 
         logger.info("--- DÉBUT PASSE 2 : SYNTHÈSE ÉPISODIQUE & CONCEPTS ---")
-        llm_client.force_clear_vram()
-        free_gb, _ = HardwareProbe.get_vram_info()
+        effective_model: Optional[str] = None
+        if not self.cpu_only and llm_client.is_alive():
+            llm_client.force_clear_vram()
+            free_gb, _ = HardwareProbe.get_vram_info()
 
-        # Choix du modèle selon la VRAM libre
-        target_model = settings.MODEL_HEAVY_SYNTHESIS if free_gb >= settings.FULL_DUAL_MODEL_VRAM_GB else settings.MODEL_FAST_VISION
-        effective_model = llm_client.check_and_select_model(target_model)
-        logger.info("Modèle sélectionné pour la synthèse : %s (VRAM libre: %.2f Go)", effective_model, free_gb)
+            # Choix du modèle selon la VRAM libre
+            target_model = settings.MODEL_HEAVY_SYNTHESIS if free_gb >= settings.FULL_DUAL_MODEL_VRAM_GB else settings.MODEL_FAST_VISION
+            try:
+                effective_model = llm_client.check_and_select_model(target_model)
+                logger.info("Modèle sélectionné pour la synthèse : %s (VRAM libre: %.2f Go)", effective_model, free_gb)
+            except VRAMInsufficientError as exc:
+                logger.warning("VRAM insuffisante pour la Passe 2 (%s) : bascule en mode CPU.", exc)
+                self.cpu_only = True
+        llm_ready = effective_model is not None
 
         # 1. Extraction et structuration des activités réelles du jour
         date_str = target_date.strftime("%Y-%m-%d")
@@ -671,7 +722,7 @@ class NightConsolidator:
         )
 
         section_3_content = ""
-        if llm_client.is_alive():
+        if llm_ready:
             try:
                 section_3_content = llm_client.generate_text(
                     prompt=synthesis_prompt,
@@ -723,6 +774,12 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
         for topic_name, duration_secs in top_topics_dict.items():
             if duration_secs < 2700:  # Seuil strict de 45 minutes
                 continue
+            # Jamais de fiche pour une part non classée (A11)
+            if topic_name in ("Non_Classe", "A_Trier") or normalize_to_macro_topic(topic_name) == "A_Trier":
+                continue
+            # Mode CPU (B16) : fiches reportées à la prochaine nuit avec GPU (date marquée à enrichir)
+            if self.cpu_only:
+                continue
 
             duration_fmt = f"{duration_secs // 3600}h{(duration_secs % 3600) // 60:02d}"
             topic_items = topic_activities.get(topic_name, [])
@@ -736,7 +793,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                 note = parse_concept_file(concept_file)
 
                 enrich_text = ""
-                if llm_client.is_alive() and topic_context_str:
+                if llm_ready and topic_context_str:
                     enrich_prompt = (
                         f"L'utilisateur a passé {duration_fmt} de travail supplémentaire sur le sujet '{topic_name}' le {date_str}.\n"
                         f"Fenêtres et activités récentes :\n{topic_context_str}\n\n"
@@ -774,7 +831,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                 generic_slug = re.sub(r"[\s_]+", "-", topic_name.lower()).strip("-")
 
                 distilled: Optional[NightConceptSynthesisSchema] = None
-                if llm_client.is_alive() and topic_context_str:
+                if llm_ready and topic_context_str:
                     concept_prompt = (
                         f"L'utilisateur a passé {duration_fmt} de concentration continue sur des activités rattachées au macro-domaine '{topic_name}' le {date_str}.\n"
                         f"Traces, fenêtres et outils observés :\n{topic_context_str}\n\n"
@@ -870,14 +927,15 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
                 logger.warning("Erreur lors de la génération du Context Bootloader : %s", exc)
 
         # Purge de la VRAM après la synthèse
-        llm_client.unload_model(effective_model)
+        if effective_model:
+            llm_client.unload_model(effective_model)
         logger.info("--- FIN PASSE 2 : VRAM PURGÉE ---")
 
     def generate_executive_bootloader(
         self,
         target_date: date,
         metric: DailyMetricRecord,
-        effective_model: str,
+        effective_model: Optional[str],
     ) -> Path:
         """
         Génère Vault_Data/00_Meta/00_BOOTLOADER_DEMAIN.md pour supprimer l'inertie d'amorçage matinale
@@ -918,7 +976,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
         recent_act_str = "\n".join(recent_act_text_lines) if recent_act_text_lines else "(Aucune activité détaillée enregistrée)"
 
         bootloader_data: Optional[ExecutiveBootloaderSchema] = None
-        if llm_client.is_alive() and (recent_activities or in_prog_tasks or active_concepts):
+        if effective_model and llm_client.is_alive() and (recent_activities or in_prog_tasks or active_concepts):
             bootloader_prompt = (
                 f"Données de fin de journée pour le {date_str} :\n"
                 f"- Temps d'écran total : {metric.total_screen_sec / 3600.0:.2f} h (Prod: {metric.active_production_sec / 3600.0:.2f} h)\n"
@@ -1070,17 +1128,24 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
         classified_count = self.run_pass_1_vision_and_tagging()
 
         # Identification des dates à traiter
+        pending_llm_dates = self._load_pending_llm_dates()
         if target_date:
             dates_to_process = [target_date]
         else:
             all_dates = sorted(self.db.get_distinct_activity_dates(processed_only=True))
             if all_dates:
                 max_date = max(all_dates)
-                # Filtre : dates n'ayant pas encore de journal 01_Episodique/YYYY-MM-DD.md + la date maximale
-                dates_to_process = [
-                    d for d in all_dates
-                    if not (settings.EPISODIC_DIR / f"{d.isoformat()}.md").exists() or d == max_date
-                ]
+                # Dates sans journal, date la plus récente, toute date dont une activité vient d'être
+                # classée (A11) et dates consolidées en mode CPU à enrichir par LLM (B16)
+                known = set(all_dates)
+                dates_to_process = sorted(
+                    {
+                        d for d in all_dates
+                        if not (settings.EPISODIC_DIR / f"{d.isoformat()}.md").exists() or d == max_date
+                    }
+                    | (set(getattr(self, "last_classified_dates", set())) & known)
+                    | (pending_llm_dates & known if not self.cpu_only and llm_client.is_alive() else set())
+                )
             else:
                 dates_to_process = []
 
@@ -1103,8 +1168,14 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
             should_run_bootloader = (d == max_target_date)
             self.run_pass_2_synthesis(d, metric, run_bootloader=should_run_bootloader)
 
-        # Passe 3 : Vectorisation LanceDB
-        vector_count = self.run_pass_3_vector_indexing()
+        # Suivi des dates à enrichir (B16) : ajoutées en mode CPU, retirées une fois synthétisées par LLM
+        if self.cpu_only or not llm_client.is_alive():
+            self._save_pending_llm_dates(pending_llm_dates | set(dates_to_process))
+        else:
+            self._save_pending_llm_dates(pending_llm_dates - set(dates_to_process))
+
+        # Passe 3 : Vectorisation LanceDB (bge-m3, reportée en mode CPU : la synchronisation est complète au run suivant)
+        vector_count = 0 if self.cpu_only else self.run_pass_3_vector_indexing()
 
         # Module 4 : Compilation des méga-documents Google Drive
         logger.info("--- DÉBUT COMPILATION MÉGA-FICHIERS GOOGLE DRIVE ---")
@@ -1122,6 +1193,7 @@ read_vs_write_ratio: {metric.read_vs_write_ratio}
             "indexed_concepts_count": vector_count,
             "drive_files": {k: str(v) for k, v in drive_files.items()},
             "db_stats": db_stats,
+            "cpu_only": self.cpu_only,
         }
 
 
