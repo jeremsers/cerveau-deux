@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="fr" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exocortex // Cognitive Command Center</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            cyber: {
+              950: '#070a12',
+              900: '#0d1322',
+              850: '#111827',
+              800: '#131b2e',
+              700: '#1f293d',
+              cyan: '#38bdf8',
+              blue: '#3b82f6',
+              purple: '#8b5cf6',
+              emerald: '#10b981',
+              amber: '#f59e0b',
+              rose: '#f43f5e',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Plotly.js CDN -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  
+  <!-- Marked.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="bg-cyber-950 text-slate-100 min-h-screen flex flex-col font-sans antialiased selection:bg-cyber-cyan selection:text-slate-900">
+
+  <!-- ========================================================================= -->
+  <!-- BANDEAU GLOBAL TEMPS RÉEL (TOPBAR)                                        -->
+  <!-- ========================================================================= -->
+  <header class="sticky top-0 z-40 bg-cyber-900/90 backdrop-blur-md border-b border-cyber-700/80 px-4 py-2.5 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-cyber-blue to-cyber-cyan flex items-center justify-center font-black text-slate-950 text-lg shadow-md shadow-cyber-cyan/20">
+        E
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="font-bold tracking-wider text-sm text-slate-100">EXOCORTEX</span>
+          <span class="text-xs px-2 py-0.5 rounded bg-cyber-cyan/10 text-cyber-cyan font-mono border border-cyber-cyan/30">v0.5.0 SOTA</span>
+        </div>
+        <p class="text-[11px] text-slate-400 font-mono tracking-tight">Command Center Cognitif & Télémétrie</p>
+      </div>
+    </div>
+
+    <!-- Live Telemetry Pills -->
+    <div class="flex flex-wrap items-center gap-2 text-xs font-mono">
+      <!-- VRAM Live -->
+      <div id="topbar-vram" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cyber-800 border border-cyber-700 text-slate-300">
+        <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+        <span class="text-slate-400">VRAM:</span>
+        <span id="vram-val" class="font-semibold text-cyber-cyan">-- / -- Go</span>
+      </div>
+
+      <!-- Ollama Status -->
+      <div id="topbar-ollama" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cyber-800 border border-cyber-700 text-slate-300">
+        <span id="ollama-dot" class="w-2 h-2 rounded-full bg-amber-400"></span>
+        <span class="text-slate-400">Ollama:</span>
+        <span id="ollama-val" class="font-semibold text-slate-200">Checking...</span>
+      </div>
+
+      <!-- DriftGuard Status -->
+      <div id="topbar-drift" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cyber-800 border border-cyber-700 text-slate-300">
+        <span id="drift-dot" class="w-2 h-2 rounded-full bg-emerald-400"></span>
+        <span class="text-slate-400">DriftGuard:</span>
+        <span id="drift-val" class="font-semibold text-emerald-400">STABLE</span>
+      </div>
+    </div>
+
+    <!-- Quick Action Triggers -->
+    <div class="flex items-center gap-2">
+      <button id="btn-open-bootloader" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-cyber-blue/20 to-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan text-xs font-medium hover:bg-cyber-cyan/20 transition shadow-sm">
+        <span>🚀</span>
+        <span>Context Bootloader</span>
+      </button>
+
+      <button id="btn-trigger-consolidate" title="Déclencher la consolidation nocturne" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyber-800 border border-cyber-700 text-slate-300 text-xs font-medium hover:bg-cyber-700 hover:text-white transition">
+        <span>🌙</span>
+        <span class="hidden sm:inline">Consolider</span>
+      </button>
+
+      <button id="btn-trigger-drive" title="Compiler les 4 méga-documents Google Drive" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyber-800 border border-cyber-700 text-slate-300 text-xs font-medium hover:bg-cyber-700 hover:text-white transition">
+        <span>📁</span>
+        <span class="hidden sm:inline">Drive</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ========================================================================= -->
+  <!-- NAVIGATION PRINCIPALE (TABS)                                              -->
+  <!-- ========================================================================= -->
+  <nav class="bg-cyber-900 border-b border-cyber-700/60 px-4 py-2 overflow-x-auto">
+    <div class="flex items-center gap-1 min-w-max">
+      <button data-view="timeline" class="nav-tab active px-3.5 py-1.5 rounded-md text-xs font-medium transition flex items-center gap-2 text-slate-200 bg-cyber-blue/30 border border-cyber-blue/50 text-cyber-cyan">
+        <span>⏱️</span>
+        <span>1. Chronologie & Tunnels</span>
+      </button>
+      <button data-view="carto" class="nav-tab px-3.5 py-1.5 rounded-md text-xs font-medium transition flex items-center gap-2 text-slate-400 hover:text-slate-200 hover:bg-cyber-800">
+        <span>🗺️</span>
+        <span>2. Cartographie & GraphRAG</span>
+      </button>
+      <button data-view="archaeology" class="nav-tab px-3.5 py-1.5 rounded-md text-xs font-medium transition flex items-center gap-2 text-slate-400 hover:text-slate-200 hover:bg-cyber-800">
+        <span>🏛️</span>
+        <span>3. Archéologie Longitudinale</span>
+      </button>
+      <button data-view="circadian" class="nav-tab px-3.5 py-1.5 rounded-md text-xs font-medium transition flex items-center gap-2 text-slate-400 hover:text-slate-200 hover:bg-cyber-800">
+        <span>🌙</span>
+        <span>4. Rythmes Circadiens</span>
+      </button>
+      <button data-view="epistemic" class="nav-tab px-3.5 py-1.5 rounded-md text-xs font-medium transition flex items-center gap-2 text-slate-400 hover:text-slate-200 hover:bg-cyber-800">
+        <span>💬</span>
+        <span>5. Explorateur Épistémique</span>
+      </button>
+      <button data-view="kanban" class="nav-tab px-3.5 py-1.5 rounded-md text-xs font-medium transition flex items-center gap-2 text-slate-400 hover:text-slate-200 hover:bg-cyber-800">
+        <span>📋</span>
+        <span>6. Studio Kanban SOTA</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ========================================================================= -->
+  <!-- ZONE PRINCIPALE DE CONTENU DES VUES                                       -->
+  <!-- ========================================================================= -->
+  <main class="flex-1 p-4 lg:p-6 max-w-[1720px] w-full mx-auto space-y-6">
+
+    <!-- --------------------------------------------------------------------- -->
+    <!-- VUE 1 : CHRONOLOGIE & TUNNELS D'HYPERFOCUS                            -->
+    <!-- --------------------------------------------------------------------- -->
+    <section id="view-timeline" class="view-panel space-y-6">
+      <!-- Sélecteur de Date & Contrôles -->
+      <div class="cyber-card p-4 flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+            <span>⏱️</span>
+            <span>Chronologie Quotidienne & Tunnels d'Hyperfocus</span>
+          </h2>
+          <p class="text-xs text-slate-400">Visualisation continue des fenêtres actives, contextes Git et navigations web.</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <label for="timeline-date-select" class="text-xs text-slate-400 font-mono">Date :</label>
+          <select id="timeline-date-select" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-1.5 focus:border-cyber-cyan outline-none">
+            <option value="">Chargement des dates...</option>
+          </select>
+          <button id="btn-refresh-timeline" class="btn-cyber-ghost px-2.5 py-1.5 rounded-lg text-xs" title="Rafraîchir">
+            🔄
+          </button>
+        </div>
+      </div>
+
+      <!-- KPI Bandeau Journalier -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div class="cyber-card p-4">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Temps Enregistré</div>
+          <div id="kpi-total-time" class="text-2xl font-black text-cyber-cyan mt-1">--</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Activité active</div>
+        </div>
+        <div class="cyber-card p-4">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Tunnels ≥ 30 min</div>
+          <div id="kpi-tunnels-count" class="text-2xl font-black text-emerald-400 mt-1">--</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Sessions d'immersion</div>
+        </div>
+        <div class="cyber-card p-4">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Échanges Gemini</div>
+          <div id="kpi-gemini-turns" class="text-2xl font-black text-purple-400 mt-1">--</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Tours de dialogue</div>
+        </div>
+        <div class="cyber-card p-4">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Score d'Alignement</div>
+          <div id="kpi-focus-ratio" class="text-2xl font-black text-amber-400 mt-1">--</div>
+          <div class="text-[11px] text-slate-500 mt-0.5">Deep Work / Total</div>
+        </div>
+      </div>
+
+      <!-- Diagramme de Gantt Plotly -->
+      <div class="cyber-card p-4 space-y-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-semibold text-slate-200">Gantt Chronologique de la Journée</h3>
+          <span class="text-xs text-slate-400 font-mono">Survoler pour détails de fenêtres</span>
+        </div>
+        <div id="gantt-chart-container" class="w-full h-80 rounded-lg overflow-hidden"></div>
+      </div>
+
+      <!-- Tunnels d'Hyperfocus & Table d'Activité -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- Tunnels d'Hyperfocus -->
+        <div class="cyber-card p-4 space-y-3">
+          <h3 class="text-sm font-semibold text-slate-200 flex items-center justify-between">
+            <span>🔥 Tunnels d'Hyperfocus</span>
+            <span id="tunnels-badge" class="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono">0</span>
+          </h3>
+          <div id="tunnels-list" class="space-y-2 max-h-96 overflow-y-auto pr-1">
+            <p class="text-xs text-slate-500 italic">Aucun tunnel identifié pour cette journée.</p>
+          </div>
+        </div>
+
+        <!-- Table des Activités Brutes avec Filtre -->
+        <div class="cyber-card p-4 space-y-3 lg:col-span-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-semibold text-slate-200">Journal d'Activité Détaillé (Git & Navigateur)</h3>
+            <input type="text" id="timeline-search-filter" placeholder="Filtrer (exécutable, titre, repo, url)..." class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded px-3 py-1 focus:border-cyber-cyan outline-none w-64">
+          </div>
+          <div class="overflow-x-auto max-h-96 overflow-y-auto">
+            <table class="w-full text-left text-xs text-slate-300">
+              <thead class="bg-cyber-900 text-slate-400 uppercase tracking-wider sticky top-0">
+                <tr>
+                  <th class="py-2 px-3">Heure</th>
+                  <th class="py-2 px-3">Durée</th>
+                  <th class="py-2 px-3">Application</th>
+                  <th class="py-2 px-3">Contexte / Fenêtre / Dépôt</th>
+                  <th class="py-2 px-3">Mode</th>
+                </tr>
+              </thead>
+              <tbody id="timeline-table-body" class="divide-y divide-cyber-700/60 font-mono text-[11px]">
+                <tr><td colspan="5" class="py-4 text-center text-slate-500 italic">Chargement...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------------------- -->
+    <!-- VUE 2 : CARTOGRAPHIE & GRAPHRAG VISUEL                                 -->
+    <!-- --------------------------------------------------------------------- -->
+    <section id="view-carto" class="view-panel hidden space-y-6">
+      <div class="cyber-card p-4">
+        <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+          <span>🗺️</span>
+          <span>Cartographie Cognitive & Explorateur GraphRAG</span>
+        </h2>
+        <p class="text-xs text-slate-400">Distribution macro des thématiques, modes cognitifs et moteur sémantique multi-sauts.</p>
+      </div>
+
+      <!-- Treemap & Donut des Modes -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="cyber-card p-4 lg:col-span-2 space-y-2">
+          <h3 class="text-sm font-semibold text-slate-200">Treemap Hiérarchique (Mode ➔ Topic ➔ Exécutable)</h3>
+          <div id="treemap-chart-container" class="w-full h-96 rounded-lg overflow-hidden"></div>
+        </div>
+
+        <div class="cyber-card p-4 space-y-2">
+          <h3 class="text-sm font-semibold text-slate-200">Répartition par Mode Cognitif</h3>
+          <div id="donut-chart-container" class="w-full h-96 rounded-lg overflow-hidden"></div>
+        </div>
+      </div>
+
+      <!-- Moteur GraphRAG Hybride Visuel -->
+      <div class="cyber-card p-5 space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-4 border-b border-cyber-700/80 pb-3">
+          <div>
+            <h3 class="text-base font-bold text-slate-100 flex items-center gap-2">
+              <span class="text-cyber-cyan">⚡</span>
+              <span>Barre de Recherche GraphRAG Hybride Multi-Sauts</span>
+            </h3>
+            <p class="text-xs text-slate-400">Combine k-NN LanceDB (Hop 0), traversée de wikilinks Obsidian (Hop 1) et traces épisodiques.</p>
+          </div>
+          <div class="flex items-center gap-2 text-xs font-mono text-slate-400">
+            <span class="w-2 h-2 rounded-full bg-cyber-cyan"></span>
+            <span>0 Mo VRAM résiduel (auto-unload bge-m3)</span>
+          </div>
+        </div>
+
+        <!-- Formulaire de recherche GraphRAG -->
+        <div class="flex flex-wrap items-center gap-3">
+          <div class="flex-1 min-w-[280px]">
+            <input type="text" id="graphrag-input-query" placeholder="Poser une question ou rechercher un concept (ex: SQLite WAL, GraphRAG, FastHTML)..." class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 text-xs rounded-lg px-3.5 py-2.5 focus:border-cyber-cyan outline-none">
+          </div>
+          <select id="graphrag-topic-filter" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2.5 focus:border-cyber-cyan outline-none">
+            <option value="">Tous les Topics</option>
+          </select>
+          <button id="btn-run-graphrag" class="btn-cyber-primary px-4 py-2.5 rounded-lg text-xs flex items-center gap-2">
+            <span>🔍</span>
+            <span>Explorer le Graphe</span>
+          </button>
+        </div>
+
+        <!-- Résultat GraphRAG : Colonnes Hop 0 vs Hop 1 -->
+        <div id="graphrag-results-container" class="hidden space-y-4 pt-2">
+          <!-- Graphe / Réseau Visuel Simplifié -->
+          <div class="p-3 bg-cyber-900/60 border border-cyber-700/60 rounded-lg">
+            <div class="flex items-center justify-between text-xs mb-2">
+              <span class="font-semibold text-slate-300">Topologie des Nœuds & Liens Identifiés</span>
+              <span id="graphrag-stats" class="text-slate-400 font-mono">-- nœuds Hop 0 | -- voisins Hop 1</span>
+            </div>
+            <div id="graphrag-network-viz" class="flex flex-wrap items-center gap-2 p-2"></div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- Hop 0 : Nœuds Primaires -->
+            <div class="space-y-2">
+              <h4 class="text-xs font-bold uppercase tracking-wider text-cyber-cyan flex items-center gap-1.5">
+                <span>🎯</span>
+                <span>Hop 0 : Ancrage Vectoriel Direct (LanceDB)</span>
+              </h4>
+              <div id="graphrag-hop0-cards" class="space-y-2"></div>
+            </div>
+
+            <!-- Hop 1 : Voisins Wikilinks -->
+            <div class="space-y-2">
+              <h4 class="text-xs font-bold uppercase tracking-wider text-purple-400 flex items-center gap-1.5">
+                <span>🔗</span>
+                <span>Hop 1 : Traversée des [[Wikilinks]] Obsidian</span>
+              </h4>
+              <div id="graphrag-hop1-cards" class="space-y-2"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------------------- -->
+    <!-- VUE 3 : ARCHÉOLOGIE LONGITUDINALE                                      -->
+    <!-- --------------------------------------------------------------------- -->
+    <section id="view-archaeology" class="view-panel hidden space-y-6">
+      <div class="cyber-card p-4">
+        <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+          <span>🏛️</span>
+          <span>Archéologie Longitudinale & Demi-Vie des Obsessions (2024 - 2026)</span>
+        </h2>
+        <p class="text-xs text-slate-400">Traçabilité des intérêts sur les sessions de réflexion, distinction entre Piliers Fondamentaux et Passions Éphémères.</p>
+      </div>
+
+      <!-- Graphique en Aire Empilée Temporelle Plotly -->
+      <div class="cyber-card p-4 space-y-2">
+        <h3 class="text-sm font-semibold text-slate-200">Évolution Mensuelle du Volume de Réflexion par Sujet Sémantique</h3>
+        <div id="archaeology-area-chart" class="w-full h-96 rounded-lg overflow-hidden"></div>
+      </div>
+
+      <!-- Matrice de Pérennité Cognitive -->
+      <div class="cyber-card p-4 space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold text-slate-200">Matrice de Pérennité Cognitive : Piliers vs Passions Éphémères</h3>
+          <input type="text" id="archaeology-search-filter" placeholder="Filtrer les sujets..." class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded px-3 py-1 focus:border-cyber-cyan outline-none">
+        </div>
+        <div class="overflow-x-auto max-h-[500px] overflow-y-auto">
+          <table class="w-full text-left text-xs text-slate-300">
+            <thead class="bg-cyber-900 text-slate-400 uppercase tracking-wider sticky top-0">
+              <tr>
+                <th class="py-2.5 px-3">Sujet Sémantique</th>
+                <th class="py-2.5 px-3">Archétype Cognitif</th>
+                <th class="py-2.5 px-3 text-right">Sessions</th>
+                <th class="py-2.5 px-3">Premier Focus</th>
+                <th class="py-2.5 px-3">Dernier Focus</th>
+                <th class="py-2.5 px-3 text-right">Étendue (Jours)</th>
+                <th class="py-2.5 px-3 text-right">Volume (Cars)</th>
+              </tr>
+            </thead>
+            <tbody id="archaeology-table-body" class="divide-y divide-cyber-700/60 font-mono text-[11px]">
+              <tr><td colspan="7" class="py-4 text-center text-slate-500 italic">Chargement des données archéologiques...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------------------- -->
+    <!-- VUE 4 : RYTHMES CIRCADIENS & CHRONOBIOLOGIE                           -->
+    <!-- --------------------------------------------------------------------- -->
+    <section id="view-circadian" class="view-panel hidden space-y-6">
+      <div class="cyber-card p-4">
+        <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+          <span>🌙</span>
+          <span>Analyse Chronobiologique & Rythmes Circadiens (24h x 7j)</span>
+        </h2>
+        <p class="text-xs text-slate-400">Cartographie thermique des plages d'hyperfocus et signatures de productivité nocturne.</p>
+      </div>
+
+      <!-- Heatmap 24h x 7j -->
+      <div class="cyber-card p-4 space-y-2">
+        <h3 class="text-sm font-semibold text-slate-200">Carte Thermique d'Activité Cognitive (Heure x Jour)</h3>
+        <div id="circadian-heatmap" class="w-full h-80 rounded-lg overflow-hidden"></div>
+      </div>
+
+      <!-- Quadrants Horaires & Diagnostic -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="cyber-card p-4 lg:col-span-2 space-y-2">
+          <h3 class="text-sm font-semibold text-slate-200">Signature de Productivité par Quart de Journée</h3>
+          <div id="circadian-quadrants-chart" class="w-full h-72 rounded-lg overflow-hidden"></div>
+        </div>
+
+        <div class="cyber-card p-4 space-y-3">
+          <h3 class="text-sm font-semibold text-slate-200">Diagnostic Chronobiologique</h3>
+          <div class="p-3 bg-cyber-900 border border-cyber-700 rounded-lg space-y-2 text-xs">
+            <div class="text-cyber-cyan font-semibold">Profil : Hyperfocus Crépusculaire & Nocturne</div>
+            <p class="text-slate-400 leading-relaxed">
+              La concentration s'intensifie significativement à partir de 18h, avec des pics d'immersion technique réguliers entre 21h et 02h.
+            </p>
+          </div>
+          <div class="p-3 bg-cyber-900 border border-cyber-700 rounded-lg space-y-1 text-xs">
+            <span class="text-slate-400 font-mono">Volume d'événements analysés :</span>
+            <div id="circadian-total-events" class="text-lg font-black text-slate-100">--</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------------------- -->
+    <!-- VUE 5 : EXPLORATEUR ÉPISTÉMIQUE (CHATS & EMPREINTES)                   -->
+    <!-- --------------------------------------------------------------------- -->
+    <section id="view-epistemic" class="view-panel hidden space-y-6">
+      <div class="cyber-card p-4 flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+            <span>💬</span>
+            <span>Explorateur Épistémique & Archéologie Numérique</span>
+          </h2>
+          <p class="text-xs text-slate-400">Recherche full-text dans les sessions Gemini, navigation dans les 73k empreintes et Burst Clusters.</p>
+        </div>
+        <!-- Sub-tabs Switcher -->
+        <div class="flex items-center gap-1 bg-cyber-900 p-1 rounded-lg border border-cyber-700">
+          <button id="epistemic-tab-chats" class="px-3 py-1 text-xs rounded font-medium bg-cyber-blue/30 text-cyber-cyan border border-cyber-blue/50">
+            Sessions Gemini
+          </button>
+          <button id="epistemic-tab-footprints" class="px-3 py-1 text-xs rounded font-medium text-slate-400 hover:text-slate-200">
+            Empreintes & Bursts
+          </button>
+        </div>
+      </div>
+
+      <!-- VOLET 1 : SESSIONS GEMINI -->
+      <div id="epistemic-panel-chats" class="space-y-4">
+        <div class="cyber-card p-4 flex flex-wrap items-center gap-3">
+          <div class="flex-1 min-w-[260px]">
+            <input type="text" id="chats-search-input" placeholder="Rechercher dans les sessions et messages (debounce 250ms)..." class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none">
+          </div>
+          <select id="chats-topic-filter" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none">
+            <option value="">Tous les Topics</option>
+          </select>
+          <select id="chats-status-filter" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none">
+            <option value="">Tous les Statuts</option>
+            <option value="success">Success</option>
+            <option value="skipped">Skipped</option>
+            <option value="pending">Pending</option>
+          </select>
+        </div>
+
+        <div id="chats-list-container" class="space-y-3">
+          <p class="text-xs text-slate-500 italic">Chargement des sessions...</p>
+        </div>
+      </div>
+
+      <!-- VOLET 2 : EMPREINTES & BURST CLUSTERS -->
+      <div id="epistemic-panel-footprints" class="hidden space-y-6">
+        <!-- 5 KPI Cards -->
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div class="cyber-card p-3">
+            <div class="text-[10px] uppercase font-semibold text-slate-400">Total Empreintes</div>
+            <div id="fp-kpi-total" class="text-xl font-black text-slate-100 mt-1">--</div>
+          </div>
+          <div class="cyber-card p-3">
+            <div class="text-[10px] uppercase font-semibold text-slate-400">Vidéos YouTube</div>
+            <div id="fp-kpi-youtube" class="text-xl font-black text-rose-400 mt-1">--</div>
+          </div>
+          <div class="cyber-card p-3">
+            <div class="text-[10px] uppercase font-semibold text-slate-400">Recherches Google</div>
+            <div id="fp-kpi-search" class="text-xl font-black text-cyber-cyan mt-1">--</div>
+          </div>
+          <div class="cyber-card p-3">
+            <div class="text-[10px] uppercase font-semibold text-slate-400">Burst Clusters</div>
+            <div id="fp-kpi-clustered" class="text-xl font-black text-amber-400 mt-1">--</div>
+          </div>
+          <div class="cyber-card p-3">
+            <div class="text-[10px] uppercase font-semibold text-slate-400">Liées à Gemini</div>
+            <div id="fp-kpi-linked" class="text-xl font-black text-purple-400 mt-1">--</div>
+          </div>
+        </div>
+
+        <!-- Top Chaînes & Burst Clusters -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div class="cyber-card p-4 space-y-3">
+            <h3 class="text-sm font-semibold text-slate-200">Top 15 Chaînes YouTube & Domaines Web</h3>
+            <div id="top-channels-list" class="max-h-80 overflow-y-auto space-y-1.5 text-xs"></div>
+          </div>
+
+          <div class="cyber-card p-4 space-y-3">
+            <h3 class="text-sm font-semibold text-slate-200">Tunnels de Recherche en Rafale (Burst Clusters)</h3>
+            <div id="burst-clusters-list" class="max-h-80 overflow-y-auto space-y-2 text-xs"></div>
+          </div>
+        </div>
+
+        <!-- Recherche Dynamique dans les Empreintes -->
+        <div class="cyber-card p-4 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <h3 class="text-sm font-semibold text-slate-200">Explorateur Dynamique d'Empreintes</h3>
+            <div class="flex flex-wrap items-center gap-2">
+              <input type="text" id="fp-search-query" placeholder="Rechercher titre, requête, chaîne..." class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded px-3 py-1.5 focus:border-cyber-cyan outline-none w-56">
+              <select id="fp-source-filter" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded px-2.5 py-1.5 focus:border-cyber-cyan outline-none">
+                <option value="Toutes">Toutes sources</option>
+                <option value="youtube">YouTube</option>
+                <option value="google_search">Google Search</option>
+              </select>
+            </div>
+          </div>
+          <div class="overflow-x-auto max-h-96 overflow-y-auto">
+            <table class="w-full text-left text-xs text-slate-300">
+              <thead class="bg-cyber-900 text-slate-400 uppercase tracking-wider sticky top-0">
+                <tr>
+                  <th class="py-2 px-3">Date</th>
+                  <th class="py-2 px-3">Source</th>
+                  <th class="py-2 px-3">Chaîne / Domaine</th>
+                  <th class="py-2 px-3">Titre / Requête</th>
+                  <th class="py-2 px-3">Topic</th>
+                </tr>
+              </thead>
+              <tbody id="fp-table-body" class="divide-y divide-cyber-700/60 font-mono text-[11px]">
+                <tr><td colspan="5" class="py-4 text-center text-slate-500 italic">Prêt pour la recherche.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------------------- -->
+    <!-- VUE 6 : STUDIO KANBAN SOTA                                            -->
+    <!-- --------------------------------------------------------------------- -->
+    <section id="view-kanban" class="view-panel hidden space-y-6">
+      <!-- Barre Supérieure Projet & Filtres -->
+      <div class="cyber-card p-4 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex flex-wrap items-center gap-3">
+          <div>
+            <label for="kanban-project-select" class="block text-[11px] uppercase font-semibold text-slate-400 mb-1">Projet Actif (1 Projet = 1 Vue) :</label>
+            <select id="kanban-project-select" class="bg-cyber-900 border border-cyber-700 text-slate-100 text-xs font-semibold rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none min-w-[220px]">
+              <option value="exocortex">Exocortex & Télémétrie</option>
+            </select>
+          </div>
+          <button id="btn-new-project-modal" class="btn-cyber-ghost px-3 py-2 rounded-lg text-xs font-medium self-end">
+            ➕ Nouveau Projet
+          </button>
+        </div>
+
+        <!-- Filtres Secondaires -->
+        <div class="flex flex-wrap items-center gap-2 self-end">
+          <select id="kanban-filter-tag" class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none">
+            <option value="Tous">Tous les modules</option>
+          </select>
+          <input type="text" id="kanban-search-input" placeholder="Rechercher ticket..." class="bg-cyber-900 border border-cyber-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:border-cyber-cyan outline-none w-48">
+          <button id="btn-new-task-modal" class="btn-cyber-primary px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5">
+            <span>➕</span>
+            <span>Nouvelle Tâche</span>
+          </button>
+          <button id="btn-open-ingest-modal" class="btn-cyber-action px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5">
+            <span>📥</span>
+            <span>Ingérer Spec</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Description Projet Actif -->
+      <div id="kanban-project-desc" class="p-3 bg-cyber-900/60 border border-cyber-700/60 rounded-lg text-xs text-slate-400 flex items-center justify-between">
+        <span>Sélectionnez ou créez un projet pour charger son flux Kanban.</span>
+        <button id="btn-toggle-icebox" class="text-cyber-cyan hover:underline text-xs">🧊 Voir le Frigo (Icebox)</button>
+      </div>
+
+      <!-- Board 4 Colonnes SOTA -->
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- Colonne 1 : Radar -->
+        <div class="kanban-col" data-col-status="radar">
+          <div class="flex items-center justify-between px-2 py-1 border-b border-cyber-700">
+            <span class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+              <span>📡</span>
+              <span>1. Radar & Idées</span>
+            </span>
+            <span class="col-count text-[11px] font-mono px-2 py-0.5 rounded bg-cyber-700 text-slate-300">0</span>
+          </div>
+          <div class="col-cards-list space-y-2 flex-1 overflow-y-auto"></div>
+        </div>
+
+        <!-- Colonne 2 : Spec Requise -->
+        <div class="kanban-col" data-col-status="needs_spec">
+          <div class="flex items-center justify-between px-2 py-1 border-b border-cyber-700">
+            <span class="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+              <span>📐</span>
+              <span>2. Spécification Requise</span>
+            </span>
+            <span class="col-count text-[11px] font-mono px-2 py-0.5 rounded bg-amber-500/20 text-amber-300">0</span>
+          </div>
+          <div class="col-cards-list space-y-2 flex-1 overflow-y-auto"></div>
+        </div>
+
+        <!-- Colonne 3 : Prêt & En Cours -->
+        <div class="kanban-col" data-col-status="ready_or_progress">
+          <div class="flex items-center justify-between px-2 py-1 border-b border-cyber-700">
+            <span class="text-xs font-bold text-cyber-cyan flex items-center gap-1.5">
+              <span>🚀</span>
+              <span>3. Prêt & En Cours</span>
+            </span>
+            <span class="col-count text-[11px] font-mono px-2 py-0.5 rounded bg-cyber-cyan/20 text-cyber-cyan">0</span>
+          </div>
+          <div class="col-cards-list space-y-2 flex-1 overflow-y-auto"></div>
+        </div>
+
+        <!-- Colonne 4 : Terminé -->
+        <div class="kanban-col" data-col-status="done">
+          <div class="flex items-center justify-between px-2 py-1 border-b border-cyber-700">
+            <span class="text-xs font-bold text-emerald-400 flex items-center gap-1.5">
+              <span>✅</span>
+              <span>4. Terminé</span>
+            </span>
+            <span class="col-count text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">0</span>
+          </div>
+          <div class="col-cards-list space-y-2 flex-1 overflow-y-auto"></div>
+        </div>
+      </div>
+
+      <!-- Tiroir Frigo (Icebox) Masqué par Défaut -->
+      <div id="kanban-icebox-section" class="hidden cyber-card p-4 space-y-3">
+        <div class="flex items-center justify-between border-b border-cyber-700 pb-2">
+          <h3 class="text-sm font-bold text-slate-300 flex items-center gap-2">
+            <span>🧊</span>
+            <span>Frigo (Icebox / Tâches Gelées)</span>
+          </h3>
+          <span class="text-xs text-slate-400 font-mono">Tâches remises à plus tard</span>
+        </div>
+        <div id="icebox-cards-list" class="grid grid-cols-1 md:grid-cols-3 gap-3"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ========================================================================= -->
+  <!-- MODALES POLYVALENTES (MARKDOWN, FORMULAIRES)                              -->
+  <!-- ========================================================================= -->
+
+  <!-- 1. Modale Polyvalente Rendu Markdown (Bootloader, Specs, Concepts) -->
+  <div id="modal-markdown" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+    <div class="cyber-card w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl border-cyber-cyan/30">
+      <div class="px-5 py-3.5 border-b border-cyber-700 flex items-center justify-between bg-cyber-900">
+        <h3 id="modal-markdown-title" class="text-sm font-bold text-slate-100 flex items-center gap-2">
+          <span>📄</span>
+          <span>Lecteur Markdown</span>
+        </h3>
+        <div class="flex items-center gap-2">
+          <button id="btn-copy-modal-raw" class="px-2.5 py-1 text-xs rounded bg-cyber-800 text-slate-300 border border-cyber-700 hover:text-white" title="Copier le Markdown brut">
+            📋 Copier Brut
+          </button>
+          <button id="btn-close-modal-markdown" class="text-slate-400 hover:text-white text-lg font-bold px-2">
+            &times;
+          </button>
+        </div>
+      </div>
+      <div id="modal-markdown-body" class="p-6 overflow-y-auto markdown-body flex-1 bg-cyber-950/70"></div>
+    </div>
+  </div>
+
+  <!-- 2. Modale Création Nouveau Projet -->
+  <div id="modal-new-project" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+    <div class="cyber-card w-full max-w-md p-5 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-cyber-700 pb-2">
+        <h3 class="text-sm font-bold text-slate-100">🚀 Créer un Nouveau Projet</h3>
+        <button id="btn-close-modal-proj" class="text-slate-400 hover:text-white text-lg">&times;</button>
+      </div>
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 mb-1">Nom d'affichage *</label>
+          <input type="text" id="new-proj-name" placeholder="ex: Homelab Media" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Slug Unique *</label>
+          <input type="text" id="new-proj-id" placeholder="ex: homelab-media" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Préfixe Tickets *</label>
+          <input type="text" id="new-proj-prefix" placeholder="ex: HLAB" maxlength="6" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan uppercase">
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Chemin Local Dépôt (optionnel)</label>
+          <input type="text" id="new-proj-repo" placeholder="C:/chemin/vers/repo" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Description Architecturale</label>
+          <textarea id="new-proj-desc" rows="3" placeholder="Objectifs et architecture..." class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan"></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button id="btn-cancel-proj" class="btn-cyber-ghost px-3 py-1.5 rounded text-xs">Annuler</button>
+        <button id="btn-save-proj" class="btn-cyber-primary px-4 py-1.5 rounded text-xs">Enregistrer le Projet</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Modale Création Nouvelle Tâche -->
+  <div id="modal-new-task" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+    <div class="cyber-card w-full max-w-lg p-5 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-cyber-700 pb-2">
+        <h3 class="text-sm font-bold text-slate-100">➕ Créer une Nouvelle Idée / Tâche</h3>
+        <button id="btn-close-modal-task" class="text-slate-400 hover:text-white text-lg">&times;</button>
+      </div>
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 mb-1">Titre de la tâche *</label>
+          <input type="text" id="new-task-title" placeholder="ex: Implémenter le streaming WebSocket" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+        </div>
+        <div class="grid grid-cols-3 gap-2">
+          <div>
+            <label class="block text-slate-400 mb-1">Sous-module</label>
+            <input type="text" id="new-task-tag" value="general" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Priorité</label>
+            <select id="new-task-priority" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-2.5 py-2 outline-none focus:border-cyber-cyan">
+              <option value="1">P1 (Urgent)</option>
+              <option value="2" selected>P2 (Normal)</option>
+              <option value="3">P3 (Secondaire)</option>
+              <option value="4">P4 (Optionnel)</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Complexité</label>
+            <select id="new-task-complexity" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-2.5 py-2 outline-none focus:border-cyber-cyan">
+              <option value="S">S (Court)</option>
+              <option value="M" selected>M (Moyen)</option>
+              <option value="L">L (Large)</option>
+              <option value="XL">XL (Épique)</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Statut Initial</label>
+          <select id="new-task-status" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+            <option value="radar" selected>1. Radar</option>
+            <option value="needs_spec">2. Spécification Requise</option>
+            <option value="ready_for_agent">3. Prêt pour Agent Codeur</option>
+            <option value="icebox">Frigo (Icebox)</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Expression du besoin & Contexte</label>
+          <textarea id="new-task-pitch" rows="3" placeholder="Détails du problème, contraintes, intentions..." class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan"></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button id="btn-cancel-task" class="btn-cyber-ghost px-3 py-1.5 rounded text-xs">Annuler</button>
+        <button id="btn-save-task" class="btn-cyber-primary px-4 py-1.5 rounded text-xs">Créer la Tâche</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. Modale Ingestion Spec Markdown -->
+  <div id="modal-ingest-spec" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+    <div class="cyber-card w-full max-w-2xl p-5 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-cyber-700 pb-2">
+        <h3 class="text-sm font-bold text-slate-100 flex items-center gap-2">
+          <span>📥</span>
+          <span>Ingérer une Spécification Markdown SOTA</span>
+        </h3>
+        <button id="btn-close-modal-ingest" class="text-slate-400 hover:text-white text-lg">&times;</button>
+      </div>
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 mb-1">Associer directement à une tâche existante (optionnel) :</label>
+          <select id="ingest-target-task" class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 rounded px-3 py-2 outline-none focus:border-cyber-cyan">
+            <option value="">Détection automatique (via frontmatter YAML ou titre H1)</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-slate-400 mb-1">Coller le Markdown retourné par Gemini Web App :</label>
+          <textarea id="ingest-spec-content" rows="12" placeholder="Collez ici le bloc Markdown contenant le frontmatter YAML, le changelog et le prompt agent codeur..." class="w-full bg-cyber-900 border border-cyber-700 text-slate-100 font-mono text-[11px] rounded p-3 outline-none focus:border-cyber-cyan"></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button id="btn-cancel-ingest" class="btn-cyber-ghost px-3 py-1.5 rounded text-xs">Annuler</button>
+        <button id="btn-submit-ingest" class="btn-cyber-primary px-4 py-1.5 rounded text-xs">Ingérer & Activer pour Codeur</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Conteneur Toast Notifications -->
+  <div id="toast-container"></div>
+
+  <!-- Application Logic -->
+  <script src="app.js"></script>
+</body>
+</html>
+

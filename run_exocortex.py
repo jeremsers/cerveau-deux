@@ -305,6 +305,29 @@ def run_defrag_graph() -> None:
     )
 
 
+def run_web(port: Optional[int] = None, host: Optional[str] = None) -> None:
+    """Lance le serveur FastAPI/Uvicorn du Web Command Center et ouvre le navigateur."""
+    import threading
+    import webbrowser
+    import uvicorn
+
+    effective_host = host or settings.WEB_GUI_HOST
+    effective_port = port or settings.WEB_GUI_PORT
+    url = f"http://{effective_host}:{effective_port}"
+    logger.info("=== Lancement de l'Exocortex Web Command Center (FastAPI / Uvicorn) ===")
+    logger.info("Serveur Web accessible à l'adresse : %s", url)
+
+    def _open_browser() -> None:
+        time.sleep(1.2)
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            logger.debug("Impossible d'ouvrir automatiquement le navigateur : %s", exc)
+
+    threading.Thread(target=_open_browser, daemon=True).start()
+    uvicorn.run("src.api.server:app", host=effective_host, port=effective_port, log_level="info")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exocortex & Télémétrie Cognitive — Orchestrateur Principal",
@@ -318,6 +341,7 @@ Exemples d'utilisation :
   python run_exocortex.py --compile-drive     # Met à jour les 4 méga-fichiers Google Drive Sync
   python run_exocortex.py --hotkey            # Démarre l'écoute du raccourci global Alt+Espace
   python run_exocortex.py --dashboard         # Ouvre le dashboard Streamlit 'Bandeur de Stats'
+  python run_exocortex.py --web               # Ouvre le Command Center Web moderne (FastAPI/Uvicorn)
   python run_exocortex.py --all               # Lance démons de fond + dashboard au premier plan
   python run_exocortex.py --kanban-status     # Affiche l'état du Kanban et actualise AGENT_QUEUE.md
   python run_exocortex.py --next-task         # Dépile la tâche prête la plus prioritaire
@@ -332,6 +356,7 @@ Exemples d'utilisation :
     group.add_argument("--compile-drive", action="store_true", help="Compile les 4 méga-documents Google Drive.")
     group.add_argument("--hotkey", action="store_true", help="Lance le démon de raccourci global Alt+Espace.")
     group.add_argument("--dashboard", action="store_true", help="Lance le dashboard analytique Streamlit.")
+    group.add_argument("--web", action="store_true", help="Lance le Web Command Center moderne (FastAPI/Uvicorn).")
     group.add_argument("--all", action="store_true", help="Lance tous les démons d'arrière-plan et le dashboard.")
     group.add_argument("--mcp-server", action="store_true", help="Lance le serveur MCP local conforme stdio.")
     group.add_argument("--kanban-status", action="store_true", help="Affiche l'état des tickets du Kanban et actualise AGENT_QUEUE.md.")
@@ -343,6 +368,8 @@ Exemples d'utilisation :
     parser.add_argument("--date", type=str, default=None, help="Date optionnelle pour la consolidation (YYYY-MM-DD).")
     parser.add_argument("--limit", type=int, default=None, help="Limite optionnelle de sessions à distiller lors du Takeout.")
     parser.add_argument("--project", type=str, default=None, help="Filtrer par project_id (ex: exocortex).")
+    parser.add_argument("--port", type=int, default=None, help=f"Port d'écoute du serveur Web (défaut: {settings.WEB_GUI_PORT}).")
+    parser.add_argument("--host", type=str, default=None, help=f"Hôte d'écoute du serveur Web (défaut: {settings.WEB_GUI_HOST}).")
 
     args = parser.parse_args()
 
@@ -363,6 +390,8 @@ Exemples d'utilisation :
         run_hotkey()
     elif args.dashboard:
         run_dashboard()
+    elif args.web:
+        run_web(port=args.port, host=args.host)
     elif args.all:
         run_all()
     elif args.mcp_server:

@@ -278,6 +278,12 @@ class Settings(BaseModel):
     BROWSER_RECEIVER_PORT: int = Field(
         default_factory=lambda: int(os.getenv("BROWSER_RECEIVER_PORT", "8502"))
     )
+    WEB_GUI_HOST: str = Field(
+        default_factory=lambda: os.getenv("WEB_GUI_HOST", "127.0.0.1")
+    )
+    WEB_GUI_PORT: int = Field(
+        default_factory=lambda: int(os.getenv("WEB_GUI_PORT", "8500"))
+    )
 
     # --- Détection Anti-Dérive / Rabbit Hole (v0.3.0 - Module 8) ---
     DRIFT_MAX_SWITCHES_30MIN: int = Field(
