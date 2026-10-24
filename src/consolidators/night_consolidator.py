@@ -10,6 +10,7 @@ Exécuté la nuit pour consolider les journées d'activité :
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
 import logging
 import math
@@ -36,7 +37,7 @@ from src.database.db_manager import (
 )
 from src.database.vector_store import vector_store
 from src.consolidators.drive_compiler import DriveCompiler
-from src.llm.ollama_client import HardwareProbe, VRAMInsufficientError, llm_client
+from src.llm.ollama_client import HardwareProbe, VRAMBusyError, VRAMInsufficientError, llm_client
 from src.llm.prompts import (
     SYSTEM_PROMPT_ANTI_WIKIPEDIA,
     PROMPT_STRICT_TAXONOMY_RULE,
@@ -235,17 +236,27 @@ class NightConsolidator:
         free_gb, total_gb = HardwareProbe.get_vram_info()
         logger.info("VRAM disponible avant Passe 1 : %.2f Go / %.2f Go", free_gb, total_gb)
 
-        if free_gb < settings.MIN_FREE_VRAM_GB:
+        if free_gb < settings.VRAM_STRICT_ABORT_FREE_GB:
             # Mode CPU (B16) : la nuit n'est plus abandonnée. Classification heuristique, métriques,
             # journaux et compilation Drive sont produits ; vision et synthèses LLM sont reportées.
             logger.warning(
                 "VRAM insuffisante (%.2f Go < %.2f Go) : consolidation en mode CPU, synthèses LLM reportées.",
-                free_gb, settings.MIN_FREE_VRAM_GB,
+                free_gb, settings.VRAM_STRICT_ABORT_FREE_GB,
             )
             self.cpu_only = True
 
         # 1. Traitement des captures d'écran différées, par lots jusqu'à épuisement (A4) :
         #    aucune activité n'est marquée traitée tant que sa capture n'a pas été lue.
+        # Vision (C5) : un modèle créé sans projecteur multimodal (mmproj) ne lit pas les images.
+        # Ollama le déclare dans ses capacités ; dans ce cas les captures sont libérées sans analyse
+        # (au lieu de s'accumuler) et l'avertissement indique comment rétablir la vision.
+        use_vision = llm_client.supports(settings.MODEL_FAST_VISION, "vision") is not False
+        if not self.cpu_only and not use_vision:
+            logger.warning(
+                "Le modèle '%s' ne déclare pas la capacité vision (GGUF sans mmproj ?) : captures "
+                "libérées sans analyse. Fournissez un modèle vision ou un projecteur pour rétablir la Passe vision.",
+                settings.MODEL_FAST_VISION,
+            )
         seen_screenshot_ids: Set[int] = set()
         while not self.cpu_only:
             screenshot_activities = [
@@ -257,7 +268,7 @@ class NightConsolidator:
             logger.info("Lot d'activités avec capture d'écran à analyser : %d", len(screenshot_activities))
             for act in tqdm(screenshot_activities, desc="Consolidation Nocturne (Captures)", unit="img"):
                 seen_screenshot_ids.add(act["id"])
-                self._analyze_activity_screenshot(act)
+                self._analyze_activity_screenshot(act, use_vision=use_vision)
 
         # 2. Classification sémantique des activités brutes (processed = 0), par lots de 500
         #    jusqu'à épuisement (A11) : une journée chargée n'est plus figée avec une part Non_Classe.
@@ -342,12 +353,14 @@ class NightConsolidator:
             logger.info("%d enregistrements d'activité classifiés et marqués processed=1.", len(updates))
         return len(updates)
 
-    def _analyze_activity_screenshot(self, act: Dict[str, Any]) -> None:
+    def _analyze_activity_screenshot(self, act: Dict[str, Any], use_vision: bool = True) -> None:
         """Résume une capture par le modèle de vision, supprime le fichier et libère screenshot_path."""
         img_path = Path(act["screenshot_path"])
         visual_summary = ""
 
-        if img_path.exists():
+        if img_path.exists() and not use_vision:
+            img_path.unlink(missing_ok=True)
+        elif img_path.exists():
             prompt = (
                 "Analyse cette capture d'écran de l'utilisateur en une seule phrase dense et factuelle : "
                 "identifie l'application, le projet, le code ou le contenu textuel affiché. Zéro bavardage."
@@ -622,7 +635,7 @@ class NightConsolidator:
             free_gb, _ = HardwareProbe.get_vram_info()
 
             # Choix du modèle selon la VRAM libre
-            target_model = settings.MODEL_HEAVY_SYNTHESIS if free_gb >= settings.FULL_DUAL_MODEL_VRAM_GB else settings.MODEL_FAST_VISION
+            target_model = settings.MODEL_HEAVY_SYNTHESIS if free_gb >= settings.VRAM_REASONING_MIN_FREE_GB else settings.MODEL_FAST_VISION
             try:
                 effective_model = llm_client.check_and_select_model(target_model)
                 logger.info("Modèle sélectionné pour la synthèse : %s (VRAM libre: %.2f Go)", effective_model, free_gb)
@@ -1069,6 +1082,20 @@ class NightConsolidator:
     # ==========================================================================
 
     def consolidate(self, target_date: Optional[date] = None) -> Dict[str, Any]:
+        """
+        Exécute les 3 passes de consolidation nocturne sous une session VRAM unique (C8) : aucun
+        autre processus Exocortex ne charge de modèle pendant la nuit. Si le GPU reste détenu par
+        un autre processus au-delà du délai, la nuit tourne en mode CPU (B16) au lieu d'échouer.
+        """
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(llm_client.vram_session())
+            except VRAMBusyError as exc:
+                logger.warning("%s Consolidation en mode CPU.", exc)
+                self.cpu_only = True
+            return self._consolidate(target_date)
+
+    def _consolidate(self, target_date: Optional[date] = None) -> Dict[str, Any]:
         """Exécute les 3 passes complètes de consolidation nocturne."""
         logger.info("============================================================")
         logger.info("=== DÉCLENCHEMENT DU SOMMEIL PARADOXAL (CONSOLIDATION) ===")

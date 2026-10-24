@@ -29,7 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from src.config import settings
 from src.database.db_manager import DBManager
 from src.database.vector_store import VectorStore
-from src.llm.ollama_client import llm_client
+from src.llm.ollama_client import VRAMBusyError, llm_client
 from src.utils.markdown_io import (
     ConceptFrontmatter,
     ParsedConceptNote,
@@ -447,6 +447,15 @@ class GraphDefragmenter:
         return updated_files_count
 
     def run_defragmentation_cycle(self) -> Dict[str, Any]:
+        """Cycle de Sommeil Profond sous une session VRAM unique (C8) : aucun autre processus ne charge de modèle entre deux paires."""
+        try:
+            with llm_client.vram_session():
+                return self._run_defragmentation_cycle()
+        except VRAMBusyError as exc:
+            logger.warning("Sommeil Profond reporté : %s", exc)
+            return {"candidates_found": 0, "merges_done": 0, "contradictions_done": 0, "deferred": True}
+
+    def _run_defragmentation_cycle(self) -> Dict[str, Any]:
         """
         Cycle autonome de Sommeil Profond :
         1. Trouve les candidats à la fusion et aux contradictions.
@@ -492,6 +501,7 @@ class GraphDefragmenter:
                             prompt=prompt,
                             response_model=ConceptMergeSchema,
                             model=settings.MODEL_HEAVY_SYNTHESIS,
+                            keep_alive="5m",  # 26B gardé entre deux paires (C3), déchargé une fois en sortie
                         )
                     except Exception as llm_exc:
                         logger.warning("Échec évaluation LLM pour fusion : %s", llm_exc)
@@ -523,6 +533,7 @@ class GraphDefragmenter:
                             prompt=prompt,
                             response_model=ConceptMergeSchema,
                             model=settings.MODEL_HEAVY_SYNTHESIS,
+                            keep_alive="5m",  # 26B gardé entre deux paires (C3), déchargé une fois en sortie
                         )
                         if dec and dec.contradiction_detected and dec.contradiction_explanation:
                             self.annotate_contradiction(

@@ -5,14 +5,19 @@ exclusion mutuelle stricte en VRAM (keep_alive=0) et support de sorties structur
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -104,6 +109,94 @@ class VRAMInsufficientError(RuntimeError):
     pass
 
 
+class VRAMBusyError(VRAMInsufficientError):
+    """Levée quand un autre processus Exocortex détient le GPU au-delà du délai d'attente (C8)."""
+    pass
+
+
+class InterProcessVRAMLock:
+    """
+    Verrou d'exclusion mutuelle VRAM partagé par TOUS les processus Exocortex (v0.5.7, C8) :
+    démon, consolidation, ingestion, API web, injecteur. `currently_loaded_model` ne garantissait
+    l'exclusion qu'à l'intérieur d'un processus ; deux processus pouvaient charger deux modèles en
+    même temps et dépasser les 16 Go.
+    Réentrant au sein d'un processus (une passe nocturne qui le détient peut enchaîner les appels).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._rlock = threading.RLock()
+        self._depth = 0
+        self._fd: Optional[int] = None
+
+    def _try_lock_file(self) -> bool:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _unlock_file(self) -> None:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+    def acquire(self, timeout: float) -> None:
+        if not self._rlock.acquire(timeout=max(0.0, timeout)):
+            raise VRAMBusyError("Verrou VRAM détenu par un autre fil d'exécution.")
+        if self._depth > 0:
+            self._depth += 1
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self._try_lock_file():
+            if time.monotonic() >= deadline:
+                os.close(self._fd)
+                self._fd = None
+                self._rlock.release()
+                raise VRAMBusyError(
+                    f"GPU occupé par un autre processus Exocortex depuis plus de {timeout:.0f} s : inférence reportée."
+                )
+            time.sleep(0.25)
+        self._depth = 1
+
+    def release(self) -> None:
+        if self._depth <= 0:
+            return
+        self._depth -= 1
+        if self._depth == 0 and self._fd is not None:
+            self._unlock_file()
+            os.close(self._fd)
+            self._fd = None
+        self._rlock.release()
+
+    @contextmanager
+    def hold(self, timeout: float) -> Iterator[None]:
+        self.acquire(timeout)
+        try:
+            yield
+        finally:
+            self.release()
+
+
 class HardwareProbe:
     """Sonde matérielle temps réel pour GPU NVIDIA via pynvml avec repli subprocess nvidia-smi."""
 
@@ -141,9 +234,32 @@ class HardwareProbe:
         except Exception as exc:
             logger.warning("Échec de la commande nvidia-smi : %s", exc)
 
-        # 3. Repli par défaut si aucun outil GPU n'est accessible
-        logger.warning("Impossible de sonder le GPU. Hypothèse conservatrice : 16 Go libres.")
-        return 16.0, 16.0
+        # 3. Repli si aucun outil GPU n'est accessible (C6) : abstention prudente par défaut
+        #    (0 Go libre), au lieu de supposer 16 Go et de charger le 26B à l'aveugle.
+        assumed = settings.VRAM_ASSUME_FREE_GB
+        logger.warning(
+            "Impossible de sonder le GPU. Hypothèse prudente : %.1f Go libres (VRAM_ASSUME_FREE_GB).", assumed
+        )
+        return assumed, assumed
+
+
+def _with_vram_lock(method):
+    """Exécute la méthode en détenant le verrou VRAM inter-processus (C8)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.vram_session():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+# Variables d'environnement que le SERVEUR Ollama doit voir (C1) : le budget VRAM du 26B repose
+# sur le cache KV quantifié. Les poser dans un .bat ne sert à rien si Ollama tourne à part.
+REQUIRED_OLLAMA_SERVER_ENV = {
+    "OLLAMA_FLASH_ATTENTION": "1",
+    "OLLAMA_KV_CACHE_TYPE": "q8_0",
+    "OLLAMA_MAX_LOADED_MODELS": "1",
+    "OLLAMA_NUM_PARALLEL": "1",
+}
 
 
 class HybridLLMClient:
@@ -161,6 +277,72 @@ class HybridLLMClient:
         self.timeout = timeout
         self.currently_loaded_model: Optional[str] = None
         self._session = requests.Session()
+        self._vram_lock = InterProcessVRAMLock(settings.VRAM_LOCK_PATH)
+        self._capabilities: Dict[str, Optional[Set[str]]] = {}
+
+    # ==========================================================================
+    # VERROU VRAM INTER-PROCESSUS & CAPACITÉS DES MODÈLES (v0.5.7)
+    # ==========================================================================
+
+    def vram_session(self, timeout: Optional[float] = None):
+        """
+        Détient le GPU pour ce processus (C8). Réentrant : une passe par lots ouvre une session
+        et tous ses appels l'utilisent sans attente. Lève VRAMBusyError au-delà du délai.
+        """
+        return self._vram_lock.hold(settings.VRAM_LOCK_TIMEOUT_SEC if timeout is None else timeout)
+
+    def model_capabilities(self, model_name: str) -> Optional[Set[str]]:
+        """Capacités déclarées par Ollama (/api/show) : 'completion', 'vision', 'thinking'… None si inconnu."""
+        if model_name in self._capabilities:
+            return self._capabilities[model_name]
+        caps: Optional[Set[str]] = None
+        if settings.LLM_BACKEND != "llama_server":
+            try:
+                resp = self._session.post(f"{self.base_url}/api/show", json={"model": model_name}, timeout=3.0)
+                if resp.status_code == 200 and "capabilities" in resp.json():
+                    caps = {str(c) for c in resp.json().get("capabilities") or []}
+            except Exception as exc:
+                logger.debug("Capacités de '%s' indisponibles : %s", model_name, exc)
+        self._capabilities[model_name] = caps
+        return caps
+
+    def supports(self, model_name: str, capability: str) -> Optional[bool]:
+        caps = self.model_capabilities(model_name)
+        return None if caps is None else capability in caps
+
+    def check_ollama_server_config(self) -> Dict[str, Any]:
+        """
+        Vérifie les variables d'environnement du PROCESSUS SERVEUR Ollama (C1), lues via psutil.
+        Retourne {"found": bool, "missing": {var: attendu}, "pid": int|None} et journalise la
+        marche à suivre (setx puis redémarrage d'Ollama) s'il manque une variable.
+        """
+        report: Dict[str, Any] = {"found": False, "missing": dict(REQUIRED_OLLAMA_SERVER_ENV), "pid": None}
+        try:
+            import psutil
+        except ImportError:
+            return report
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = (proc.info["name"] or "").lower()
+                cmdline = " ".join(proc.info["cmdline"] or []).lower()
+                if not name.startswith("ollama") or "serve" not in cmdline:
+                    continue
+                env = proc.environ()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+            report["found"] = True
+            report["pid"] = proc.info["pid"]
+            report["missing"] = {k: v for k, v in REQUIRED_OLLAMA_SERVER_ENV.items() if env.get(k) != v}
+            break
+        if report["found"] and report["missing"]:
+            logger.warning(
+                "Le serveur Ollama (PID %s) ne voit pas : %s. Le budget VRAM du 26B suppose un cache KV q8_0. "
+                "Définissez ces variables au niveau utilisateur (setx NOM valeur) puis redémarrez Ollama : "
+                "les poser dans un .bat n'affecte pas un serveur lancé séparément.",
+                report["pid"],
+                ", ".join(f"{k}={v}" for k, v in report["missing"].items()),
+            )
+        return report
 
     # ==========================================================================
     # SONDE ET SÉLECTION DU MODÈLE SELON LA VRAM
@@ -206,8 +388,8 @@ class HybridLLMClient:
         free_gb, total_gb = HardwareProbe.get_vram_info()
 
         # 3. Purge préventive active via /api/ps si mémoire basse (élimine les modèles fantômes)
-        min_strict = getattr(settings, "VRAM_STRICT_ABORT_FREE_GB", settings.MIN_FREE_VRAM_GB)
-        min_reasoning = getattr(settings, "VRAM_REASONING_MIN_FREE_GB", settings.FULL_DUAL_MODEL_VRAM_GB)
+        min_strict = settings.VRAM_STRICT_ABORT_FREE_GB
+        min_reasoning = settings.VRAM_REASONING_MIN_FREE_GB
         is_heavy = requested_model in (settings.MODEL_HEAVY_SYNTHESIS, getattr(settings, "MODEL_REASONING", None))
 
         if free_gb < min_strict or (is_heavy and free_gb < min_reasoning):
@@ -305,7 +487,7 @@ class HybridLLMClient:
             logger.info("Modèle '%s' absent d'Ollama. Création automatique depuis %s...", model_name, gguf_path.name)
             modelfile_content = (
                 f"FROM \"{gguf_path.resolve().as_posix()}\"\n"
-                "PARAMETER num_ctx 16384\n"
+                f"PARAMETER num_ctx {settings.OLLAMA_NUM_CTX}\n"
                 'TEMPLATE """{{ if .System }}<start_of_turn>system\n'
                 '{{ .System }}<end_of_turn>\n'
                 '{{ end }}{{ if .Prompt }}<start_of_turn>user\n'
@@ -318,36 +500,47 @@ class HybridLLMClient:
             )
 
             modelfile_path = settings.MODELS_DIR / f"Modelfile.{model_name.replace(':', '_')}"
-            try:
-                modelfile_path.write_text(modelfile_content, encoding="utf-8")
-                # 1. Tentative via l'API REST Ollama /api/create
-                create_url = f"{self.base_url}/api/create"
-                create_payload = {
-                    "name": model_name,
-                    "modelfile": modelfile_content,
-                    "stream": False,
-                }
-                c_resp = self._session.post(create_url, json=create_payload, timeout=600.0)
-                if c_resp.status_code == 200:
-                    logger.info("Modèle Ollama '%s' créé avec succès via API REST !", model_name)
-                    status[model_name] = True
-                    continue
-            except Exception as exc:
-                logger.debug("Tentative API REST pour créer '%s' : %s", model_name, exc)
-
-            # 2. Repli via CLI subprocess ollama create
-            try:
-                cmd = ["ollama", "create", model_name, "-f", str(modelfile_path.resolve())]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=600.0)
-                if res.returncode == 0:
-                    logger.info("Modèle Ollama '%s' créé avec succès via CLI !", model_name)
-                    status[model_name] = True
-                else:
-                    logger.warning("Échec de 'ollama create' pour '%s' : %s", model_name, res.stderr)
-            except Exception as exc:
-                logger.error("Erreur d'exécution de 'ollama create' pour '%s' : %s", model_name, exc)
+            modelfile_path.write_text(modelfile_content, encoding="utf-8")
+            status[model_name] = self._create_ollama_model(model_name, modelfile_path, modelfile_content)
 
         return status
+
+    def _create_ollama_model(self, model_name: str, modelfile_path: Path, modelfile_content: str) -> bool:
+        """
+        Crée un modèle Ollama depuis un Modelfile (v0.5.7, C9). La CLI `ollama create -f` est la voie
+        principale : son format est stable d'une version à l'autre, alors que /api/create attend
+        désormais `model` + `files` (blobs téléversés) et rejette l'ancien couple `name` + `modelfile`.
+        Repli REST au format historique uniquement si la CLI est introuvable (anciens serveurs).
+        """
+        ollama_cli = shutil.which("ollama")
+        if ollama_cli:
+            try:
+                res = subprocess.run(
+                    [ollama_cli, "create", model_name, "-f", str(modelfile_path.resolve())],
+                    capture_output=True, text=True, timeout=600.0,
+                )
+                if res.returncode == 0:
+                    logger.info("Modèle Ollama '%s' créé avec succès via la CLI.", model_name)
+                    return True
+                logger.warning("Échec de 'ollama create' pour '%s' : %s", model_name, res.stderr.strip())
+            except Exception as exc:
+                logger.error("Erreur d'exécution de 'ollama create' pour '%s' : %s", model_name, exc)
+            return False
+
+        logger.warning("CLI 'ollama' introuvable dans le PATH : tentative /api/create au format historique.")
+        try:
+            resp = self._session.post(
+                f"{self.base_url}/api/create",
+                json={"model": model_name, "name": model_name, "modelfile": modelfile_content, "stream": False},
+                timeout=600.0,
+            )
+            if resp.status_code == 200:
+                logger.info("Modèle Ollama '%s' créé via /api/create.", model_name)
+                return True
+            logger.warning("/api/create a refusé la création de '%s' (HTTP %s) : installez la CLI Ollama.", model_name, resp.status_code)
+        except Exception as exc:
+            logger.warning("Création REST de '%s' impossible : %s", model_name, exc)
+        return False
 
     # ==========================================================================
     # EXCLUSION MUTUELLE ET PURGE MÉMOIRE (KEEP_ALIVE=0)
@@ -386,34 +579,34 @@ class HybridLLMClient:
         self.currently_loaded_model = None
         time.sleep(0.5)  # Pause brève pour libération pilote NVIDIA
 
+    @_with_vram_lock
     def force_clear_vram(self) -> float:
         """
         Interroge /api/ps d'Ollama et décharge immédiatement tous les modèles résidents en VRAM
         (purge active des modèles fantômes d'anciens runs ou de crashs).
         Retourne la quantité de VRAM libre en Go après déchargement.
         """
-        loaded_models: Set[str] = set()
+        # Seuls les modèles de l'Exocortex sont déchargés (C7) : un modèle chargé par un autre
+        # outil utilisant le même serveur Ollama n'est plus éjecté.
+        known_models = {
+            settings.MODEL_HEAVY_SYNTHESIS,
+            settings.MODEL_FAST_VISION,
+            settings.MODEL_EMBEDDING,
+            settings.MODEL_REASONING,
+        }
+        loaded_models: Set[str] = set(known_models)
         if self.is_alive():
             try:
                 resp = self._session.get(f"{self.base_url}/api/ps", timeout=5.0)
                 if resp.status_code == 200:
                     for m in resp.json().get("models", []):
-                        name = m.get("name") or m.get("model")
-                        if name:
+                        name = m.get("name") or m.get("model") or ""
+                        if any(name == km or name.startswith(f"{km}:") for km in known_models):
                             loaded_models.add(name)
+                        elif name:
+                            logger.debug("Modèle externe '%s' laissé en VRAM (non géré par l'Exocortex).", name)
             except Exception as exc:
                 logger.debug("Impossible d'interroger /api/ps lors du force_clear_vram : %s", exc)
-
-        # Ajouter tous les modèles connus du système
-        known_models = [
-            settings.MODEL_HEAVY_SYNTHESIS,
-            settings.MODEL_FAST_VISION,
-            settings.MODEL_EMBEDDING,
-        ]
-        if hasattr(settings, "MODEL_REASONING") and settings.MODEL_REASONING:
-            known_models.append(settings.MODEL_REASONING)
-        for km in known_models:
-            loaded_models.add(km)
 
         if self.currently_loaded_model:
             loaded_models.add(self.currently_loaded_model)
@@ -434,6 +627,7 @@ class HybridLLMClient:
     # GÉNÉRATION TEXTUELLE LOCALE
     # ==========================================================================
 
+    @_with_vram_lock
     def generate_text(
         self,
         prompt: str,
@@ -487,7 +681,7 @@ class HybridLLMClient:
             "model": effective_model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": temperature},
+            "options": {"temperature": temperature, "num_ctx": settings.OLLAMA_NUM_CTX},
             "keep_alive": keep_alive,
         }
 
@@ -501,6 +695,7 @@ class HybridLLMClient:
             logger.error("Erreur de requête HTTP vers Ollama (%s) : %s", url, exc)
             raise
 
+    @_with_vram_lock
     def generate_vision(
         self,
         prompt: str,
@@ -540,7 +735,7 @@ class HybridLLMClient:
             "model": effective_model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_ctx": settings.OLLAMA_NUM_CTX},
             "keep_alive": keep_alive,
         }
 
@@ -558,6 +753,7 @@ class HybridLLMClient:
     # GÉNÉRATION STRUCTURÉE PYDANTIC V2
     # ==========================================================================
 
+    @_with_vram_lock
     def generate_structured(
         self,
         prompt: str,
@@ -639,7 +835,7 @@ class HybridLLMClient:
             ]
             options = {
                 "temperature": temp,
-                "num_ctx": 16384,
+                "num_ctx": settings.OLLAMA_NUM_CTX,
                 "num_predict": pred,
             }
             payload = {
@@ -652,6 +848,10 @@ class HybridLLMClient:
             }
             if not thinking:
                 payload["think"] = False
+            elif self.supports(target_m, "thinking"):
+                # Activation explicite (C4) : selon la version d'Ollama et le Modelfile, l'omission
+                # ne garantit pas le mode réflexion attendu en Vague 1
+                payload["think"] = True
 
             resp = self._session.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
@@ -729,6 +929,7 @@ class HybridLLMClient:
     # EMBEDDINGS VECTORIELS (BGE-M3)
     # ==========================================================================
 
+    @_with_vram_lock
     def generate_embeddings(
         self,
         text: str,

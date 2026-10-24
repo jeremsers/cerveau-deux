@@ -2,11 +2,14 @@
 setlocal enabledelayedexpansion
 title Exocortex & Telemetrie Cognitive - Lanceur Windows
 
-:: Optimisations VRAM pour Ollama sur NVIDIA RTX 4070 Ti Super 16 Go
-set OLLAMA_FLASH_ATTENTION=1
-set OLLAMA_KV_CACHE_TYPE=q8_0
-set OLLAMA_MAX_LOADED_MODELS=1
-set OLLAMA_NUM_PARALLEL=1
+:: Optimisations VRAM pour Ollama (RTX 4070 Ti Super 16 Go) : ces variables doivent etre vues par
+:: le SERVEUR Ollama, qui tourne dans son propre processus. Les poser ici (set) n'a aucun effet
+:: (v0.5.7, C1). A faire une fois, puis redemarrer Ollama :
+::   setx OLLAMA_FLASH_ATTENTION 1
+::   setx OLLAMA_KV_CACHE_TYPE q8_0
+::   setx OLLAMA_MAX_LOADED_MODELS 1
+::   setx OLLAMA_NUM_PARALLEL 1
+:: L'etape [0/3] ci-dessous verifie la configuration reelle du serveur et previent si elle manque.
 
 echo ============================================================
 echo ===      EXOCORTEX & TELEMETRIE COGNITIVE (V2.0)         ===
@@ -31,7 +34,7 @@ if %errorlevel% neq 0 (
     set PYTHONW_EXE=python.exe
 )
 
-echo [0/3] Provisioning des modeles GGUF locaux dans Ollama...
+echo [0/3] Verification du serveur Ollama et provisioning des modeles GGUF locaux...
 python run_exocortex.py --init-models
 
 echo.

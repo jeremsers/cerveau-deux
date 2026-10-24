@@ -89,7 +89,9 @@ def test_v013_chantier3_vram_parameters():
     assert settings.VRAM_STRICT_ABORT_FREE_GB == 8.0
     assert settings.VRAM_REASONING_MIN_FREE_GB == 12.8
     assert settings.MODEL_REASONING == settings.MODEL_HEAVY_SYNTHESIS
-    assert "num_ctx 16384" in inspect.getsource(HybridLLMClient.ensure_local_gguf_models)
+    # Depuis v0.5.7 (C2), le Modelfile reprend la fenêtre de contexte unique OLLAMA_NUM_CTX (16384)
+    assert settings.OLLAMA_NUM_CTX == 16384
+    assert "PARAMETER num_ctx {settings.OLLAMA_NUM_CTX}" in inspect.getsource(HybridLLMClient.ensure_local_gguf_models)
 
     sig = inspect.signature(HybridLLMClient.generate_structured)
     assert sig.parameters["enable_thinking"].default is True

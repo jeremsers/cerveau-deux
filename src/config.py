@@ -253,17 +253,31 @@ class Settings(BaseModel):
     )
 
     # --- Contraintes Matérielles VRAM (RTX 4070 Ti Super 16 Go sous Windows 11) ---
-    MIN_FREE_VRAM_GB: float = Field(
-        default_factory=lambda: float(os.getenv("MIN_FREE_VRAM_GB", "8.0"))
-    )
-    FULL_DUAL_MODEL_VRAM_GB: float = Field(
-        default_factory=lambda: float(os.getenv("FULL_DUAL_MODEL_VRAM_GB", "12.8"))
-    )
+    # Une seule source par seuil (v0.5.7, C10). Les anciens noms MIN_FREE_VRAM_GB et
+    # FULL_DUAL_MODEL_VRAM_GB restent lus en repli et exposés en alias (propriétés ci-dessous).
     VRAM_STRICT_ABORT_FREE_GB: float = Field(
-        default_factory=lambda: float(os.getenv("VRAM_STRICT_ABORT_FREE_GB", "8.0"))
+        default_factory=lambda: float(
+            os.getenv("VRAM_STRICT_ABORT_FREE_GB") or os.getenv("MIN_FREE_VRAM_GB") or "8.0"
+        )
     )
     VRAM_REASONING_MIN_FREE_GB: float = Field(
-        default_factory=lambda: float(os.getenv("VRAM_REASONING_MIN_FREE_GB", "12.8"))
+        default_factory=lambda: float(
+            os.getenv("VRAM_REASONING_MIN_FREE_GB") or os.getenv("FULL_DUAL_MODEL_VRAM_GB") or "12.8"
+        )
+    )
+    # VRAM supposée libre quand aucune sonde GPU ne répond (C6) : 0 = abstention prudente
+    # (aucun modèle chargé à l'aveugle). Une machine sans outils NVIDIA peut le fixer explicitement.
+    VRAM_ASSUME_FREE_GB: float = Field(
+        default_factory=lambda: float(os.getenv("VRAM_ASSUME_FREE_GB", "0"))
+    )
+    # Fenêtre de contexte unique envoyée à chaque requête (C2) : un num_ctx variable entre deux
+    # requêtes force Ollama à recharger le modèle.
+    OLLAMA_NUM_CTX: int = Field(
+        default_factory=lambda: int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+    )
+    # Attente maximale du verrou VRAM inter-processus (C8) avant report de l'inférence
+    VRAM_LOCK_TIMEOUT_SEC: float = Field(
+        default_factory=lambda: float(os.getenv("VRAM_LOCK_TIMEOUT_SEC", "900"))
     )
     TAKEOUT_MAX_DISTILL_SESSIONS: int = Field(
         default_factory=lambda: int(os.getenv("TAKEOUT_MAX_DISTILL_SESSIONS", "0"))  # 0 = Toutes les sessions qualifiées
@@ -541,6 +555,21 @@ class Settings(BaseModel):
     def CONCEPTS_QUARANTINE_DIR(self) -> Path:
         """Fiches retirées par le Vault Doctor (déplacées, jamais supprimées)."""
         return self.CONCEPTS_DIR / "_Quarantine"
+
+    @property
+    def MIN_FREE_VRAM_GB(self) -> float:
+        """Alias historique de VRAM_STRICT_ABORT_FREE_GB (C10)."""
+        return self.VRAM_STRICT_ABORT_FREE_GB
+
+    @property
+    def FULL_DUAL_MODEL_VRAM_GB(self) -> float:
+        """Alias historique de VRAM_REASONING_MIN_FREE_GB (C10)."""
+        return self.VRAM_REASONING_MIN_FREE_GB
+
+    @property
+    def VRAM_LOCK_PATH(self) -> Path:
+        """Verrou fichier d'exclusion mutuelle VRAM entre processus (C8)."""
+        return self.SYSTEM_BUFFER_DIR / "vram.lock"
 
     @property
     def MODEL_REASONING(self) -> str:

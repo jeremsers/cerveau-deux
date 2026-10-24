@@ -39,6 +39,7 @@ from src import __version__
 from src.config import settings
 from src.database.db_manager import DBManager
 from src.database.graph_rag import HybridGraphRAG
+from src.llm.ollama_client import VRAMBusyError, llm_client
 from src.utils.markdown_io import parse_concept_file
 
 
@@ -59,15 +60,29 @@ def mcp_search_concepts(
     - Hop 1 : Traversée des liens [[wikilinks]] d'Obsidian (si include_graph_neighbors=True).
     - Traces épisodiques rattachées issues de SQLite.
     """
-    db = db_manager or DBManager(read_only=True)
-    rag = HybridGraphRAG(db_manager=db)
+    rag = _shared_graph_rag(db_manager)
     neighbor_limit = top_k if include_graph_neighbors else 0
-    return rag.search_hybrid(
-        query=query,
-        top_k=top_k,
-        neighbor_k=neighbor_limit,
-        topic_filter=topic,
-    )
+    try:
+        with llm_client.vram_session(timeout=10.0):
+            return rag.search_hybrid(
+                query=query,
+                top_k=top_k,
+                neighbor_k=neighbor_limit,
+                topic_filter=topic,
+            )
+    except VRAMBusyError as exc:
+        return {"error": f"GPU occupé par un autre processus Exocortex : {exc}", "primary_nodes": [], "linked_neighbors": []}
+
+
+_graph_rag_cache: Dict[int, HybridGraphRAG] = {}
+
+
+def _shared_graph_rag(db_manager: Optional[DBManager]) -> HybridGraphRAG:
+    """Instance GraphRAG réutilisée entre appels d'outil (v0.5.7, C12)."""
+    key = id(db_manager)
+    if key not in _graph_rag_cache or _graph_rag_cache[key].concepts_dir != settings.CONCEPTS_DIR:
+        _graph_rag_cache[key] = HybridGraphRAG(db_manager=db_manager or DBManager(read_only=True))
+    return _graph_rag_cache[key]
 
 
 def mcp_get_concept_note(

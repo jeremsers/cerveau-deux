@@ -6,6 +6,7 @@ avec exclusion mutuelle stricte en VRAM (keep_alive=0).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -167,26 +168,90 @@ class VectorStore:
             logger.warning("Erreur suppression LanceDB pour slug '%s': %s", slug, exc)
             return False
 
+    @property
+    def sync_state_path(self) -> Path:
+        """Empreintes des fiches déjà indexées (slug -> sha1 du fichier), hors du dossier LanceDB."""
+        return self.store_dir.parent / f"{self.store_dir.name}_sync_state.json"
+
+    def _load_sync_state(self) -> Optional[Dict[str, str]]:
+        try:
+            data = json.loads(self.sync_state_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def _indexed_slugs(self) -> set:
+        try:
+            return set(self._table.to_arrow().column("slug").to_pylist())
+        except Exception:
+            return set()
+
     def sync_all_concepts(self, concepts_dir: Optional[Path] = None) -> int:
-        """Parcourt 02_Concepts/ et synchronise toutes les notes Markdown dans LanceDB."""
+        """
+        Synchronise 02_Concepts/ dans LanceDB de façon incrémentale (v0.5.7, C11) :
+        - seules les fiches nouvelles ou modifiées (empreinte sha1 du fichier) sont ré-embarquées,
+          au lieu de tout le coffre chaque nuit ;
+        - les fiches disparues (fusionnées, mises en quarantaine, supprimées) sont retirées ;
+        - les fichiers agrégés `all-*` ne sont pas indexés ;
+        - la table est compactée après modification.
+        Retourne le nombre de fiches (ré)indexées lors de cet appel.
+        """
         from tqdm import tqdm
 
         target_dir = concepts_dir or settings.CONCEPTS_DIR
         if not target_dir.exists():
             return 0
 
-        md_files = sorted(list(target_dir.glob("*.md")))
-        indexed_count = 0
-        with tqdm(total=len(md_files), desc="Indexation LanceDB (bge-m3)", unit="note") as pbar:
-            for md_file in md_files:
-                if self.index_concept_file(md_file, keep_alive="5m"):
-                    indexed_count += 1
-                pbar.update(1)
+        md_files = sorted(
+            f for f in target_dir.glob("*.md") if not f.name.startswith(("all-", "all_", "."))
+        )
+        previous = self._load_sync_state()
+        state: Dict[str, str] = dict(previous or {})
+        on_disk = {f.stem: f for f in md_files}
 
-        # Purge de la mémoire VRAM après le batch d'embeddings
-        llm_client.unload_model(settings.MODEL_EMBEDDING)
-        logger.info("Synchronisation LanceDB achevée : %d notes indexées.", indexed_count)
+        # Fiches disparues : retirées de l'index (au premier passage, toute ligne orpheline de la table)
+        known = set(state) if previous is not None else self._indexed_slugs()
+        removed = [slug for slug in known if slug not in on_disk]
+        for slug in removed:
+            self.delete_by_slug(slug)
+            state.pop(slug, None)
+
+        to_index = []
+        for md_file in md_files:
+            digest = hashlib.sha1(md_file.read_bytes()).hexdigest()
+            if state.get(md_file.stem) != digest:
+                to_index.append((md_file, digest))
+
+        indexed_count = 0
+        if to_index:
+            with tqdm(total=len(to_index), desc="Indexation LanceDB (bge-m3)", unit="note") as pbar:
+                for md_file, digest in to_index:
+                    if self.index_concept_file(md_file, keep_alive="5m"):
+                        state[md_file.stem] = digest
+                        indexed_count += 1
+                    pbar.update(1)
+            # Purge de la mémoire VRAM après le batch d'embeddings
+            llm_client.unload_model(settings.MODEL_EMBEDDING)
+
+        if to_index or removed:
+            self._compact()
+        self.sync_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sync_state_path.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        logger.info(
+            "Synchronisation LanceDB : %d fiche(s) (ré)indexée(s), %d retirée(s), %d inchangée(s).",
+            indexed_count, len(removed), len(md_files) - len(to_index),
+        )
         return indexed_count
+
+    def _compact(self) -> None:
+        """Compacte la table (fragments créés par les delete + add successifs)."""
+        try:
+            if hasattr(self._table, "optimize"):
+                self._table.optimize()
+            elif hasattr(self._table, "compact_files"):
+                self._table.compact_files()
+        except Exception as exc:
+            logger.debug("Compaction LanceDB ignorée : %s", exc)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Recherche sémantique k-NN dans LanceDB à partir d'un prompt utilisateur."""

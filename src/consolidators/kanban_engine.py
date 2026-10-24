@@ -280,7 +280,8 @@ class KanbanEngine:
 
             if vector_store.count() > 0 and llm_client.is_alive():
                 query = f"{task['title']} {task.get('summary_pitch', '')}".strip()
-                results = vector_store.search(query, top_k=3)
+                with llm_client.vram_session(timeout=5.0):  # GPU éventuellement tenu par la nuit (C8)
+                    results = vector_store.search(query, top_k=3)
                 if results:
                     snippets = []
                     for r in results:

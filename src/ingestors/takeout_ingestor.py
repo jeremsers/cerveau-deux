@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -36,7 +37,7 @@ from src.database.db_manager import (
 )
 from src.database.vector_store import vector_store
 from src.consolidators.drive_compiler import DriveCompiler
-from src.llm.ollama_client import VRAMInsufficientError, llm_client
+from src.llm.ollama_client import VRAMBusyError, VRAMInsufficientError, llm_client
 from src.llm.prompts import (
     PROFILE_SPLIT_MARKER,
     PROMPT_BURST_CLUSTER_SYSTEM,
@@ -349,7 +350,11 @@ def heuristic_burst_topic(queries: List[str], min_votes: int = 2) -> Optional[st
     return best if count >= min_votes else None
 
 
-def classify_burst_clusters(db: DBManager, min_events: int = settings.SEARCH_BURST_MIN_EVENTS) -> int:
+def classify_burst_clusters(
+    db: DBManager,
+    min_events: int = settings.SEARCH_BURST_MIN_EVENTS,
+    use_llm: bool = True,
+) -> int:
     """
     Attribue un semantic_topic aux rafales Search/YouTube qui n'en ont pas (v0.5.3, B11) :
     lots de BURST_LLM_BATCH_SIZE rafales par appel au 12B, puis repli heuristique pour les
@@ -362,7 +367,7 @@ def classify_burst_clusters(db: DBManager, min_events: int = settings.SEARCH_BUR
     logger.info("Classification thématique de %d rafale(s) Search/YouTube...", len(clusters))
 
     resolved: Dict[str, str] = {}
-    if llm_client.is_alive():
+    if use_llm and llm_client.is_alive():
         allowed = _allowed_taxonomy_block()
         try:
             for start in range(0, len(clusters), BURST_LLM_BATCH_SIZE):
@@ -818,6 +823,7 @@ def initialize_meta_and_concepts(
     noise_sessions: List[ReconstructedSession],
     db: DBManager,
     max_distill_sessions: Optional[int] = None,
+    use_local_llm: bool = True,
 ) -> Dict[str, int]:
     """
     Initialise 00_Meta/, assainit l'existant, distille les sessions restantes via l'architecture
@@ -911,10 +917,13 @@ def initialize_meta_and_concepts(
                 pbar.update(1)
         vague1_queue = local_fallback
 
-    if vague1_queue and llm_client.is_alive():
+    if vague1_queue and use_local_llm and llm_client.is_alive():
         llm_client.ensure_local_gguf_models()
     elif vague1_queue:
-        logger.warning("Ollama hors ligne : %d session(s) restent en attente (pending) pour un prochain run.", len(vague1_queue))
+        logger.warning(
+            "Ollama hors ligne ou GPU détenu par un autre processus : %d session(s) restent en attente (pending).",
+            len(vague1_queue),
+        )
         deferred_sessions.extend(vague1_queue)
         vague1_queue = []
 
@@ -922,7 +931,10 @@ def initialize_meta_and_concepts(
     # VAGUE 1 : gemma4:26b-a4b (Thinking ACTIF, num_predict=8192, Prompt Complet)
     # ==========================================================================
     if vague1_queue and llm_client.is_alive():
-        free_gb = llm_client.force_clear_vram()
+        try:
+            free_gb = llm_client.force_clear_vram()
+        except VRAMInsufficientError:
+            free_gb = 0.0
         min_strict = getattr(settings, "VRAM_STRICT_ABORT_FREE_GB", 8.0)
         if free_gb < min_strict:
             # Report sans interrompre le pipeline (B13) : les sessions restent 'pending' et seront
@@ -1196,24 +1208,36 @@ class TakeoutIngestor:
         # 5. Jointure temporelle [-60 min ; +30 min] (sur les sessions qualifiées)
         linked_count = perform_temporal_join(qualified_sessions, self.db)
 
-        # 6. Burst Clustering sur les traces restantes, puis topic de chaque rafale (B11)
-        burst_count = perform_burst_clustering(self.db)
-        bursts_topiced = classify_burst_clusters(self.db)
+        # Session VRAM unique pour toutes les inférences locales du Takeout (C8). Si un autre
+        # processus Exocortex détient le GPU, les rafales passent par le repli heuristique et la
+        # distillation locale est reportée (la voie cloud reste disponible).
+        with ExitStack() as gpu:
+            try:
+                gpu.enter_context(llm_client.vram_session())
+                local_llm = True
+            except VRAMBusyError as exc:
+                logger.warning("%s Inférences locales du Takeout reportées.", exc)
+                local_llm = False
 
-        # 7. Génération des fichiers de staging
-        user_prompts_file, batch_files, web_prompt_file = generate_staging_files(qualified_sessions)
+            # 6. Burst Clustering sur les traces restantes, puis topic de chaque rafale (B11)
+            burst_count = perform_burst_clustering(self.db)
+            bursts_topiced = classify_burst_clusters(self.db, use_llm=local_llm)
 
-        # 7b. Mode cloud_api : profil cognitif automatique tant que le profil est le gabarit (B15)
-        settings.ensure_directories()
-        profile_path = generate_cognitive_profile_cloud(user_prompts_file)
+            # 7. Génération des fichiers de staging
+            user_prompts_file, batch_files, web_prompt_file = generate_staging_files(qualified_sessions)
 
-        # 8. Initialisation de 00_Meta, assainissement existant, distillation Delta et Cold Start épisodique
-        distillation_report = initialize_meta_and_concepts(
-            qualified_sessions,
-            noise_sessions,
-            self.db,
-            max_distill_sessions=max_distill_sessions,
-        )
+            # 7b. Mode cloud_api : profil cognitif automatique tant que le profil est le gabarit (B15)
+            settings.ensure_directories()
+            profile_path = generate_cognitive_profile_cloud(user_prompts_file)
+
+            # 8. Initialisation de 00_Meta, assainissement existant, distillation Delta et Cold Start épisodique
+            distillation_report = initialize_meta_and_concepts(
+                qualified_sessions,
+                noise_sessions,
+                self.db,
+                max_distill_sessions=max_distill_sessions,
+                use_local_llm=local_llm,
+            )
 
         # 9. Synchronisation Vectorielle LanceDB & Compilation Google Drive
         logger.info("--- SYNCHRONISATION VECTORIELLE LANCEDB ---")

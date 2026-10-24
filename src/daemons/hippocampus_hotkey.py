@@ -34,10 +34,13 @@ from src.config import settings
 from src.database.db_manager import DBManager
 from src.database.graph_rag import HybridGraphRAG
 from src.database.vector_store import vector_store
-from src.llm.ollama_client import llm_client
+from src.llm.ollama_client import VRAMBusyError, llm_client
 from src.utils.lifecycle import clear_stop_flag, stop_requested
 
 logger = logging.getLogger("Exocortex.HippocampusHotkey")
+
+# Attente maximale du GPU pour une injection interactive (v0.5.7, C8)
+INTERACTIVE_VRAM_TIMEOUT_SEC = 3.0
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 # Constantes Win32 Virtual Keys
@@ -314,7 +317,14 @@ class HippocampusInjector:
                 winsound.MessageBeep(winsound.MB_ICONHAND)
                 return
 
-            enriched_payload = self.build_enriched_payload(prompt, top_k=5)
+            try:
+                # Le GPU peut être tenu par la consolidation nocturne : attente bornée (C8)
+                with llm_client.vram_session(timeout=INTERACTIVE_VRAM_TIMEOUT_SEC):
+                    enriched_payload = self.build_enriched_payload(prompt, top_k=5)
+            except VRAMBusyError as exc:
+                logger.warning("Injection annulée : %s", exc)
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+                return
 
             if enriched_payload != prompt:
                 simulate_paste_payload(enriched_payload)
@@ -353,7 +363,7 @@ class HippocampusInjector:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Injecteur Pré-Prompt Hippocampe Local (Alt+Espace)")
+    parser = argparse.ArgumentParser(description="Injecteur Pré-Prompt Hippocampe Local (raccourci HIPPOCAMPUS_HOTKEY)")
     parser.add_argument(
         "--test",
         type=str,

@@ -42,7 +42,7 @@ from src.consolidators.kanban_engine import _slugify, build_project_record, kanb
 from src.consolidators.night_consolidator import NightConsolidator
 from src.database.db_manager import DBManager, ProjectRecord
 from src.database.graph_rag import HybridGraphRAG, extract_wikilinks
-from src.llm.ollama_client import HardwareProbe, llm_client
+from src.llm.ollama_client import HardwareProbe, VRAMBusyError, llm_client
 from src.utils.markdown_io import parse_concept_file
 from src.utils.cognitive_metrics import (
     HYPERFOCUS_TUNNEL_MIN_SEC,
@@ -173,6 +173,20 @@ def get_api_token(request: Request) -> Dict[str, str]:
 
 def _get_read_db() -> DBManager:
     return DBManager(read_only=True)
+
+
+_graph_rag_instance: Optional[HybridGraphRAG] = None
+
+
+def _get_graph_rag() -> HybridGraphRAG:
+    """
+    Instance GraphRAG partagée entre requêtes (v0.5.7, C12) : l'index des fiches n'est plus
+    relu et reparsé à chaque recherche, seulement quand 02_Concepts/ change.
+    """
+    global _graph_rag_instance
+    if _graph_rag_instance is None or _graph_rag_instance.concepts_dir != settings.CONCEPTS_DIR:
+        _graph_rag_instance = HybridGraphRAG()
+    return _graph_rag_instance
 
 
 # ==============================================================================
@@ -540,13 +554,16 @@ def search_graphrag(
     Exécute la recherche GraphRAG hybride multi-sauts et formate les nœuds et arêtes
     pour la visualisation de graphe interactive.
     """
-    rag = HybridGraphRAG()
-    results = rag.search_hybrid(
-        query=q,
-        top_k=top_k,
-        neighbor_k=neighbor_k,
-        topic_filter=topic,
-    )
+    try:
+        with llm_client.vram_session(timeout=5.0):
+            results = _get_graph_rag().search_hybrid(
+                query=q,
+                top_k=top_k,
+                neighbor_k=neighbor_k,
+                topic_filter=topic,
+            )
+    except VRAMBusyError as exc:
+        raise HTTPException(status_code=503, detail=f"GPU occupé, réessayez plus tard : {exc}")
 
     primary_nodes = results.get("primary_nodes", [])
     linked_neighbors = results.get("linked_neighbors", [])

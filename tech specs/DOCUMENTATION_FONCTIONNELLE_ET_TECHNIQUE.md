@@ -1,8 +1,8 @@
 # 🧠 DOCUMENTATION TECHNIQUE & FONCTIONNELLE EXHAUSTIVE — EXOCORTEX & TÉLÉMÉTRIE COGNITIVE
 
 **Système :** Exocortex & Télémétrie Cognitive  
-**Version actuelle :** v0.1.4  
-**Date d'audit :** 22 Octobre 2026  
+**Version actuelle :** v0.5.7 (mise à jour suite à l'audit de conformité du 24 octobre 2026)  
+**Date de révision :** 24 Octobre 2026  
 **Environnement cible :** Windows 11 Pro 64-bit, GPU NVIDIA GeForce RTX 4070 Ti Super (16 Go VRAM), CPU Intel Core i7-14700KF, 64 Go RAM DDR5.
 
 ---
@@ -16,11 +16,12 @@
 5. [Module 2 : Démon de Télémétrie Cognitive Temps Réel (0-VRAM)](#5-module-2--démon-de-télémétrie-cognitive-temps-réel)
 6. [Module 3 : Consolidateur Nocturne & Sommeil Paradoxal (3 Passes)](#6-module-3--consolidateur-nocturne--sommeil-paradoxal)
 7. [Module 4 : Compilateur Google Drive (Pont B - Gemini Web App)](#7-module-4--compilateur-google-drive)
-8. [Module 5 : Injecteur Pré-Prompt Hippocampe Local (Pont A - Alt + Espace)](#8-module-5--injecteur-pré-prompt-hippocampe-local)
+8. [Module 5 : Injecteur Pré-Prompt Hippocampe Local (Pont A - Ctrl + Alt + Espace)](#8-module-5--injecteur-pré-prompt-hippocampe-local)
 9. [Module 6 : Dashboard Streamlit "Bandeur de Stats"](#9-module-6--dashboard-streamlit-bandeur-de-stats)
 10. [Moteur LLM Hybride, Modelfiles & Auto-Guérison JSON](#10-moteur-llm-hybride-modelfiles--auto-guérison-json)
 11. [Taxonomie Sémantique Fermée & Règles Anti-Wikipédia](#11-taxonomie-sémantique-fermée--règles-anti-wikipédia)
 12. [Scripts de Pilotage & Déploiement Opérationnel](#12-scripts-de-pilotage--déploiement-opérationnel)
+13. [Modules ajoutés de v0.2 à v0.5.7](#13-modules-ajoutés-de-v02-à-v057)
 
 ---
 
@@ -33,13 +34,13 @@ flowchart TD
     subgraph Saisie ["1. Activité Quotidienne"]
         USER["Utilisateur sur Windows 11"]
         USER -->|"Frappes / Souris / Fenêtres"| M2["Module 2 : Telemetry Daemon\n(0 Mo VRAM, < 2% CPU)"]
-        USER -->|"Prompt Alt + Espace"| M5["Module 5 : Hippocampus Hotkey\n(Injection sémantique instantanée)"]
+        USER -->|"Prompt Ctrl + Alt + Espace"| M5["Module 5 : Hippocampus Hotkey\n(Injection sémantique instantanée)"]
         TAKEOUT["Archives Google Takeout\n(Gemini, YouTube, Search)"] -->|"Cold Start / Import"| M1["Module 1 : Takeout Ingestor\n(Sessionisation & Distillation Delta)"]
     end
 
     subgraph Stockage ["2. Persistance Locale & Tampons"]
-        M2 -->|"Dwell Time >= 20s"| SQLITE[("SQLite WAL : telemetry.db\n(5 tables relationnelles)")]
-        M1 -->|"480 Sessions / 6 649 Msgs\n73 153 Empreintes"| SQLITE
+        M2 -->|"Dwell Time >= 20s"| SQLITE[("SQLite WAL : telemetry.db\n(7 tables relationnelles)")]
+        M1 -->|"Sessions, messages\net empreintes Search/YouTube"| SQLITE
         M2 -.->|"Hyperfocus >= 180s\n(dHash anti-doublon)"| STAGING["_System_Buffer/screen_staging/\n(Captures .webp qualité 75)"]
     end
 
@@ -56,14 +57,14 @@ flowchart TD
         M4 --> GEMINI_WEB["Gemini Web App (Pont B)"]
         VAULT & BGEM3 --> M5
         SQLITE --> M5
-        SQLITE & VAULT --> M6["Module 6 : Dashboard Streamlit\n'Bandeur de Stats' (Mode Read-Only)"]
+        SQLITE & VAULT --> M6["Command Center Web (FastAPI :8500)\n+ Dashboard Streamlit secondaire"]
     end
 ```
 
 ### Principes Directeurs
 1. **Zéro perturbation en temps réel :** Le démon de capture d'écran et d'activité n'effectue aucun calcul LLM lourd pendant les heures de travail. Son empreinte mémoire est nulle sur le GPU (0 Mo VRAM) et minime sur le processeur (< 2 % CPU).
 2. **Exclusion mutuelle stricte VRAM :** Les modèles d'inférence (Vision 12B, Synthèse 26B, Embedding BGE-M3) ne sont jamais chargés simultanément sur la RTX 4070 Ti Super (16 Go VRAM).
-3. **Souveraineté des données :** L'intégralité du traitement s'exécute sur le matériel local. Aucune donnée privée n'est envoyée dans le cloud par défaut.
+3. **Souveraineté des données :** L'intégralité du traitement s'exécute sur le matériel local. Ne sortent de la machine que les 4 méga-documents de `Google_Drive_Sync/` si ce dossier est synchronisé (catégories sensibles exclues), et les sessions envoyées à Gemini en mode `cloud_api`.
 4. **Anti-Wikipédia absolu :** Les fiches de connaissances capitalisent les décisions, architectures et commandes réelles testées par l'utilisateur, excluant toute paraphrase encyclopédique générique.
 
 ---
@@ -75,19 +76,22 @@ Le système est dimensionné pour tirer parti d'une carte graphique **NVIDIA GeF
 ### Contraintes Matérielles sous Windows 11
 - **Réservation de l'OS (WDDM / DWM) :** Sous Windows 11, le système d'exploitation et le gestionnaire de fenêtres (Desktop Window Manager) préemptent en permanence entre **1,8 Go et 2,4 Go de VRAM**, laissant environ **13,6 Go à 14,2 Go** réellement exploitables.
 - **Seuils d'arbitrage de la VRAM (`src/config.py`) :**
-  - `FULL_DUAL_MODEL_VRAM_GB = 12.8` : Seuil en deçà duquel le système refuse de charger le modèle lourd 26B et bascule automatiquement sur le modèle 12B.
-  - `MIN_FREE_VRAM_GB = 8.0` : Seuil critique d'avortement. Si moins de 8 Go sont libres au repos, aucune inférence lourde n'est lancée pour prévenir tout plantage CUDA Out Of Memory (OOM).
+  - `VRAM_REASONING_MIN_FREE_GB = 12.8` (ancien nom `FULL_DUAL_MODEL_VRAM_GB`) : Seuil en deçà duquel le système refuse de charger le modèle lourd 26B et bascule automatiquement sur le modèle 12B.
+  - `VRAM_STRICT_ABORT_FREE_GB = 8.0` (ancien nom `MIN_FREE_VRAM_GB`) : Seuil critique. Sous 8 Go libres, aucune inférence n'est lancée ; la consolidation nocturne bascule en mode CPU (métriques, journaux et Drive produits, synthèses LLM reportées).
 
 ### Mécanismes de Gestion VRAM (`src/llm/ollama_client.py`)
 1. **Sonde matérielle dynamique (`HardwareProbe`) :**
    - Interroge prioritairement les compteurs bas niveau NVML via `pynvml`.
    - Repli transparent sur `nvidia-smi --query-gpu=memory.free,memory.total` en cas d'indisponibilité de NVML.
+   - Si aucune sonde ne répond, la VRAM est supposée nulle (`VRAM_ASSUME_FREE_GB = 0`) : abstention plutôt que chargement à l'aveugle.
 2. **Purge active & déchargement forcé (`force_clear_vram`) :**
-   - Interroge l'API `http://localhost:11434/api/ps` d'Ollama pour lister tous les modèles actifs résidant en VRAM.
-   - Envoie une requête de déchargement explicite avec `keep_alive = 0` pour chaque modèle détecté.
-   - Force un `gc.collect()` et vide le cache CUDA PyTorch si disponible.
+   - Interroge l'API `http://localhost:11434/api/ps` d'Ollama pour lister les modèles résidant en VRAM.
+   - Envoie une requête de déchargement explicite avec `keep_alive = 0` pour chaque modèle **de l'Exocortex** (12B, 26B, bge-m3) ; les modèles d'autres outils utilisant le même serveur ne sont pas touchés.
+   - Aucune mémoire n'est gérée côté Python : la VRAM appartient au processus Ollama.
 3. **Politique d'exclusion mutuelle :**
    - Lors de la transition entre la Passe 1 (Vision 12B), la Passe 2 (Synthèse 26B) et la Passe 3 (BGE-M3), la mémoire GPU est systématiquement réinitialisée à zéro.
+   - **Entre processus**, un verrou fichier (`_System_Buffer/vram.lock`) garantit qu'un seul processus Exocortex (nuit, ingestion, API, injecteur, MCP) utilise le GPU à la fois. Les traitements par lots le détiennent pour toute leur durée ; les appels interactifs attendent au plus quelques secondes.
+4. **Configuration du serveur Ollama :** `OLLAMA_FLASH_ATTENTION`, `OLLAMA_KV_CACHE_TYPE=q8_0`, `OLLAMA_MAX_LOADED_MODELS=1` et `OLLAMA_NUM_PARALLEL=1` doivent être définis au niveau utilisateur (`setx`) puis Ollama redémarré ; `--init-models` vérifie l'environnement réel du processus serveur.
 
 ---
 
@@ -360,26 +364,27 @@ Vault_Data/Google_Drive_Sync/
 
 ## 8. MODULE 5 : INJECTEUR PRÉ-PROMPT HIPPOCAMPE LOCAL
 
-Le Module 5 (`src/daemons/hippocampus_hotkey.py`) matérialise le **Pont A** : un pont sémantique en temps réel accessible depuis n'importe quelle application Windows via le raccourci global **`Alt + Espace`**.
+Le Module 5 (`src/daemons/hippocampus_hotkey.py`) matérialise le **Pont A** : un pont sémantique en temps réel accessible depuis n'importe quelle application Windows via le raccourci global **`Ctrl + Alt + Espace`** (configurable par `HIPPOCAMPUS_HOTKEY` ; `Alt + Espace` entrait en conflit avec le menu système des fenêtres).
 
 ```mermaid
 flowchart LR
-    A["Utilisateur saisit son prompt\n(Navigateur / VS Code / Terminal)"] --> B["Raccourci Alt + Espace"]
+    A["Utilisateur saisit son prompt\n(Navigateur / VS Code / Terminal)"] --> B["Raccourci Ctrl + Alt + Espace"]
     B --> C["Win32 keybd_event\n(Ctrl+A -> Ctrl+C)"]
     C --> D["Capture Presse-papier (pyperclip)"]
     D --> E["Interrogation Vectorielle LanceDB\n(k-NN top_k = 5 via bge-m3)"]
     E --> F["Interrogation SQLite\n(Cumul heures + antériorité)"]
     F --> G["Construction du bloc structuré\n<contexte_hippocampe_local>"]
     G --> H["Réinjection Presse-papier (Ctrl+V)"]
-    H --> I["Notification sonore winsound\n(Bip aigu 1200 Hz = Succès)"]
+    H --> I["Notification sonore winsound\n(MessageBeep système)"]
 ```
 
 ### Fonctionnement Interne Détaillé
 1. **Écoute globale ultra-légère :**
    - Utilise `pynput.keyboard` pour écouter la combinaison de touches.
+   - Le callback du hook clavier ne fait que déléguer le travail à un thread dédié : Windows retire silencieusement un hook trop lent.
    - Empreinte au repos : **0 Mo VRAM, 0 % CPU**.
 2. **Capture non intrusive du texte actif :**
-   - Simule le relâchement propre de la touche Alt, puis enchaîne `Ctrl + A` (sélectionner tout) et `Ctrl + C` (copier).
+   - Simule le relâchement propre des touches du raccourci, puis enchaîne `Ctrl + A` (sélectionner tout) et `Ctrl + C` (copier).
 3. **Résolution k-NN & Télémétrie :**
    - Interroge LanceDB sur le prompt capturé pour extraire les 5 fiches conceptuelles les plus proches (similarité cosinus).
    - Décharge immédiatement le modèle d'embedding.
@@ -404,19 +409,19 @@ flowchart LR
    ```
    - Place le texte combiné dans le presse-papier et simule `Ctrl + V` pour remplacer la sélection.
 5. **Retour Haptique / Sonore :**
-   - Un signal sonore discret (`winsound.Beep(1200, 80)`) confirme l'injection sans obliger l'utilisateur à quitter des yeux son écran.
+   - Un son système discret (`winsound.MessageBeep`) confirme l'injection (ou signale un échec, par exemple GPU occupé par la consolidation) sans quitter l'écran des yeux. Le DriftGuard, lui, émet un double bip à 600 Hz.
 
 ---
 
 ## 9. MODULE 6 : DASHBOARD STREAMLIT "BANDEUR DE STATS"
 
-Le Module 6 (`src/dashboard/app.py`) est l'interface analytique de l'Exocortex. Il est conçu pour les passionnés d'auto-quantification cognitive (*Quantified Self*).
+Le Module 6 (`src/dashboard/app.py`) est l'interface analytique historique. Depuis v0.5.0, l'interface principale est le Command Center Web (section 13) ; Streamlit reste disponible (`--dashboard`) et partage avec lui les mêmes requêtes, vocabulaires et calculs (tunnels, drift, diagnostic circadien).
 
 ### Sécurité & Concurrence
-- Interroge `telemetry.db` en **lecture seule stricte** via le protocole SQLite URI : `file:telemetry.db?mode=ro`.
-- Ne crée aucun verrou en écriture, permettant au démon de télémétrie de continuer à insérer ses données en temps réel sans blocage.
+- Les requêtes analytiques passent par des connexions SQLite en lecture seule (`mode=ro`), sans verrou en écriture : le démon continue d'insérer en temps réel.
+- L'onglet Kanban, lui, **écrit** dans la base (projets, tâches) et dans `03_Kanban_Specs/`.
 
-### Les 5 Onglets du Dashboard
+### Les Onglets du Dashboard
 
 | Onglet | Fonctionnalités Clés & Visualisations |
 |---|---|
@@ -424,8 +429,8 @@ Le Module 6 (`src/dashboard/app.py`) est l'interface analytique de l'Exocortex. 
 | **1. Chronologie & Focus** | - Sélecteur de date journalière.<br>- Diagramme de Gantt interactif minute par minute (Plotly Timeline).<br>- Bannière d'alerte identifiant le tunnel d'hyperfocus maximal de la journée.<br>- Tableau détaillé des fenêtres consultées avec durée, mode cognitif et niveau d'input. |
 | **2. Cartographie des Obsessions** | - **Treemap hiérarchique Plotly** à 3 niveaux : `Mode Cognitif` $\rightarrow$ `Topic Sémantique` $\rightarrow$ `Application`.<br>- Camembert de répartition des modes cognitifs (*production*, *exploration*, *media*, etc.).<br>- Classement tabulaire du Top 5 des applications les plus utilisées. |
 | **3. Archéologie Longitudinale** | - Graphique en aires empilées de l'évolution mensuelle des centres d'intérêt sur 2024-2026.<br>- **Matrice de Pérennité Cognitive :** Catégorise chaque sujet selon sa demi-vie :<br>  - 🏛️ *Pilier Fondamental* (durée > 180j, $\ge 15$ sessions)<br>  - ⚡ *Passion Éphémère* (durée < 45j, $\ge 5$ sessions)<br>  - 🌱 *Sujet Émergent* (récent < 30j)<br>  - 🔄 *Intérêt Intermittent*. |
-| **4. Rythmes Circadiens** | - **Heatmap d'activité 24h $\times$ 7j** visualisant les plages horaires d'hyperfocus.<br>- Graphique par quadrants horaires (Nuit, Matin, Après-Midi, Soirée).<br>- **Diagnostic Chronobiologique :** Calcul de l'Index Nocturne et détection du chronotype (ex: *Chronotype du Loup / Chouette Nocturne*). |
-| **5. Explorateur Épistémique & Empreintes** | - **Volet A (Recherche Gemini) :** Recherche plein texte dans les 6 649 messages et 480 sessions, filtres par topic et statut de distillation, aperçu direct des fiches Markdown associées dans `02_Concepts/`, et expander des tours de conversation complets.<br>- **Volet B (Archéologie des Empreintes) :** Bandeau des 73 153 empreintes, graphique horizontal du Top 15 des chaînes YouTube et domaines web consultés, détection des *Burst Clusters* denses, et table de recherche avec filtres croisés. |
+| **4. Rythmes Circadiens** | - **Heatmap d'activité 24h $\times$ 7j** visualisant les plages horaires d'hyperfocus.<br>- Graphique par quadrants horaires (Nuit, Matin, Après-Midi, Soirée).<br>- **Diagnostic Chronobiologique :** Index nocturne et profil déduit des données (un quadrant horaire est dominant s'il réunit au moins 40 % des horodatages). |
+| **5. Explorateur Épistémique & Empreintes** | - **Volet A (Recherche Gemini) :** Recherche plein texte dans les sessions et messages, filtres par topic et statut de distillation (`success`, `pending`, `misc_noise`, `failed_fallback`), aperçu direct des fiches Markdown associées dans `02_Concepts/`, et expander des tours de conversation complets.<br>- **Volet B (Archéologie des Empreintes) :** Bandeau des volumes d'empreintes, graphique horizontal du Top 15 des chaînes YouTube et domaines web consultés, détection des *Burst Clusters* denses, et table de recherche avec filtres croisés. |
 
 ---
 
@@ -439,8 +444,10 @@ La méthode `ensure_local_gguf_models()` inspecte le dossier `./models/` et conf
 2. `./models/gemma-4-26b-a4b-it-UD-IQ4_NL.gguf` $\rightarrow$ `gemma4:26b-a4b`
 
 Elle génère à la volée un `Modelfile` optimisé intégrant :
-- `PARAMETER num_ctx 16384` : Fenêtre de contexte étendue indispensable pour l'analyse des sessions longues.
-- `PARAMETER stop "<|thought|>"` / `PARAMETER stop "<|/thought|>"` selon les modes.
+- `PARAMETER num_ctx` = `OLLAMA_NUM_CTX` (16384) : fenêtre de contexte, également envoyée à **chaque** requête pour éviter les rechargements dus à un `num_ctx` variable.
+- Le gabarit de conversation Gemma (`<start_of_turn>` / `<end_of_turn>`) et ses balises d'arrêt.
+
+Le provisioning passe par la CLI `ollama create -f Modelfile` (format stable entre versions) ; l'API `/api/create` n'est qu'un repli si la CLI est absente. Le mode thinking est demandé explicitement (`think: true`) quand Ollama déclare la capacité `thinking` du modèle ; la Passe vision est ignorée (captures libérées) si le modèle ne déclare pas la capacité `vision`.
 
 ### B. Inférence Structurée Pydantic v2 & Grammaire JSON Schema
 La méthode `generate_structured()` utilise les grammaires formelles d'Ollama (`format=schema.model_json_schema()`) pour contraindre l'espace d'échantillonnage des tokens du LLM et garantir la conformité typologique des réponses.
@@ -493,11 +500,11 @@ Tous les prompts de distillation et de synthèse imposent l'invariant strict sui
 
 ### Lanceurs Silencieux Windows
 - **`start_exocortex.bat` :**
-  - Lance en tâche de fond le démon de télémétrie via `pythonw.exe` (sans console résiduelle).
-  - Lance en tâche de fond l'injecteur `Alt + Espace` via `pythonw.exe`.
-  - Lance le serveur Streamlit du Dashboard et ouvre la page dans le navigateur par défaut.
+  - Vérifie la configuration du serveur Ollama et provisionne les modèles (`--init-models`).
+  - Lance en tâche de fond le démon de télémétrie et l'injecteur Hippocampe via `pythonw.exe`.
+  - Lance le Command Center Web (`--web`) et l'ouvre dans le navigateur.
 - **`stop_exocortex.bat` :**
-  - Termine proprement tous les processus `pythonw.exe` et l'instance Streamlit associés au projet.
+  - Appelle `run_exocortex.py --stop` : les démons reçoivent un signal (fichier `stop_daemons.flag`), sauvegardent la fenêtre en cours et s'arrêtent ; le serveur web et Streamlit sont ensuite arrêtés. Plus de dépendance à `wmic`.
 
 ### Commandes CLI Unifiées (`run_exocortex.py`)
 
@@ -514,7 +521,7 @@ python run_exocortex.py --consolidate --date 2026-10-21
 # Compiler et synchroniser les 4 méga-documents Google Drive
 python run_exocortex.py --compile-drive
 
-# Lancer l'injecteur pré-prompt Alt+Espace
+# Lancer l'injecteur Hippocampe (Ctrl+Alt+Espace)
 python run_exocortex.py --hotkey
 
 # Ouvrir le Dashboard Streamlit "Bandeur de Stats"
@@ -523,12 +530,31 @@ python run_exocortex.py --dashboard
 # Ingestion complète ou incrémentale d'un dossier Takeout
 python run_exocortex.py --ingest-takeout
 
-# Démarrer l'ensemble de la suite (démons + dashboard)
+# Démarrer l'ensemble de la suite (démons + Command Center Web)
 python run_exocortex.py --all
+
+# Arrêter proprement démons, serveur web et dashboard
+python run_exocortex.py --stop
 ```
 
-### Validation & Assurance Qualité
-La robustesse du système est vérifiée par les suites de tests unitaires et d'intégration :
-- `pytest tests/test_v014_verification.py` : Valide à 100 % l'anti-collision de slug, l'exclusion VRAM, les requêtes du Dashboard et les schémas Pydantic.
-- `python tests/test_v013_verification.py` : Valide la déduplication SQLite, la préservation du thinking et l'assainissement in-place.
+La liste complète des commandes (Kanban, MCP, vocal, défragmentation, import du profil) figure dans le README.
 
+### Validation & Assurance Qualité
+La robustesse du système est vérifiée par une suite par version (`tests/test_vXYZ_*.py`), lancée par `python -m pytest tests`.
+La suite est hermétique : `tests/conftest.py` redirige coffre, base, Takeout, Ollama et clé Gemini vers des valeurs de test avant tout import, et refuse de démarrer si la configuration pointe vers le vrai coffre.
+
+---
+
+## 13. MODULES AJOUTÉS DE v0.2 À v0.5.7
+
+| Version | Module | Rôle |
+|---|---|---|
+| v0.2.0 | Kanban exécutif (`kanban_engine.py`) | Projets et tâches en base, context-pack pour Gemini Web, ingestion des specs, `AGENT_QUEUE.md`. |
+| v0.2.2 | GraphRAG hybride (`graph_rag.py`) et serveur MCP | k-NN LanceDB (Hop 0) + wikilinks (Hop 1) + traces SQLite ; 5 outils MCP sur stdio. |
+| v0.3.0 | Bootloader et DriftGuard | Point de reprise du lendemain et open loops ; alertes de zapping et de dérive média après un tunnel de production. |
+| v0.3.5 | Sonde Git/IDE et extension navigateur | Dépôt et branche de l'IDE actif ; onglets actifs et tours de chat IA capturés via le récepteur local 8502 (jeton). |
+| v0.4.0 | Ingestion vocale et défragmenteur | Mémos de `voice_inbox/` transcrits sur CPU et distillés ; fusion des fiches redondantes et callouts d'évolution d'arbitrage. |
+| v0.5.0 | Command Center Web | API FastAPI (port 8500) et interface web en 6 vues ; remplace Streamlit comme interface principale. |
+| v0.5.1 → v0.5.7 | Remédiation de l'audit | Intégrité des données, sécurité réseau (CORS, jeton, CSP), fonctions rétablies (vocal, rafales, profil, mode CPU), contrats d'interface, exactitude des métriques, robustesse des démons, verrou VRAM inter-processus. Détail dans `tech specs/0.5.x/changelog_0.5.x.md`. |
+
+Base SQLite à 7 tables : `raw_activity`, `daily_metrics`, `chat_sessions`, `chat_messages`, `historical_footprints`, `projects`, `kanban_tasks` (schéma versionné par `PRAGMA user_version`).

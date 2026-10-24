@@ -79,7 +79,7 @@ class HybridGraphRAG:
         self.concepts_dir = concepts_dir or settings.CONCEPTS_DIR
         self._concept_index: Dict[str, Path] = {}
         self._concept_metadata: Dict[str, Dict[str, Any]] = {}
-        self._last_index_scan = 0.0
+        self._last_index_scan: Any = None
 
     def refresh_index(self, force: bool = False) -> int:
         """
@@ -93,15 +93,15 @@ class HybridGraphRAG:
             return 0
 
         # Vérification simple de modification pour éviter de réindexer inutilement
+        # Signature (mtime le plus récent, nombre de fiches) : une suppression ou une fusion
+        # invalide aussi l'index (v0.5.7, C12)
         try:
-            latest_mtime = max(
-                (f.stat().st_mtime for f in target_dir.glob("*.md")),
-                default=0.0,
-            )
+            files = list(target_dir.glob("*.md"))
+            signature = (max((f.stat().st_mtime for f in files), default=0.0), len(files))
         except Exception:
-            latest_mtime = 0.0
+            signature = (0.0, 0)
 
-        if not force and self._concept_index and latest_mtime <= self._last_index_scan:
+        if not force and self._concept_index and signature == self._last_index_scan:
             return len(self._concept_index)
 
         index_map: Dict[str, Path] = {}
@@ -118,6 +118,8 @@ class HybridGraphRAG:
                 note = parse_concept_file(p)
                 title = note.frontmatter.title.strip() if note.frontmatter.title else slug
                 index_map[title.lower()] = p
+                for alias in (note.frontmatter.model_extra or {}).get("aliases") or []:
+                    index_map.setdefault(str(alias).strip().lower(), p)
 
                 meta_map[slug.lower()] = {
                     "slug": slug,
@@ -142,7 +144,7 @@ class HybridGraphRAG:
 
         self._concept_index = index_map
         self._concept_metadata = meta_map
-        self._last_index_scan = latest_mtime
+        self._last_index_scan = signature
         return len(self._concept_index)
 
     def resolve_wikilink_to_path(self, target: str) -> Optional[Path]:

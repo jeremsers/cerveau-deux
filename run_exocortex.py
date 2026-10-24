@@ -4,7 +4,7 @@ Point d'entrée unique pour piloter l'ensemble des modules du système :
 - Démon de télémétrie temps réel Win32 (Module 2)
 - Consolidateur nocturne bi-modèle (Module 3)
 - Compilateur Google Drive (Module 4)
-- Injecteur de contexte local Alt+Espace (Module 5)
+- Injecteur de contexte local Hippocampe, Ctrl+Alt+Espace par défaut (Module 5)
 - Dashboard analytique Streamlit "Bandeur de Stats" (Module 6)
 """
 
@@ -42,6 +42,13 @@ def run_init_models() -> None:
     """Provisionne les modèles GGUF locaux de ./models/ dans Ollama avec limitation num_ctx."""
     logger.info("=== Initialisation & Provisioning des Modèles GGUF Locaux ===")
     from src.llm.ollama_client import llm_client
+
+    # Le budget VRAM suppose un cache KV quantifié côté SERVEUR Ollama (C1)
+    server = llm_client.check_ollama_server_config()
+    if not server["found"]:
+        logger.info("Processus serveur Ollama introuvable : configuration non vérifiable.")
+    elif not server["missing"]:
+        logger.info("Configuration du serveur Ollama conforme (flash attention, cache KV q8_0, 1 modèle).")
 
     status = llm_client.ensure_local_gguf_models()
     logger.info("Statut du provisioning des modèles : %s", status)

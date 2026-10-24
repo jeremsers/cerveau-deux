@@ -1,204 +1,170 @@
 # 🧠 Exocortex & Télémétrie Cognitive
 
-Architecture d'hippocampe artificiel local et de quantification cognitive temps réel pour Windows 11, optimisée pour GPU **NVIDIA RTX 4070 Ti Super (16 Go VRAM)**.
+Architecture d'hippocampe artificiel local et de quantification cognitive pour Windows 11, optimisée pour GPU **NVIDIA RTX 4070 Ti Super (16 Go VRAM)**. Version courante : **0.5.7**.
 
-Le système observe l'activité de l'utilisateur sans keylogging, consolide la mémoire par cycles de sommeil paradoxal bi-modèle (Gemma 4 & BGE-M3), indexe les concepts dans une base vectorielle embarquée (**LanceDB**), et établit un pont bidirectionnel avec l'interface Gemini Web App (via synchronisation Google Drive et injection pré-prompt globale `Alt + Espace`).
-
----
-
-## 📐 Invariants d'Ingénierie & Architecture Système
-
-```
-                                  +--------------------------------------------------+
-                                  |                 UTILISATEUR                      |
-                                  +--------------------------------------------------+
-                                       |                                         |
-                       [Activité OS]   |                                         | [Alt + Espace]
-                                       v                                         v
-               +----------------------------------+             +----------------------------------+
-               |  Module 2 : Telemetry Daemon     |             | Module 5 : Hippocampus Injector  |
-               |  (Win32, 0 Mo VRAM, < 2% CPU)    |             | (pynput, LanceDB k-NN top_k=5)   |
-               +----------------------------------+             +----------------------------------+
-                                       |                                         |
-                                       v                                         v
-               +----------------------------------+             +----------------------------------+
-               |     SQLite WAL (telemetry.db)    | <---------- | Gemini Web App (Input Prompt)    |
-               | (raw_activity, daily_metrics...) |             +----------------------------------+
-               +----------------------------------+
-                                       |
-                     [Traitement Nocturne Différé]
-                                       v
-               +-----------------------------------------------------------------+
-               |              Module 3 : Night Consolidator                      |
-               |  - Passe 1 (gemma4:12b) : Vision .webp + Classification         |
-               |  - Analytique : Détection Tunnels d'Hyperfocus & Métriques      |
-               |  - Passe 2 (gemma4:26b-a4b) : Synthèse Épisodique & Concepts     |
-               |  - Passe 3 (bge-m3) : Vectorisation & Indexation LanceDB        |
-               +-----------------------------------------------------------------+
-                                       |
-                       +---------------+---------------+
-                       |                               |
-                       v                               v
-       +-------------------------------+   +-------------------------------------+
-       |   Coffre Markdown (Vault)     |   | Module 4 : Drive Compiler           |
-       | 01_Episodique/ / 02_Concepts/ |   | 4 Méga-fichiers (Google Drive Sync) |
-       +-------------------------------+   +-------------------------------------+
-                       |
-                       v
-       +-----------------------------------------------+
-       | Module 6 : Dashboard Streamlit "Bandeur de Stats" |
-       | (Timeline Gantt, Treemap, Archéologie, Circadien)|
-       +-----------------------------------------------+
-```
-
-### 1. Zéro Empreinte Temps Réel (0 Mo VRAM, CPU < 2%)
-- Le démon de télémétrie (`telemetry_daemon.py`) n'exécute **aucune inférence locale** pendant la session de travail.
-- Utilise l'API Windows native (`GetLastInputInfo`) pour quantifier l'intensité motrice sans enregistrer les frappes.
-- Seuil d'engagement (*Dwell Time*) : les fenêtres quittées en moins de 20 secondes sont ignorées.
-- Capture d'écran différée en `.webp` (qualité 75) uniquement après 180s de concentration continue sur un même écran avec filtre de redondance perceptuel (`dHash` 64-bit).
-
-### 2. Sommeil Paradoxal en 3 Passes VRAM Mutuellement Exclusives
-- Les modèles ne cohabitent jamais en VRAM (`HardwareProbe` via NVML / `nvidia-smi` avec déchargement forcé `keep_alive=0`) :
-  - **Passe 1 (`gemma4:12b`)** : Analyse visuelle des captures `.webp`, extraction du résumé visuel, suppression immédiate des `.webp` et classification sémantique fermée.
-  - **Calcul Analytique** : Détection des tunnels d'hyperfocus (tolérance micro-interruptions < 120s) et calcul de la fragmentation (`context_switches_per_hour`).
-  - **Passe 2 (`gemma4:26b-a4b` ou fallback `12b`)** : Rédaction du journal `01_Episodique/YYYY-MM-DD.md` et mise à jour chirurgicale des fiches `02_Concepts/` pour les sujets cumulant $\ge 45$ min de focus.
-  - **Passe 3 (`bge-m3`)** : Vectorisation et indexation k-NN dans LanceDB (`_System_Buffer/lancedb_store/`).
-
-### 3. Non-Pollution du Coffre & Séparation Épistémique
-- Les historiques YouTube et Google Search alimentent `historical_footprints` mais ne créent jamais de fiches autonomes dans `02_Concepts/`.
-- Les notes Markdown ne contiennent aucune paraphrase encyclopédique Wikipédia : uniquement la substance intellectuelle et les arbitrages de l'utilisateur. La télémétrie et le graphe sont isolés dans des callouts Obsidian repliables (`> [!abstract]-`).
+Le système observe l'activité de l'utilisateur sans keylogging, consolide la mémoire par cycles de sommeil paradoxal bi-modèle (Gemma 4 12B/26B et BGE-M3 via Ollama), indexe les concepts dans une base vectorielle embarquée (**LanceDB**), et relie ce coffre aux outils du quotidien : injection pré-prompt par raccourci global, synchronisation Google Drive pour Gemini Web, serveur MCP pour les agents, Kanban de spécifications, Command Center web.
 
 ---
 
-## 📁 Arborescence du Projet
+## 📐 Architecture
+
+```
+  Activité OS ──► Démon de télémétrie (Win32, 0 Mo VRAM) ──┐
+  Navigateur  ──► Extension MV3 ──► Récepteur 127.0.0.1:8502 ┤
+  Mémos audio ──► voice_inbox/                               ├──► SQLite WAL (7 tables)
+  Google Takeout ──► Ingesteur (Gemini, Search, YouTube) ────┘          │
+                                                                       ▼
+                     Consolidation nocturne (verrou VRAM unique, un modèle à la fois)
+                     Passe 0 vocal · Passe 1 vision + classification (12B)
+                     Métriques & tunnels · Passe 2 journaux + fiches (26B/12B)
+                     Passe 3 index LanceDB (bge-m3) · Défragmenteur (Sommeil Profond)
+                                                                       │
+            ┌────────────────────────────┬─────────────────────────────┼────────────────────────┐
+            ▼                            ▼                             ▼                        ▼
+   Coffre Obsidian (Vault_Data)   Google_Drive_Sync (4 docs)   Command Center Web :8500   Serveur MCP (stdio)
+   01_Episodique · 02_Concepts    → Gemini Web App             (+ Streamlit secondaire)   → agents codeurs
+   03_Kanban_Specs                                              Kanban · GraphRAG
+            ▲
+   Injecteur Hippocampe (Ctrl+Alt+Espace) : k-NN LanceDB + wikilinks + télémétrie SQLite
+```
+
+### Invariants
+- **0 Mo VRAM au repos, un seul modèle à la fois** : déchargement `keep_alive=0` et verrou VRAM **inter-processus** (`_System_Buffer/vram.lock`) partagé par la nuit, l'ingestion, l'API, l'injecteur et le MCP. Sous 8 Go libres (jeu lancé), la nuit tourne en mode CPU et les synthèses LLM sont reportées.
+- **Démon sans inférence** : `GetLastInputInfo` pour l'intensité de saisie, dwell time de 20 s, fenêtre close après 5 min sans saisie (60 min en lecture média), écran verrouillé ignoré, capture `.webp` différée après 180 s (dHash anti-doublon).
+- **Coffre sans pollution** : historiques YouTube/Search en base uniquement ; corps de fiches sans paraphrase encyclopédique ; télémétrie isolée dans le callout `> [!abstract]-` ; écritures atomiques.
+- **Aucune perte silencieuse** : migrations SQLite versionnées (`PRAGMA user_version`), fiches douteuses déplacées dans `02_Concepts/_Quarantine/`, fusions archivées dans `_Archive_Merged/`.
+
+---
+
+## 📁 Arborescence
 
 ```text
 cerveau-deux/
-├── .env                              # Clés API, chemins et modèles configurés
-├── requirements.txt                  # Dépendances Python typées et figées
-├── run_exocortex.py                  # Point d'entrée CLI unifié
-├── start_exocortex.bat               # Lanceur silencieux Windows (pythonw + Streamlit)
-├── stop_exocortex.bat                # Arrêt propre des démons d'arrière-plan
-├── SPECIFICATIONS_TECHNIQUES.md     # Spécifications d'architecture
+├── run_exocortex.py                 # Point d'entrée CLI unifié
+├── start_exocortex.bat              # Démons silencieux + Command Center Web
+├── start_web_center.bat             # Command Center Web seul
+├── stop_exocortex.bat               # Arrêt propre (démons, serveur web, Streamlit)
+├── requirements.txt · .env.example
+├── browser_extension/               # Extension Chrome/Edge MV3 (onglets actifs, chats IA)
 ├── src/
-│   ├── config.py                     # Configuration Pydantic v2 & validation d'environnement
-│   ├── consolidators/
-│   │   ├── drive_compiler.py         # Module 4 : Générateur des 4 méga-fichiers Google Drive
-│   │   └── night_consolidator.py     # Module 3 : Sommeil paradoxal en 3 passes VRAM
-│   ├── daemons/
-│   │   ├── hippocampus_hotkey.py     # Module 5 : Injecteur pré-prompt Alt+Espace (LanceDB + SQLite)
-│   │   └── telemetry_daemon.py       # Module 2 : Capteur Win32 bas niveau (0 Mo VRAM)
-│   ├── dashboard/
-│   │   └── app.py                    # Module 6 : Tableau de bord Streamlit "Bandeur de Stats"
-│   ├── database/
-│   │   ├── db_manager.py             # SQLite WAL haute performance (4 tables relationnelles)
-│   │   └── vector_store.py           # Base vectorielle LanceDB + wrapper BGE-M3
-│   ├── ingestors/
-│   │   └── takeout_ingestor.py       # Module 1 : Parseur Takeout Gemini, Search & YouTube
-│   └── llm/
-│       ├── ollama_client.py          # Client hybride Ollama/Google GenAI + sonde VRAM
-│       └── prompts.py                # Prompts système anti-Wikipédia et gabarits Markdown
-└── Vault_Data/                       # Coffre Obsidian & Données persistantes
-    ├── 00_Meta/                      # Profil_Cognitif.md & Taxonomie_Tags.md
-    ├── 01_Episodique/                # Journaux quotidiens YYYY-MM-DD.md
-    ├── 02_Concepts/                  # Fiches conceptuelles atomiques
-    ├── Google_Drive_Sync/            # 4 méga-fichiers synchronisés vers Gemini Web App
-    └── _System_Buffer/               # telemetry.db (SQLite WAL), lancedb_store, screen_staging
+│   ├── config.py                    # Réglages Pydantic, taxonomie fermée, vocabulaires partagés
+│   ├── api/server.py                # API FastAPI + service du Command Center
+│   ├── web_gui/                     # Interface web (index.html, app.js, vendor/)
+│   ├── dashboard/app.py             # Dashboard Streamlit (interface secondaire)
+│   ├── consolidators/               # night_consolidator, drive_compiler, vault_doctor,
+│   │                                #   graph_defragmenter, kanban_engine
+│   ├── daemons/                     # telemetry_daemon, browser_telemetry_receiver,
+│   │                                #   git_ide_probe, hippocampus_hotkey
+│   ├── database/                    # db_manager (SQLite), vector_store (LanceDB), graph_rag
+│   ├── ingestors/                   # takeout_ingestor, takeout_parsers, voice_ingestor
+│   ├── llm/                         # ollama_client (sonde VRAM, verrou, Gemini), prompts
+│   ├── mcp/exocortex_mcp_server.py  # 5 outils MCP (FastMCP ou JSON-RPC autonome)
+│   └── utils/                       # markdown_io, episodic_journal, cognitive_metrics, privacy,
+│                                    #   local_auth, path_safety, atomic_io, lifecycle
+├── tests/                           # Suites de vérification hermétiques (v0.1.2 → v0.5.7)
+├── tech specs/                      # Spécifications et changelogs par version
+└── Vault_Data/                      # Coffre Obsidian et données persistantes (hors Git)
+    ├── 00_Meta/                     # Profil_Cognitif.md, Taxonomie_Tags.md, bootloader, registre du bruit
+    ├── 01_Episodique/               # Journaux quotidiens (sections télémétrie et sessions IA)
+    ├── 02_Concepts/                 # Fiches atomiques, _Archive_Merged/, _Quarantine/
+    ├── 03_Kanban_Specs/             # Specs par projet et AGENT_QUEUE.md
+    ├── Google_Drive_Sync/           # 4 méga-documents pour Gemini Web
+    └── _System_Buffer/              # telemetry.db, lancedb_store, screen_staging, voice_inbox, jetons
 ```
+
+Base SQLite (`_System_Buffer/telemetry.db`) : `raw_activity`, `daily_metrics`, `chat_sessions`, `chat_messages`, `historical_footprints`, `projects`, `kanban_tasks`.
 
 ---
 
 ## 🚀 Installation & Configuration
 
-### 1. Prérequis Système
-- **OS :** Windows 10 ou 11 (64-bit).
-- **Python :** 3.11+.
-- **GPU Recommandé :** NVIDIA RTX 4070 Ti Super (16 Go VRAM) ou équivalent avec pilote NVIDIA récent.
-- **Ollama :** Installé localement avec les modèles :
-  ```bash
-  ollama pull gemma4:12b
-  ollama pull gemma4:26b-a4b
-  ollama pull bge-m3
-  ```
+### 1. Prérequis
+- Windows 10/11 64 bits, Python 3.11+, pilote NVIDIA récent.
+- [Ollama](https://ollama.com) avec les modèles `gemma4:12b`, `gemma4:26b-a4b` et `bge-m3` (les deux Gemma peuvent être provisionnés depuis des GGUF locaux de `models/` par `--init-models`).
 
-### 2. Installation des Dépendances
+### 2. Dépendances
 ```bash
 pip install -r requirements.txt
 ```
+`faster-whisper` (transcription des mémos vocaux) est optionnel, voir la fin de `requirements.txt`.
 
-### 3. Configuration (`.env`)
-Copiez `.env.example` en `.env` et adaptez les variables si nécessaire :
+### 3. Serveur Ollama (une fois)
+Le budget VRAM du 26B suppose un cache KV quantifié. Ces variables doivent être vues par le **serveur** Ollama : définissez-les au niveau utilisateur puis redémarrez Ollama.
+```bat
+setx OLLAMA_FLASH_ATTENTION 1
+setx OLLAMA_KV_CACHE_TYPE q8_0
+setx OLLAMA_MAX_LOADED_MODELS 1
+setx OLLAMA_NUM_PARALLEL 1
+```
+`python run_exocortex.py --init-models` vérifie l'environnement réel du processus serveur et prévient s'il manque une variable.
+
+### 4. Fichier `.env`
+Copiez `.env.example` en `.env`. Toutes les variables y sont documentées ; les principales :
 ```ini
 VAULT_ROOT=./Vault_Data
 OLLAMA_BASE_URL=http://localhost:11434
 MODEL_FAST_VISION=gemma4:12b
 MODEL_HEAVY_SYNTHESIS=gemma4:26b-a4b
 MODEL_EMBEDDING=bge-m3
-MIN_FREE_VRAM_GB=8.0
-FULL_DUAL_MODEL_VRAM_GB=14.5
-GEMINI_API_KEY=votre_cle_optionnelle
-GEMINI_MODEL=gemini-2.5-flash
+VRAM_STRICT_ABORT_FREE_GB=8.0      # sous ce seuil, aucune inférence (mode CPU la nuit)
+VRAM_REASONING_MIN_FREE_GB=12.8    # sous ce seuil, le 26B est remplacé par le 12B
+OLLAMA_NUM_CTX=16384
+TAKEOUT_MODE=web_manual            # ou cloud_api avec GEMINI_API_KEY
+HIPPOCAMPUS_HOTKEY=<ctrl>+<alt>+<space>
 ```
 
----
-
-## 🕹️ Utilisation Quotidienne
-
-### 1. Démarrage en 1 Clic (Recommandé)
-Double-cliquez sur `start_exocortex.bat` :
-- Lance le démon de télémétrie silencieusement en arrière-plan (`pythonw.exe`).
-- Lance le listener global `Alt + Espace` silencieusement (`pythonw.exe`).
-- Ouvre automatiquement le tableau de bord Streamlit dans votre navigateur.
-
-Pour arrêter tous les démons d'arrière-plan à tout moment :
-Double-cliquez sur `stop_exocortex.bat`.
+### 5. Extension navigateur
+Chargez `browser_extension/` comme extension non empaquetée (`chrome://extensions`, mode développeur). Elle n'est injectée que sur Gemini, Claude et ChatGPT ; elle s'authentifie auprès du récepteur local avec un jeton obtenu automatiquement.
 
 ---
 
-### 2. Pilote CLI (`run_exocortex.py`)
+## 🕹️ Utilisation
+
+### Démarrage en 1 clic
+`start_exocortex.bat` vérifie Ollama, démarre le démon de télémétrie et l'injecteur en arrière-plan (`pythonw`), puis ouvre le **Command Center** sur `http://127.0.0.1:8500`. `stop_exocortex.bat` arrête tout proprement : les démons sauvegardent la fenêtre en cours avant de sortir.
+
+### Commandes (`run_exocortex.py`)
 
 | Commande | Action |
 |---|---|
-| `python run_exocortex.py --daemon` | Démarre la capture de télémétrie Windows en direct. |
-| `python run_exocortex.py --consolidate` | Déclenche manuellement la consolidation nocturne en 3 passes VRAM. |
-| `python run_exocortex.py --consolidate --date YYYY-MM-DD` | Consolide rétroactivement une date précise. |
-| `python run_exocortex.py --compile-drive` | Génère les 4 méga-documents dans `Vault_Data/Google_Drive_Sync/`. |
-| `python run_exocortex.py --hotkey` | Démarre l'injecteur pré-prompt `Alt + Espace`. |
-| `python run_exocortex.py --dashboard` | Ouvre le dashboard Streamlit "Bandeur de Stats". |
-| `python run_exocortex.py --all` | Démarre l'écosystème complet (démons de fond + dashboard). |
+| `--init-models` | Vérifie la configuration du serveur Ollama et provisionne les modèles GGUF locaux. |
+| `--ingest-takeout [--limit N]` | Ingestion complète Google Takeout (sessions, empreintes, rafales, distillation Delta, journaux). |
+| `--import-profile FICHIER` | Importe le profil cognitif renvoyé par Gemini Web (mode `web_manual`). |
+| `--daemon` | Démon de télémétrie Win32 (et récepteur de l'extension sur 8502). |
+| `--consolidate [--date AAAA-MM-JJ]` | Consolidation nocturne (Passes 0 à 3, Drive). |
+| `--ingest-voice` | Transcrit et distille les mémos de `_System_Buffer/voice_inbox/`. |
+| `--defrag-graph` | Sommeil Profond : fusions et évolutions d'arbitrage entre fiches proches. |
+| `--compile-drive` | Régénère les 4 méga-documents de `Google_Drive_Sync/`. |
+| `--hotkey` | Injecteur Hippocampe (raccourci `HIPPOCAMPUS_HOTKEY`). |
+| `--web [--port --host]` | Command Center Web (interface principale). |
+| `--dashboard` | Dashboard Streamlit (interface secondaire, mêmes requêtes et contrats). |
+| `--all` | Démons d'arrière-plan + Command Center au premier plan. |
+| `--stop` | Arrêt propre de tous les processus Exocortex. |
+| `--mcp-server` | Serveur MCP stdio (5 outils : recherche, fiche, télémétrie, session, file Kanban). |
+| `--kanban-status` · `--next-task` · `--complete-task ID` | Pilotage du Kanban et de `AGENT_QUEUE.md`. |
 
----
-
-### 3. L'Injecteur Hippocampe (`Alt + Espace`)
-Dans n'importe quelle application (navigateur web sur Gemini, VS Code, invite de commande) :
-1. Tapez votre question ou prompt.
-2. Appuyez sur `Alt + Espace`.
-3. Le système capture votre texte, interroge **LanceDB** (`top_k = 5`), interroge **SQLite** pour récupérer le cumul d'heures investies et l'antériorité du sujet, et réinjecte instantanément votre prompt enrichi d'un bloc `<contexte_hippocampe_local>`.
-4. Un signal sonore discret confirme l'injection sans quitter votre fenêtre.
-
-Pour tester l'injecteur en ligne de commande de manière headless :
+### Injecteur Hippocampe
+Dans n'importe quelle zone de saisie, tapez votre prompt puis **Ctrl+Alt+Espace** : le texte est capturé, enrichi d'un bloc `<contexte_hippocampe_local>` (fiches proches par k-NN, voisins par wikilinks, heures investies) et réinjecté. Si une consolidation détient le GPU, l'injection est annulée au bout de 3 s plutôt que de bloquer. Test sans clavier :
 ```bash
 python -m src.daemons.hippocampus_hotkey --test "Comment optimiser mon pipeline RAG avec LanceDB ?"
 ```
 
+### Google Takeout
+Placez les exports dans `takeout_raw/` (HTML ou JSON ; les dates JSON en UTC sont converties en heure locale). En mode `web_manual`, suivez `_System_Buffer/takeout_staging/PROMPT_A_COPIER_DANS_GEMINI_WEB.txt` puis importez la réponse avec `--import-profile`. En mode `cloud_api`, distillation et profil passent par Gemini, même Ollama éteint.
+
+### Command Center Web
+Six vues : chronologie et tunnels d'hyperfocus, cartographie et GraphRAG, archéologie longitudinale, rythmes circadiens, explorateur épistémique (chats, empreintes, rafales), studio Kanban. Les modes cognitifs, statuts et topics affichés sont servis par l'API (`/api/meta/vocabulary`) ; les valeurs estimées (journées issues du cold start Takeout) sont signalées.
+
+### Google Drive (Pont B)
+`00_CORE_IDENTITE_ET_STYLE.md`, `01_TELEMETRIE_ET_EPISODIQUE_7J.md`, `02_PROJETS_ET_CONCEPTS_ACTIFS.md`, `03_INDEX_GRAPHE_CONCEPTS.md` sont compilés chaque nuit. Les catégories de `DRIVE_EXCLUDED_TOPICS` n'y figurent jamais.
+
 ---
 
-### 4. Les 4 Méga-Documents Google Drive (`Pont B`)
-Situés dans `Vault_Data/Google_Drive_Sync/`, ces 4 fichiers sont compilés automatiquement chaque nuit pour être partagés dans Google Drive et lus par Gemini Web App :
-- **`00_CORE_IDENTITE_ET_STYLE.md`** : Profil cognitif, taxonomie maîtresse et contrat d'interaction.
-- **`01_TELEMETRIE_ET_EPISODIQUE_7J.md`** : Bilan statistique des 7 derniers jours (temps par topic, record d'hyperfocus, ratio prod/conso) + notes épisodiques.
-- **`02_PROJETS_ET_CONCEPTS_ACTIFS.md`** : Concaténation intégrale des 15 concepts les plus récemment travaillés.
-- **`03_INDEX_GRAPHE_CONCEPTS.md`** : Table des matières exhaustive de 100% des fiches conceptuelles du coffre classées par topic.
-
----
-
-### 5. Tableau de Bord "Bandeur de Stats" (Streamlit)
-Lit les métriques via des connexions SQLite en lecture seule (`mode=ro`) ; l'onglet Kanban, lui, **écrit** dans la base (création de projets et de tâches) :
-- **Bandeau KPIs Macro :** Heures totales traquées, record d'hyperfocus, fréquence de zapping (`switches/h`), ratio prod/conso, volume épistémique.
-- **Onglet 1 (Chronologie & Focus Quotidien) :** Diagramme de Gantt interactif Plotly minute par minute et mise en exergue des tunnels d'hyperfocus.
-- **Onglet 2 (Cartographie des Obsessions) :** Treemap hiérarchique (`Mode Cognitif` → `Topic Sémantique` → `Application`) et camembert des modes cognitifs.
-- **Onglet 3 (Archéologie Longitudinale) :** Aire empilée mensuelle des réflexions depuis 2024 et matrice de catégorisation (*Piliers Fondamentaux* vs *Passions Éphémères*).
-- **Onglet 4 (Rythmes Circadiens) :** Heatmap 24h x 7j et diagnostic chronobiologique personnalisé (détection du chronotype nocturne).
+## 🧪 Tests
+```bash
+python -m pytest tests
+```
+La suite est **hermétique** : `tests/conftest.py` redirige coffre, base, Takeout, Ollama et clé Gemini vers des valeurs de test avant tout import, et refuse de démarrer si la configuration pointe vers `Vault_Data`. Aucun test ne lit ni ne modifie vos données.
 
 ---
 
